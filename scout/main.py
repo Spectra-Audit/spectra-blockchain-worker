@@ -11,6 +11,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import replace
 
+from .auth_wallet import load_or_create_admin_wallet
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
@@ -45,12 +46,19 @@ class ScoutApp:
         load_env_file()
         db_path = os.environ.get("SCOUT_DB_PATH") or os.environ.get("DB_PATH") or DEFAULT_DB_PATH
         database = DatabaseManager(db_path)
-        featured_config = _load_config_from_env()
+        admin_wallet = load_or_create_admin_wallet(database)
+        featured_config = _load_config_from_env(database=database)
         api_base_url = os.environ.get("API_BASE_URL") or featured_config.api_root
-        admin_access_token = featured_config.admin_token
-        admin_refresh_token = featured_config.admin_refresh_token
-        backend_client = BackendClient(api_base_url, admin_access_token, admin_refresh_token)
-        pro_scout = ProScout.from_env(database=database, backend_client=backend_client)
+        backend_client = BackendClient(
+            api_base_url,
+            admin_wallet_address=admin_wallet.address,
+            admin_wallet_private_key=admin_wallet.private_key,
+        )
+        pro_scout = ProScout.from_env(
+            database=database,
+            backend_client=backend_client,
+            admin_wallet=admin_wallet,
+        )
         if featured_config.db_path != db_path:
             featured_config = replace(featured_config, db_path=db_path)
         featured_scout = FeaturedScout(featured_config, database=database, backend_client=backend_client)

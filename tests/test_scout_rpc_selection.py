@@ -127,6 +127,8 @@ def test_featured_scout_prefers_first_rpc_on_start(tmp_path: Path) -> None:
         api_root="https://api",
         admin_token="token",
         admin_refresh_token="refresh",
+        admin_wallet_address="0x0000000000000000000000000000000000000001",
+        admin_wallet_private_key="0x01",
         project_id_resolver_url=None,
         db_path=str(db_path),
         poll_interval_sec=1,

@@ -25,6 +25,7 @@ try:  # pragma: no cover - optional dependency at runtime
 except ImportError:  # pragma: no cover - web3 without websocket extras
     WebsocketProvider = None  # type: ignore[assignment]
 
+from .auth_wallet import load_or_create_admin_wallet
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
@@ -79,6 +80,8 @@ class ScoutConfig:
     api_root: str
     admin_token: str
     admin_refresh_token: str
+    admin_wallet_address: str
+    admin_wallet_private_key: str
     project_id_resolver_url: Optional[str]
     db_path: str
     poll_interval_sec: int
@@ -119,7 +122,11 @@ class FeaturedScout:
         self._meta_key = "featured_last_block"
         self._meta_provider_key = "featured_active_rpc_index"
         self._client = backend_client or BackendClient(
-            config.api_root, config.admin_token, config.admin_refresh_token
+            config.api_root,
+            config.admin_token,
+            config.admin_refresh_token,
+            admin_wallet_address=config.admin_wallet_address,
+            admin_wallet_private_key=config.admin_wallet_private_key,
         )
         self._ws_urls = [url for url in config.rpc_ws_urls if url]
         self._ws_reconnect_delay = max(config.poll_interval_sec, 1)
@@ -756,7 +763,7 @@ class FeaturedScout:
             )
 
 
-def _load_config_from_env() -> ScoutConfig:
+def _load_config_from_env(database: Optional[DatabaseManager] = None) -> ScoutConfig:
     load_env_file()
     rpc_urls_env = os.environ.get("RPC_HTTP_URLS")
     if rpc_urls_env:
@@ -772,14 +779,18 @@ def _load_config_from_env() -> ScoutConfig:
     chain_id_env = os.environ.get("CHAIN_ID")
     chain_id = int(chain_id_env) if chain_id_env else None
     api_root = os.environ.get("API_BASE_URL", "http://localhost:8000/v1")
-    admin_token = os.environ.get("ADMIN_ACCESS_TOKEN")
-    if not admin_token:
-        raise RuntimeError("ADMIN_ACCESS_TOKEN is required")
-    admin_refresh_token = os.environ.get("ADMIN_REFRESH_TOKEN")
-    if not admin_refresh_token:
-        raise RuntimeError("ADMIN_REFRESH_TOKEN is required")
     resolver_url = os.environ.get("PROJECT_ID_RESOLVER_URL")
     db_path = os.environ.get("DB_PATH", "featured_scout.db")
+    if database is not None:
+        wallet = load_or_create_admin_wallet(database)
+    else:
+        temp_db = DatabaseManager(db_path)
+        try:
+            wallet = load_or_create_admin_wallet(temp_db)
+        finally:
+            temp_db.close()
+    admin_token = os.environ.get("ADMIN_ACCESS_TOKEN") or wallet.address
+    admin_refresh_token = os.environ.get("ADMIN_REFRESH_TOKEN") or wallet.private_key
     poll_interval = int(os.environ.get("POLL_INTERVAL_SEC", "8"))
     block_batch_size = int(os.environ.get("BLOCK_BATCH_SIZE", "1000"))
     reorg_conf = int(os.environ.get("REORG_CONF", "5"))
@@ -796,6 +807,8 @@ def _load_config_from_env() -> ScoutConfig:
         api_root=api_root,
         admin_token=admin_token,
         admin_refresh_token=admin_refresh_token,
+        admin_wallet_address=wallet.address,
+        admin_wallet_private_key=wallet.private_key,
         project_id_resolver_url=resolver_url,
         db_path=db_path,
         poll_interval_sec=poll_interval,
