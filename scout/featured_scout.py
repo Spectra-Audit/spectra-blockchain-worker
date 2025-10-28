@@ -78,6 +78,7 @@ class ScoutConfig:
     chain_id: Optional[int]
     api_root: str
     admin_token: str
+    admin_refresh_token: str
     project_id_resolver_url: Optional[str]
     db_path: str
     poll_interval_sec: int
@@ -117,7 +118,9 @@ class FeaturedScout:
         self._lock = threading.Lock()
         self._meta_key = "featured_last_block"
         self._meta_provider_key = "featured_active_rpc_index"
-        self._client = backend_client or BackendClient(config.api_root, config.admin_token)
+        self._client = backend_client or BackendClient(
+            config.api_root, config.admin_token, config.admin_refresh_token
+        )
         self._ws_urls = [url for url in config.rpc_ws_urls if url]
         self._ws_reconnect_delay = max(config.poll_interval_sec, 1)
         persisted_index = self._load_active_rpc_index()
@@ -772,6 +775,9 @@ def _load_config_from_env() -> ScoutConfig:
     admin_token = os.environ.get("ADMIN_ACCESS_TOKEN")
     if not admin_token:
         raise RuntimeError("ADMIN_ACCESS_TOKEN is required")
+    admin_refresh_token = os.environ.get("ADMIN_REFRESH_TOKEN")
+    if not admin_refresh_token:
+        raise RuntimeError("ADMIN_REFRESH_TOKEN is required")
     resolver_url = os.environ.get("PROJECT_ID_RESOLVER_URL")
     db_path = os.environ.get("DB_PATH", "featured_scout.db")
     poll_interval = int(os.environ.get("POLL_INTERVAL_SEC", "8"))
@@ -789,6 +795,7 @@ def _load_config_from_env() -> ScoutConfig:
         chain_id=chain_id,
         api_root=api_root,
         admin_token=admin_token,
+        admin_refresh_token=admin_refresh_token,
         project_id_resolver_url=resolver_url,
         db_path=db_path,
         poll_interval_sec=poll_interval,

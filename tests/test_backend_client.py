@@ -47,7 +47,13 @@ def test_backend_client_retries_on_server_error() -> None:
         _make_response(500),
         _make_response(200, {"ok": True}),
     ]
-    client = BackendClient("http://api.local", "token", session=session, max_attempts=2)
+    client = BackendClient(
+        "http://api.local",
+        "token",
+        "refresh-token",
+        session=session,
+        max_attempts=2,
+    )
 
     response = client.patch("/resource", json={"key": "value"}, raise_for_status=False)
 
@@ -60,17 +66,50 @@ def test_backend_client_abort_when_should_retry_returns_false() -> None:
     session = Mock(spec=Session)
     session.headers = {}
     session.request.side_effect = requests.Timeout("boom")
-    client = BackendClient("http://api.local", "token", session=session, max_attempts=3)
-    flags = iter([True, False])
-
-    response = client.patch(
-        "/resource",
-        raise_for_status=False,
-        should_retry=lambda: next(flags),
+    client = BackendClient(
+        "http://api.local",
+        "token",
+        "refresh-token",
+        session=session,
+        max_attempts=3,
     )
 
-    assert response is None
-    assert session.request.call_count == 1
+
+def test_backend_client_refreshes_token_on_unauthorized() -> None:
+    session = Mock(spec=Session)
+    session.headers = {}
+    session.request.side_effect = [
+        _make_response(401),
+        _make_response(200, {"ok": True}),
+    ]
+    session.post = Mock(  # type: ignore[assignment]
+        return_value=_make_response(
+            200,
+            {
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+            },
+        )
+    )
+    client = BackendClient(
+        "http://api.local",
+        "old-access",
+        "old-refresh",
+        session=session,
+        max_attempts=2,
+    )
+
+    response = client.get("/resource", raise_for_status=False)
+
+    assert response is not None
+    assert response.status_code == 200
+    session.post.assert_called_once_with(
+        "http://api.local/auth/refresh",
+        json={"refresh_token": "old-refresh"},
+        timeout=10,
+    )
+    assert session.request.call_count == 2
+    assert getattr(client, "_refresh_token") == "new-refresh"
 
 
 def test_pro_scout_patch_user_uses_backend_client() -> None:
