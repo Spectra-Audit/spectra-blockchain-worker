@@ -344,7 +344,7 @@ def test_featured_scout_rotates_rpc_endpoints(tmp_path, scout_modules):
 
     assert scout._poll_once() is False
     assert scout._active_rpc_index == 0
-    assert scout._db.get_meta("featured_active_rpc_index") == "0"
+    assert scout._db.get_meta("featured_active_rpc_index") is None
 
     featured.Web3.failure_sequence = {}
     result = scout._poll_once()
@@ -385,7 +385,7 @@ def test_pro_scout_rotates_rpc_endpoints(tmp_path, scout_modules):
     initial_last_block = service._last_block
     service._poll_once()
     assert service._active_rpc_index == 0
-    assert service.db_manager.get_meta("pro_active_rpc_index") == "0"
+    assert service.db_manager.get_meta("pro_active_rpc_index") is None
     assert service._last_block == initial_last_block
 
     pro.Web3.failure_sequence = {}
