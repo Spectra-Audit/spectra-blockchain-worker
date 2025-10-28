@@ -394,3 +394,90 @@ def test_pro_scout_rotates_rpc_endpoints(tmp_path, scout_modules):
     assert service._active_rpc_index == 1
     assert service.db_manager.get_meta("pro_active_rpc_index") == "1"
     assert service._last_block >= initial_last_block
+
+
+def test_featured_scout_websocket_retries_before_switch(monkeypatch, tmp_path, scout_modules):
+    featured, _ = scout_modules
+
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=("ws://one", "ws://two"),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_ws_retries.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=1,
+        start_block=None,
+        start_block_latest=True,
+    )
+    scout = featured.FeaturedScout(config, once=True)
+
+    sleep_calls = []
+    monkeypatch.setattr(featured.time, "sleep", lambda duration: sleep_calls.append(duration))
+
+    call_log = []
+
+    def fake_consume(url: str) -> None:
+        attempt = sum(1 for entry in call_log if entry[0] == url) + 1
+        call_log.append((url, attempt))
+        if url == "ws://one" and attempt < 3:
+            raise RuntimeError("fail")
+        scout._stop_event.set()
+
+    scout._consume_ws_url = fake_consume  # type: ignore[assignment]
+    scout._websocket_loop()
+
+    assert call_log == [
+        ("ws://one", 1),
+        ("ws://one", 2),
+        ("ws://one", 3),
+    ]
+    assert sleep_calls == []
+
+
+def test_pro_scout_websocket_retries_then_advances(monkeypatch, tmp_path, scout_modules):
+    _, pro = scout_modules
+
+    class DummyBackendClient:
+        base_url = "http://api"
+
+        def patch(self, *args, **kwargs):
+            return types.SimpleNamespace(status_code=200, text="")
+
+    service = pro.ProScout(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=["ws://one", "ws://two"],
+        api_base_url="http://api",
+        admin_access_token="token",
+        contract_address="0xabc",
+        db_path=str(tmp_path / "pro_ws_retries.db"),
+        backend_client=DummyBackendClient(),
+        poll_interval=1,
+        reorg_conf=0,
+    )
+
+    sleep_calls = []
+    monkeypatch.setattr(pro.time, "sleep", lambda duration: sleep_calls.append(duration))
+
+    call_log = []
+
+    def fake_consume(url: str) -> None:
+        attempt = sum(1 for entry in call_log if entry[0] == url) + 1
+        call_log.append((url, attempt))
+        if url == "ws://one":
+            raise RuntimeError("fail")
+        service._stop_event.set()
+
+    service._consume_ws_url = fake_consume  # type: ignore[assignment]
+    service._websocket_loop()
+
+    assert call_log == [
+        ("ws://one", 1),
+        ("ws://one", 2),
+        ("ws://one", 3),
+        ("ws://two", 1),
+    ]
+    assert sleep_calls == [service._ws_reconnect_delay]
