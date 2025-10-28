@@ -18,6 +18,7 @@ from web3._utils.events import get_event_data
 from web3.datastructures import AttributeDict
 from web3.types import FilterParams, LogReceipt
 
+from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 
 LOGGER = logging.getLogger(__name__)
@@ -85,12 +86,12 @@ class FeaturedScout:
         once: bool = False,
         *,
         database: Optional[DatabaseManager] = None,
+        backend_client: Optional[BackendClient] = None,
     ) -> None:
         self._config = config
         self._once = once
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._session = requests.Session()
         self._web3 = Web3(Web3.HTTPProvider(config.rpc_url, request_kwargs={"timeout": 30}))
         self._contract = self._web3.eth.contract(address=Web3.to_checksum_address(config.contract_address), abi=EVENT_ABI)
         self._event_topic_map = {
@@ -101,6 +102,7 @@ class FeaturedScout:
         self._owns_db = database is None
         self._lock = threading.Lock()
         self._meta_key = "featured_last_block"
+        self._client = backend_client or BackendClient(config.api_root, config.admin_token)
         self._ensure_schema()
 
     def start(self) -> None:
@@ -336,58 +338,26 @@ class FeaturedScout:
         if not backend_id:
             return False
         url = f"{self._config.api_root}/admin/projects/{backend_id}"
-        headers = {"Authorization": f"Bearer {self._config.admin_token}"}
         try:
-            response = self._request_with_retries("patch", url, headers=headers, json=payload, timeout=10)
+            response = self._client.patch(
+                url,
+                json=payload,
+                timeout=10,
+                raise_for_status=False,
+            )
         except requests.RequestException:
             LOGGER.exception("Failed to PATCH project", extra={"backend_id": backend_id})
             return False
         if response is None:
             LOGGER.error("PATCH project returned no response", extra={"backend_id": backend_id})
             return False
+        if response.status_code >= 400:
+            LOGGER.error(
+                "PATCH project failed",
+                extra={"backend_id": backend_id, "status": response.status_code, "response": response.text},
+            )
+            return False
         return True
-
-    def _request_with_retries(self, method: str, url: str, max_attempts: int = 5, **kwargs: Any) -> Optional[Response]:
-        delay = 0.5
-        for attempt in range(1, max_attempts + 1):
-            try:
-                response = self._session.request(method, url, **kwargs)
-            except (requests.Timeout, requests.ConnectionError) as exc:
-                LOGGER.warning(
-                    "HTTP request failed",
-                    extra={"url": url, "attempt": attempt, "error": str(exc)},
-                )
-                if attempt == max_attempts:
-                    raise
-                time.sleep(delay)
-                delay *= 2
-                continue
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                sleep_time = float(retry_after) if retry_after and retry_after.isdigit() else delay
-                LOGGER.warning("HTTP 429 received", extra={"url": url, "sleep": sleep_time})
-                time.sleep(sleep_time)
-                continue
-            if 500 <= response.status_code < 600:
-                LOGGER.warning(
-                    "HTTP server error",
-                    extra={"url": url, "status": response.status_code, "attempt": attempt},
-                )
-                if attempt == max_attempts:
-                    response.raise_for_status()
-                time.sleep(delay)
-                delay *= 2
-                continue
-            try:
-                response.raise_for_status()
-            except requests.HTTPError as exc:
-                LOGGER.error(
-                    "HTTP client error",
-                    extra={"url": url, "status": response.status_code, "error": str(exc)},
-                )
-                return None
-            return response
-        return None
 
     def _resolve_backend_project_id(self, project_hex: str) -> Optional[str]:
         if not project_hex:
@@ -399,11 +369,11 @@ class FeaturedScout:
         if not resolver_url:
             return None
         try:
-            response = self._request_with_retries(
-                "get",
+            response = self._client.get(
                 resolver_url,
                 params={"project_id_hex": project_hex},
                 timeout=10,
+                raise_for_status=False,
             )
         except requests.RequestException:
             LOGGER.exception(
@@ -412,6 +382,12 @@ class FeaturedScout:
             )
             return None
         if response is None:
+            return None
+        if response.status_code >= 400:
+            LOGGER.error(
+                "Resolver returned error",
+                extra={"project_hex": project_hex, "status": response.status_code},
+            )
             return None
         try:
             payload = response.json()

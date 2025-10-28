@@ -3,87 +3,10 @@
 from __future__ import annotations
 
 import logging
-import sys
 import threading
 import types
 from pathlib import Path
 from typing import Iterator
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-
-class _StubSession:
-    def __init__(self) -> None:
-        self.headers: dict[str, str] = {}
-
-    def close(self) -> None:  # pragma: no cover - simple stub
-        pass
-
-
-requests_stub = types.SimpleNamespace(
-    Session=_StubSession,
-    Response=object,
-    RequestException=Exception,
-    Timeout=Exception,
-    ConnectionError=Exception,
-    HTTPError=Exception,
-)
-
-sys.modules.setdefault("requests", requests_stub)
-
-
-class _Web3:
-    HTTPProvider = staticmethod(lambda *args, **kwargs: object())
-    to_checksum_address = staticmethod(lambda value: value)
-    to_hex = staticmethod(lambda value: value if isinstance(value, str) else "0x0")
-
-    def __init__(self, *args, **kwargs) -> None:
-        self.eth = types.SimpleNamespace(
-            chain_id=1,
-            contract=lambda *a, **k: types.SimpleNamespace(events=types.SimpleNamespace()),
-            get_logs=lambda *a, **k: [],
-        )
-
-    def is_connected(self) -> bool:  # pragma: no cover - simple stub
-        return True
-
-    def keccak(self, text: str) -> bytes:  # pragma: no cover - simple stub
-        return b"\x00" * 32
-
-
-web3_stub = types.ModuleType("web3")
-web3_stub.Web3 = _Web3
-sys.modules.setdefault("web3", web3_stub)
-
-contract_module = types.ModuleType("web3.contract")
-contract_module.Contract = type("Contract", (), {})
-
-
-class _ContractEvent:
-    def __call__(self, *args, **kwargs):  # pragma: no cover - simple stub
-        return types.SimpleNamespace(processLog=lambda log: types.SimpleNamespace(event="", args={}))
-
-
-contract_module.ContractEvent = _ContractEvent
-sys.modules.setdefault("web3.contract", contract_module)
-
-types_module = types.ModuleType("web3.types")
-types_module.EventData = dict
-types_module.FilterParams = dict
-types_module.LogReceipt = dict
-sys.modules.setdefault("web3.types", types_module)
-
-datastructures_module = types.ModuleType("web3.datastructures")
-datastructures_module.AttributeDict = dict
-sys.modules.setdefault("web3.datastructures", datastructures_module)
-
-utils_module = types.ModuleType("web3._utils")
-events_module = types.ModuleType("web3._utils.events")
-events_module.get_event_data = lambda *args, **kwargs: {}  # type: ignore[assignment]
-sys.modules.setdefault("web3._utils", utils_module)
-sys.modules.setdefault("web3._utils.events", events_module)
 
 import pytest
 
@@ -121,8 +44,8 @@ def _make_featured_stub(manager: DatabaseManager) -> FeaturedScout:
     featured._meta_key = "featured_last_block"  # type: ignore[attr-defined]
     featured._stop_event = threading.Event()
     featured._thread = None
-    featured._session = None
     featured._lock = threading.Lock()
+    featured._client = None  # type: ignore[attr-defined]
     return featured  # type: ignore[return-value]
 
 

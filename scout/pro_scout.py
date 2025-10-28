@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import signal
@@ -13,12 +12,12 @@ from dataclasses import dataclass
 from heapq import heappop, heappush
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import requests
-from requests import Response, Session
+from requests import Response
 from web3 import Web3
 from web3.contract import Contract, ContractEvent
 from web3.types import EventData, FilterParams, LogReceipt
 
+from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 
 EVENT_ABI = [
@@ -101,6 +100,7 @@ class ProScout:
         contract_address: str = DEFAULT_CONTRACT_ADDRESS,
         db_path: str = DEFAULT_DB_PATH,
         database: Optional[DatabaseManager] = None,
+        backend_client: Optional[BackendClient] = None,
         poll_interval: int = DEFAULT_POLL_INTERVAL,
         reorg_conf: int = DEFAULT_REORG_CONF,
         default_user_tier: str = DEFAULT_USER_TIER,
@@ -147,14 +147,9 @@ class ProScout:
         self._topic_to_event: Dict[str, ContractEvent] = {}
         self._setup_event_registry()
 
-        self.session: Session = requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {self.admin_access_token}",
-                "Content-Type": "application/json",
-            }
+        self.backend_client = backend_client or BackendClient(
+            self.api_base_url, self.admin_access_token, max_attempts=MAX_HTTP_RETRIES
         )
-        self._http_lock = threading.Lock()
 
         self.pro_tier_set = {tier.strip() for tier in pro_tier_set or [] if tier.strip()}
         self.db_manager = database or DatabaseManager(db_path)
@@ -211,8 +206,6 @@ class ProScout:
         if self._scheduler_thread:
             self._scheduler_thread.join(timeout=timeout)
             self._scheduler_thread = None
-        with self._http_lock:
-            self.session.close()
         if self._owns_db_manager:
             self.db_manager.close()
         self.logger.info("ProScout service stopped")
@@ -488,65 +481,26 @@ class ProScout:
 
     def _patch_user(self, wallet: str, payload: Dict[str, object]) -> bool:
         url = f"{self.api_base_url}/v1/user/{wallet}"
-        body = json.dumps(payload)
-        delay = 0.5
-        for attempt in range(1, MAX_HTTP_RETRIES + 1):
-            if self._stop_event.is_set():
-                return False
-            try:
-                with self._http_lock:
-                    response: Response = self.session.patch(url, data=body, timeout=HTTP_TIMEOUT)
-            except (requests.Timeout, requests.ConnectionError) as exc:
-                self.logger.warning(
-                    "HTTP request failed",
-                    extra={"wallet": wallet, "attempt": attempt, "error": str(exc)},
-                )
-                time.sleep(delay)
-                delay = min(delay * 2, 8)
-                continue
-
-            if response.status_code == 429:
-                retry_after = self._retry_after_delay(response)
-                self.logger.warning(
-                    "HTTP 429 received",
-                    extra={"wallet": wallet, "attempt": attempt, "retry_after": retry_after},
-                )
-                time.sleep(retry_after)
-                continue
-
-            if 500 <= response.status_code < 600:
-                self.logger.warning(
-                    "HTTP server error",
-                    extra={"wallet": wallet, "status": response.status_code, "attempt": attempt},
-                )
-                time.sleep(delay)
-                delay = min(delay * 2, 8)
-                continue
-
-            if response.status_code >= 400:
-                self.logger.error(
-                    "HTTP client error",
-                    extra={
-                        "wallet": wallet,
-                        "status": response.status_code,
-                        "response": response.text,
-                    },
-                )
-                return False
-
-            return True
-
-        return False
-
-    @staticmethod
-    def _retry_after_delay(response: Response) -> float:
-        retry_after = response.headers.get("Retry-After")
-        if retry_after is None:
-            return 1.0
-        try:
-            return float(retry_after)
-        except ValueError:
-            return 1.0
+        response = self.backend_client.patch(
+            url,
+            json=payload,
+            timeout=HTTP_TIMEOUT,
+            raise_for_status=False,
+            should_retry=lambda: not self._stop_event.is_set(),
+        )
+        if response is None:
+            return False
+        if response.status_code >= 400:
+            self.logger.error(
+                "HTTP client error",
+                extra={
+                    "wallet": wallet,
+                    "status": response.status_code,
+                    "response": response.text,
+                },
+            )
+            return False
+        return True
 
     def _compute_is_pro(self, tier: str) -> bool:
         return tier in self.pro_tier_set
@@ -574,7 +528,12 @@ class ProScout:
     # CLI ------------------------------------------------------------------------
 
     @classmethod
-    def from_env(cls, *, database: Optional[DatabaseManager] = None) -> "ProScout":
+    def from_env(
+        cls,
+        *,
+        database: Optional[DatabaseManager] = None,
+        backend_client: Optional[BackendClient] = None,
+    ) -> "ProScout":
         rpc_http_url = os.environ.get("RPC_HTTP_URL", "")
         api_base_url = os.environ.get("API_BASE_URL", "")
         admin_access_token = os.environ.get("ADMIN_ACCESS_TOKEN", "")
@@ -590,6 +549,9 @@ class ProScout:
         chain_id = int(chain_id_env) if chain_id_env else None
         start_block_env = os.environ.get("START_BLOCK")
         start_block = int(start_block_env) if start_block_env else None
+        if backend_client is not None and not api_base_url:
+            api_base_url = backend_client.base_url
+
         return cls(
             rpc_http_url=rpc_http_url,
             api_base_url=api_base_url,
@@ -597,6 +559,7 @@ class ProScout:
             contract_address=contract_address,
             db_path=db_path,
             database=database,
+            backend_client=backend_client,
             poll_interval=poll_interval,
             reorg_conf=reorg_conf,
             default_user_tier=default_tier,
