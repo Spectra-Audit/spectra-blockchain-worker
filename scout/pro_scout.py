@@ -608,7 +608,8 @@ class ProScout:
         for event_abi in EVENT_ABI:
             name = event_abi["name"]
             signature = self._event_signature(name, event_abi["inputs"])
-            topic = self.web3.keccak(text=signature).hex()
+            digest = self.web3.keccak(text=signature)
+            topic = Web3.to_hex(digest)
             event_cls: ContractEvent = getattr(self.contract.events, name)
             topics.append(topic)
             mapping[topic] = event_cls
