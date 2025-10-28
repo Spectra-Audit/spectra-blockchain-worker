@@ -1,6 +1,7 @@
 import importlib
 import sys
 import types
+from typing import Any, Dict, List
 
 import pytest
 
@@ -35,9 +36,10 @@ class FakeEvent:
 
 
 class FakeEth:
-    def __init__(self) -> None:
-        self.block_number = 10
-        self.logs = []
+    def __init__(self, web3: "FakeWeb3") -> None:
+        self._web3 = web3
+        self._block_number = FakeWeb3.default_block_number
+        self.logs = list(FakeWeb3.default_logs)
 
     def contract(self, address, abi):  # noqa: ANN001 - signature matches Web3
         events = types.SimpleNamespace()
@@ -46,7 +48,23 @@ class FakeEth:
         return types.SimpleNamespace(events=events)
 
     def get_logs(self, params):  # noqa: ANN001 - mimic Web3 signature
+        failures = FakeWeb3.failure_sequence.get(self._web3.provider.url, [])
+        if failures and failures[0] == "get_logs":
+            failures.pop(0)
+            raise RuntimeError("get_logs failure")
         return list(self.logs)
+
+    @property
+    def block_number(self) -> int:
+        failures = FakeWeb3.failure_sequence.get(self._web3.provider.url, [])
+        if failures and failures[0] == "block_number":
+            failures.pop(0)
+            raise RuntimeError("block_number failure")
+        return self._block_number
+
+    @block_number.setter
+    def block_number(self, value: int) -> None:
+        self._block_number = value
 
 
 class FakeHTTPProvider:
@@ -57,10 +75,13 @@ class FakeHTTPProvider:
 
 class FakeWeb3:
     HTTPProvider = FakeHTTPProvider
+    default_block_number = 10
+    default_logs: List[Any] = []
+    failure_sequence: Dict[str, List[str]] = {}
 
     def __init__(self, provider):  # noqa: ANN001 - mimic Web3 signature
         self.provider = provider
-        self.eth = FakeEth()
+        self.eth = FakeEth(self)
         self.codec = object()
 
     def keccak(self, text: str):
@@ -108,6 +129,9 @@ def install_web3_stub(monkeypatch):
     web3_module = types.ModuleType("web3")
     web3_module.Web3 = FakeWeb3
     web3_module.HTTPProvider = FakeHTTPProvider
+    FakeWeb3.default_block_number = 10
+    FakeWeb3.default_logs = []
+    FakeWeb3.failure_sequence = {}
 
     utils_module = types.ModuleType("web3._utils")
     events_module = types.ModuleType("web3._utils.events")
@@ -164,7 +188,7 @@ def scout_modules(monkeypatch):
 def test_featured_scout_processes_http_and_websocket_logs(tmp_path, scout_modules):
     featured, _ = scout_modules
     config = featured.ScoutConfig(
-        rpc_url="http://rpc",
+        rpc_http_urls=("http://rpc",),
         rpc_ws_urls=("ws://rpc",),
         contract_address="0xabc",
         chain_id=None,
@@ -226,7 +250,7 @@ def test_pro_scout_processes_http_and_websocket_logs(tmp_path, scout_modules):
             return types.SimpleNamespace(status_code=200, text="")
 
     service = pro.ProScout(
-        rpc_http_url="http://rpc",
+        rpc_http_urls=("http://rpc",),
         rpc_ws_urls=["ws://rpc"],
         api_base_url="http://api",
         admin_access_token="token",
@@ -284,3 +308,89 @@ def test_pro_scout_processes_http_and_websocket_logs(tmp_path, scout_modules):
     with service.db_manager.read_connection() as conn:
         count_after = conn.execute("SELECT COUNT(*) FROM processed_logs").fetchone()[0]
     assert count_after == 2
+
+
+def test_featured_scout_rotates_rpc_endpoints(tmp_path, scout_modules):
+    featured, _ = scout_modules
+
+    http_log = FakeAttributeDict(
+        {
+            "transactionHash": bytes.fromhex("05" * 32),
+            "logIndex": 0,
+            "blockNumber": 6,
+            "topics": [bytes.fromhex("aa" * 32)],
+        }
+    )
+    featured.Web3.default_logs = [http_log]
+    featured.Web3.default_block_number = 6
+    featured.Web3.failure_sequence = {"http://bad": ["block_number"]}
+
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://bad", "http://good"),
+        rpc_ws_urls=(),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_rotate.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=1,
+        start_block=None,
+        start_block_latest=True,
+    )
+    scout = featured.FeaturedScout(config, once=True)
+    scout._handle_log = lambda *args, **kwargs: True  # type: ignore[assignment]
+
+    assert scout._poll_once() is False
+    assert scout._active_rpc_index == 0
+    assert scout._db.get_meta("featured_active_rpc_index") == "0"
+
+    featured.Web3.failure_sequence = {}
+    result = scout._poll_once()
+    assert result is True
+    assert scout._active_rpc_index == 1
+    assert scout._db.get_meta("featured_active_rpc_index") == "1"
+    with scout._db.read_connection() as conn:
+        processed = conn.execute("SELECT COUNT(*) FROM processed_logs").fetchone()[0]
+    assert processed == 1
+
+
+def test_pro_scout_rotates_rpc_endpoints(tmp_path, scout_modules):
+    _, pro = scout_modules
+
+    class DummyBackendClient:
+        base_url = "http://api"
+
+        def patch(self, *args, **kwargs):
+            return types.SimpleNamespace(status_code=200, text="")
+
+    pro.Web3.default_block_number = 5
+    pro.Web3.default_logs = []
+    pro.Web3.failure_sequence = {}
+
+    service = pro.ProScout(
+        rpc_http_urls=("http://bad", "http://good"),
+        rpc_ws_urls=[],
+        api_base_url="http://api",
+        admin_access_token="token",
+        contract_address="0xabc",
+        db_path=str(tmp_path / "pro_rotate.db"),
+        backend_client=DummyBackendClient(),
+        poll_interval=1,
+        reorg_conf=0,
+    )
+
+    pro.Web3.failure_sequence = {"http://bad": ["block_number"]}
+    initial_last_block = service._last_block
+    service._poll_once()
+    assert service._active_rpc_index == 0
+    assert service.db_manager.get_meta("pro_active_rpc_index") == "0"
+    assert service._last_block == initial_last_block
+
+    pro.Web3.failure_sequence = {}
+    pro.Web3.default_block_number = 6
+    service._poll_once()
+    assert service._active_rpc_index == 1
+    assert service.db_manager.get_meta("pro_active_rpc_index") == "1"
+    assert service._last_block >= initial_last_block
