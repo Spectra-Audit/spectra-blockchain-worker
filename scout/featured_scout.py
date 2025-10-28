@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - web3 without websocket extras
 
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
+from .env_loader import load_env_file
 
 LOGGER = logging.getLogger(__name__)
 
@@ -731,6 +732,7 @@ class FeaturedScout:
 
 
 def _load_config_from_env() -> ScoutConfig:
+    load_env_file()
     rpc_urls_env = os.environ.get("RPC_HTTP_URLS")
     if rpc_urls_env:
         rpc_http_urls = tuple(url.strip() for url in rpc_urls_env.split(",") if url.strip())
