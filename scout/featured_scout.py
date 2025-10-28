@@ -440,13 +440,23 @@ class FeaturedScout:
             for url in self._ws_urls:
                 if self._stop_event.is_set():
                     return
-                try:
-                    self._consume_ws_url(url)
-                except Exception:  # noqa: BLE001
-                    LOGGER.exception("WebSocket listener failed", extra={"url": url})
-                if self._stop_event.is_set():
-                    return
-                time.sleep(self._ws_reconnect_delay)
+                for attempt in range(3):
+                    if self._stop_event.is_set():
+                        return
+                    try:
+                        self._consume_ws_url(url)
+                    except Exception:  # noqa: BLE001
+                        LOGGER.exception(
+                            "WebSocket listener failed",
+                            extra={"url": url, "attempt": attempt + 1},
+                        )
+                        if attempt == 2:
+                            if self._stop_event.is_set():
+                                return
+                            time.sleep(self._ws_reconnect_delay)
+                        continue
+                    else:
+                        break
 
     def _consume_ws_url(self, url: str) -> None:
         provider = WebsocketProvider(url, websocket_timeout=30)  # type: ignore[call-arg]

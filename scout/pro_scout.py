@@ -741,13 +741,23 @@ class ProScout:
             for url in self.rpc_ws_urls:
                 if self._stop_event.is_set():
                     return
-                try:
-                    self._consume_ws_url(url)
-                except Exception as exc:  # pragma: no cover - defensive logging
-                    self.logger.exception("WebSocket listener error", extra={"url": url, "error": str(exc)})
-                if self._stop_event.is_set():
-                    return
-                time.sleep(self._ws_reconnect_delay)
+                for attempt in range(3):
+                    if self._stop_event.is_set():
+                        return
+                    try:
+                        self._consume_ws_url(url)
+                    except Exception as exc:  # pragma: no cover - defensive logging
+                        self.logger.exception(
+                            "WebSocket listener error",
+                            extra={"url": url, "error": str(exc), "attempt": attempt + 1},
+                        )
+                        if attempt == 2:
+                            if self._stop_event.is_set():
+                                return
+                            time.sleep(self._ws_reconnect_delay)
+                        continue
+                    else:
+                        break
 
     def _consume_ws_url(self, url: str) -> None:
         provider = WebsocketProvider(url, websocket_timeout=30)  # type: ignore[call-arg]
