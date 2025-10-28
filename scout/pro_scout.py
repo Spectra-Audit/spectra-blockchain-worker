@@ -12,11 +12,19 @@ import threading
 import time
 from dataclasses import dataclass
 from heapq import heappop, heappush
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from requests import Response
 from web3 import Web3
-from web3.contract import Contract, ContractEvent
+from web3.contract import Contract
+
+try:  # pragma: no cover - compatibility shim for web3<7
+    from web3.contract import ContractEvent
+except ImportError:  # pragma: no cover - ContractEvent moved in newer web3 releases
+    try:
+        from web3.contract.contract import ContractEvent  # type: ignore[attr-defined]
+    except ImportError:  # pragma: no cover - fallback for environments without ContractEvent
+        ContractEvent = Any  # type: ignore[misc,assignment]
 from web3.datastructures import AttributeDict
 from web3.types import EventData, FilterParams, LogReceipt
 
