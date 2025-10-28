@@ -202,7 +202,7 @@ class BackendClient:
         if not refresh_token:
             self._bootstrap_tokens(force=True)
             return
-        url = self._build_url("/v1/auth/refresh")
+        url = self._build_url("auth/refresh")
         payload = {"refresh_token": refresh_token}
         headers = {
             "Authorization": f"Bearer {refresh_token}",

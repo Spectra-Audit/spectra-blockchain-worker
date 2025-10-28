@@ -48,7 +48,7 @@ def test_backend_client_retries_on_server_error() -> None:
         _make_response(200, {"ok": True}),
     ]
     client = BackendClient(
-        "http://api.local",
+        "http://api.local/v1",
         "token",
         "refresh-token",
         session=session,
@@ -67,7 +67,7 @@ def test_backend_client_abort_when_should_retry_returns_false() -> None:
     session.headers = {}
     session.request.side_effect = requests.Timeout("boom")
     client = BackendClient(
-        "http://api.local",
+        "http://api.local/v1",
         "token",
         "refresh-token",
         session=session,
@@ -85,7 +85,7 @@ def test_backend_client_refreshes_token_on_unauthorized() -> None:
     ]
     token_persistor = Mock()
     client = BackendClient(
-        "http://api.local",
+        "http://api.local/v1",
         "old-access",
         "old-refresh",
         session=session,
@@ -115,7 +115,7 @@ def test_backend_client_bootstrap_uses_provider() -> None:
     token_provider = Mock(return_value=("boot-access", "boot-refresh"))
 
     client = BackendClient(
-        "http://api.local",
+        "http://api.local/v1",
         token_provider=token_provider,
         session=session,
     )
@@ -135,7 +135,7 @@ def test_backend_client_refresh_failure_uses_provider() -> None:
     ]
     token_provider = Mock(return_value=("forced-access", "forced-refresh"))
     client = BackendClient(
-        "http://api.local",
+        "http://api.local/v1",
         "old-access",
         "old-refresh",
         session=session,

@@ -64,7 +64,7 @@ def test_siwe_authenticator_performs_handshake(temp_db: DatabaseManager) -> None
     )
     wallet = AdminWallet(address="0xabc", private_key="0x1")
     authenticator = SiweAuthenticator(
-        "http://api.local",
+        "http://api.local/v1",
         wallet,
         temp_db,
         session_factory=lambda: session,
@@ -89,7 +89,7 @@ def test_siwe_authenticator_reuses_refresh_token(temp_db: DatabaseManager) -> No
     )
     wallet = AdminWallet(address="0xabc", private_key="0x1")
     authenticator = SiweAuthenticator(
-        "http://api.local",
+        "http://api.local/v1",
         wallet,
         temp_db,
         session_factory=lambda: session,
@@ -115,7 +115,7 @@ def test_siwe_authenticator_refresh_failure_triggers_handshake(temp_db: Database
     )
     wallet = AdminWallet(address="0xabc", private_key="0x1")
     authenticator = SiweAuthenticator(
-        "http://api.local",
+        "http://api.local/v1",
         wallet,
         temp_db,
         session_factory=lambda: session,
@@ -145,7 +145,7 @@ def test_siwe_authenticator_force_handshake(temp_db: DatabaseManager) -> None:
     )
     wallet = AdminWallet(address="0xabc", private_key="0x1")
     authenticator = SiweAuthenticator(
-        "http://api.local",
+        "http://api.local/v1",
         wallet,
         temp_db,
         session_factory=lambda: session,

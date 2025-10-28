@@ -94,7 +94,7 @@ class SiweAuthenticator:
     # ----------------------------------------------------------------- internals
     def _perform_handshake_locked(self) -> Tuple[str, str]:
         nonce_payload = {"wallet_address": self._wallet.address}
-        nonce_response = self._post("/v1/auth/nonce", json=nonce_payload)
+        nonce_response = self._post("auth/nonce", json=nonce_payload)
         if nonce_response.status_code != 200:
             raise SiweAuthenticationError(
                 f"Nonce request failed with status {nonce_response.status_code}"
@@ -115,7 +115,7 @@ class SiweAuthenticator:
             "message": message,
             "signature": signature,
         }
-        verify_response = self._post("/v1/auth/verify", json=verify_payload)
+        verify_response = self._post("auth/verify", json=verify_payload)
         if verify_response.status_code != 200:
             raise SiweAuthenticationError(
                 f"Verify request failed with status {verify_response.status_code}"
@@ -140,7 +140,7 @@ class SiweAuthenticator:
         }
         refresh_payload = {"refresh_token": refresh_token}
         response = self._post(
-            "/v1/auth/refresh",
+            "auth/refresh",
             json=refresh_payload,
             headers=refresh_headers,
         )
