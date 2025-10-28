@@ -33,6 +33,7 @@ try:  # pragma: no cover - optional at import time
 except ImportError:  # pragma: no cover - websocket extras not installed
     WebsocketProvider = None  # type: ignore[assignment]
 
+from .auth_wallet import AdminWallet, load_or_create_admin_wallet
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
@@ -114,8 +115,10 @@ class ProScout:
         rpc_http_urls: Iterable[str],
         rpc_ws_urls: Optional[Iterable[str]] = None,
         api_base_url: str,
-        admin_access_token: str,
-        admin_refresh_token: str,
+        admin_access_token: Optional[str] = None,
+        admin_refresh_token: Optional[str] = None,
+        admin_wallet_address: Optional[str] = None,
+        admin_wallet_private_key: Optional[str] = None,
         contract_address: str = DEFAULT_CONTRACT_ADDRESS,
         db_path: str = DEFAULT_DB_PATH,
         database: Optional[DatabaseManager] = None,
@@ -134,10 +137,11 @@ class ProScout:
             raise ValueError("At least one rpc_http_url is required")
         if not api_base_url:
             raise ValueError("api_base_url is required")
-        if not admin_access_token:
-            raise ValueError("admin_access_token is required")
-        if not admin_refresh_token:
-            raise ValueError("admin_refresh_token is required")
+        if not admin_access_token or not admin_refresh_token:
+            if not admin_wallet_address or not admin_wallet_private_key:
+                raise ValueError("Admin wallet credentials are required")
+            admin_access_token = admin_access_token or admin_wallet_address
+            admin_refresh_token = admin_refresh_token or admin_wallet_private_key
 
         logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO), format=LOG_FORMAT)
         self.logger = logging.getLogger("ProScout")
@@ -147,6 +151,8 @@ class ProScout:
         self.api_base_url = api_base_url.rstrip("/")
         self.admin_access_token = admin_access_token
         self.admin_refresh_token = admin_refresh_token
+        self.admin_wallet_address = admin_wallet_address or admin_access_token
+        self.admin_wallet_private_key = admin_wallet_private_key or admin_refresh_token
         self.contract_address = Web3.to_checksum_address(contract_address)
         self.poll_interval = poll_interval
         self.reorg_conf = max(reorg_conf, 0)
@@ -170,6 +176,8 @@ class ProScout:
             self.api_base_url,
             self.admin_access_token,
             self.admin_refresh_token,
+            admin_wallet_address=self.admin_wallet_address,
+            admin_wallet_private_key=self.admin_wallet_private_key,
             max_attempts=MAX_HTTP_RETRIES,
         )
 
@@ -725,6 +733,7 @@ class ProScout:
         *,
         database: Optional[DatabaseManager] = None,
         backend_client: Optional[BackendClient] = None,
+        admin_wallet: Optional[AdminWallet] = None,
     ) -> "ProScout":
         load_env_file()
         rpc_http_env = os.environ.get("RPC_HTTP_URLS")
@@ -750,6 +759,17 @@ class ProScout:
         chain_id = int(chain_id_env) if chain_id_env else None
         start_block_env = os.environ.get("START_BLOCK")
         start_block = int(start_block_env) if start_block_env else None
+        if database is not None:
+            wallet = admin_wallet or load_or_create_admin_wallet(database)
+        else:
+            if admin_wallet is not None:
+                wallet = admin_wallet
+            else:
+                temp_db = DatabaseManager(db_path)
+                try:
+                    wallet = load_or_create_admin_wallet(temp_db)
+                finally:
+                    temp_db.close()
         if backend_client is not None:
             if not api_base_url:
                 api_base_url = backend_client.base_url
@@ -757,12 +777,18 @@ class ProScout:
                 admin_access_token = getattr(backend_client, "_access_token", "")
             if not admin_refresh_token:
                 admin_refresh_token = getattr(backend_client, "_refresh_token", "")
+        if not admin_access_token:
+            admin_access_token = wallet.address
+        if not admin_refresh_token:
+            admin_refresh_token = wallet.private_key
 
         return cls(
             rpc_http_urls=rpc_http_urls,
             api_base_url=api_base_url,
             admin_access_token=admin_access_token,
             admin_refresh_token=admin_refresh_token,
+            admin_wallet_address=wallet.address,
+            admin_wallet_private_key=wallet.private_key,
             contract_address=contract_address,
             db_path=db_path,
             database=database,

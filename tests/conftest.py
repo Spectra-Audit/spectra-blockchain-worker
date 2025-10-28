@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -129,3 +131,46 @@ events_module = types.ModuleType("web3._utils.events")
 events_module.get_event_data = lambda *args, **kwargs: {}  # type: ignore[assignment]
 sys.modules.setdefault("web3._utils", utils_module)
 sys.modules.setdefault("web3._utils.events", events_module)
+
+
+class _HexString:
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def hex(self) -> str:  # pragma: no cover - simple access
+        return self._value
+
+
+class _Account:
+    _counter = 0
+    _store: dict[str, str] = {}
+
+    @classmethod
+    def create(cls):  # pragma: no cover - simple deterministic stub
+        cls._counter += 1
+        private_key = f"0x{cls._counter:064x}"
+        address = f"0x{cls._counter:040x}"
+        cls._store[private_key] = address
+        return types.SimpleNamespace(address=address, key=_HexString(private_key))
+
+    @classmethod
+    def from_key(cls, key: str):  # pragma: no cover - simple deterministic stub
+        if isinstance(key, bytes):
+            key_hex = "0x" + key.hex()
+        else:
+            key_hex = key
+        address = cls._store.get(key_hex)
+        if address is None:
+            address = f"0x{int(key_hex, 16) & ((1 << 160) - 1):040x}"
+            cls._store[key_hex] = address
+        return types.SimpleNamespace(address=address, key=_HexString(key_hex))
+
+
+eth_account_module = types.ModuleType("eth_account")
+eth_account_module.Account = _Account
+sys.modules.setdefault("eth_account", eth_account_module)
+
+
+@pytest.fixture(autouse=True)
+def _skip_wallet_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SCOUT_SKIP_WALLET_PROMPT", "1")

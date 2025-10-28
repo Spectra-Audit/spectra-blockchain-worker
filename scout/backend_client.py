@@ -19,9 +19,11 @@ class BackendClient:
     def __init__(
         self,
         base_url: str,
-        admin_token: str,
-        admin_refresh_token: str,
+        admin_token: Optional[str] = None,
+        admin_refresh_token: Optional[str] = None,
         *,
+        admin_wallet_address: Optional[str] = None,
+        admin_wallet_private_key: Optional[str] = None,
         session: Optional[Session] = None,
         max_attempts: int = 5,
         initial_delay: float = 0.5,
@@ -29,10 +31,12 @@ class BackendClient:
     ) -> None:
         if not base_url:
             raise ValueError("base_url is required")
-        if not admin_token:
-            raise ValueError("admin_token is required")
-        if not admin_refresh_token:
-            raise ValueError("admin_refresh_token is required")
+
+        if not admin_token or not admin_refresh_token:
+            if not admin_wallet_address or not admin_wallet_private_key:
+                raise ValueError("Admin wallet credentials are required")
+            admin_token = admin_token or admin_wallet_address
+            admin_refresh_token = admin_refresh_token or admin_wallet_private_key
 
         self.base_url = base_url.rstrip("/")
         self._session = session or requests.Session()
