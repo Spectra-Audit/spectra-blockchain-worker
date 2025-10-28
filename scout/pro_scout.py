@@ -183,15 +183,31 @@ class ProScout:
             )
         self._active_rpc_index = 0
         self._should_persist_provider_index = False
-        web3 = self._ensure_provider()
-        if web3 is None:
+        provider_ready = False
+        last_error: Optional[Exception] = None
+        for _ in range(len(self.rpc_http_urls)):
+            web3 = self._ensure_provider()
+            if web3 is None:
+                break
+            try:
+                if not web3.is_connected():
+                    raise ConnectionError("Unable to connect to RPC node")
+                if self.chain_id is not None:
+                    node_chain_id = web3.eth.chain_id
+                    if node_chain_id != self.chain_id:
+                        raise ValueError(
+                            f"Connected to chain {node_chain_id}, expected {self.chain_id}"
+                        )
+            except Exception as exc:  # noqa: BLE001 - startup fallback handling
+                last_error = exc
+                self._handle_provider_error(exc)
+                continue
+            provider_ready = True
+            break
+        if not provider_ready:
+            if last_error is not None:
+                raise last_error
             raise RuntimeError("No RPC HTTP providers are available")
-        if not web3.is_connected():
-            raise ConnectionError("Unable to connect to RPC node")
-        if self.chain_id is not None:
-            node_chain_id = web3.eth.chain_id
-            if node_chain_id != self.chain_id:
-                raise ValueError(f"Connected to chain {node_chain_id}, expected {self.chain_id}")
 
         self.contract = self.web3.eth.contract(address=self.contract_address, abi=EVENT_ABI)
         self._setup_event_registry()
