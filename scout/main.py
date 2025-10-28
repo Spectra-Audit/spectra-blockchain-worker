@@ -11,6 +11,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import replace
 
+from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .featured_scout import FeaturedScout, _load_config_from_env
 from .pro_scout import DEFAULT_DB_PATH, ProScout
@@ -21,10 +22,18 @@ LOGGER = logging.getLogger(__name__)
 class ScoutApp:
     """Facade that wires ProScout and FeaturedScout around a shared database."""
 
-    def __init__(self, *, database: DatabaseManager, pro_scout: ProScout, featured_scout: FeaturedScout) -> None:
+    def __init__(
+        self,
+        *,
+        database: DatabaseManager,
+        pro_scout: ProScout,
+        featured_scout: FeaturedScout,
+        backend_client: BackendClient,
+    ) -> None:
         self.database = database
         self.pro_scout = pro_scout
         self.featured_scout = featured_scout
+        self.backend_client = backend_client
         self._running = False
         self._closed = False
 
@@ -34,12 +43,20 @@ class ScoutApp:
 
         db_path = os.environ.get("SCOUT_DB_PATH") or os.environ.get("DB_PATH") or DEFAULT_DB_PATH
         database = DatabaseManager(db_path)
-        pro_scout = ProScout.from_env(database=database)
         featured_config = _load_config_from_env()
+        api_base_url = os.environ.get("API_BASE_URL") or featured_config.api_root
+        admin_access_token = featured_config.admin_token
+        backend_client = BackendClient(api_base_url, admin_access_token)
+        pro_scout = ProScout.from_env(database=database, backend_client=backend_client)
         if featured_config.db_path != db_path:
             featured_config = replace(featured_config, db_path=db_path)
-        featured_scout = FeaturedScout(featured_config, database=database)
-        return cls(database=database, pro_scout=pro_scout, featured_scout=featured_scout)
+        featured_scout = FeaturedScout(featured_config, database=database, backend_client=backend_client)
+        return cls(
+            database=database,
+            pro_scout=pro_scout,
+            featured_scout=featured_scout,
+            backend_client=backend_client,
+        )
 
     def __enter__(self) -> "ScoutApp":
         return self
@@ -71,6 +88,7 @@ class ScoutApp:
         if self._running:
             self.stop()
         self.database.close()
+        self.backend_client.close()
         self._closed = True
 
     def run(self) -> None:
