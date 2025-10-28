@@ -45,8 +45,10 @@ pip install web3 requests pytest
 
 ## Configuration
 
-The worker is configured entirely through environment variables. The most
-important settings are listed below.
+The worker is configured entirely through environment variables. Start by
+copying `.env.example` to `.env` and updating the values for your deployment;
+every variable mentioned below is documented there with inline guidance. The
+most important settings are listed below.
 
 | Variable | Description |
 | --- | --- |
