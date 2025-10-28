@@ -356,6 +356,80 @@ def test_featured_scout_rotates_rpc_endpoints(tmp_path, scout_modules):
     assert processed == 1
 
 
+def test_featured_scout_batches_get_logs_requests(tmp_path, scout_modules):
+    featured, _ = scout_modules
+
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=(),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_batch.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=1,
+        start_block=5,
+        start_block_latest=False,
+        block_batch_size=2,
+    )
+    scout = featured.FeaturedScout(config, once=True)
+    scout._handle_log = lambda *args, **kwargs: True  # type: ignore[assignment]
+
+    scout._web3.eth.block_number = 10
+    calls = []
+
+    def fake_get_logs(params):
+        calls.append((params["fromBlock"], params["toBlock"]))
+        return []
+
+    scout._web3.eth.get_logs = fake_get_logs  # type: ignore[assignment]
+
+    assert scout._poll_once() is True
+    assert calls == [(5, 6), (7, 8), (9, 10)]
+    assert scout._db.get_meta("featured_last_block") == "10"
+
+
+def test_featured_scout_persists_progress_across_batch_failures(
+    tmp_path, scout_modules
+):
+    featured, _ = scout_modules
+
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=(),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_batch_failure.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=1,
+        start_block=5,
+        start_block_latest=False,
+        block_batch_size=2,
+    )
+    scout = featured.FeaturedScout(config, once=True)
+    scout._handle_log = lambda *args, **kwargs: True  # type: ignore[assignment]
+
+    scout._web3.eth.block_number = 10
+    calls = []
+
+    def flaky_get_logs(params):
+        calls.append((params["fromBlock"], params["toBlock"]))
+        if len(calls) == 2:
+            raise RuntimeError("boom")
+        return []
+
+    scout._web3.eth.get_logs = flaky_get_logs  # type: ignore[assignment]
+
+    assert scout._poll_once() is False
+    assert calls == [(5, 6), (7, 8)]
+    assert scout._db.get_meta("featured_last_block") == "6"
+
+
 def test_pro_scout_rotates_rpc_endpoints(tmp_path, scout_modules):
     _, pro = scout_modules
 

@@ -84,6 +84,7 @@ class ScoutConfig:
     reorg_confirmations: int
     start_block: Optional[int]
     start_block_latest: bool
+    block_batch_size: int = 1000
 
 
 class FeaturedScout:
@@ -106,6 +107,8 @@ class FeaturedScout:
         self._rpc_urls = [url for url in config.rpc_http_urls if url]
         if not self._rpc_urls:
             raise ValueError("At least one RPC HTTP URL must be configured")
+        if config.block_batch_size <= 0:
+            raise ValueError("block_batch_size must be a positive integer")
         self._rpc_fail_counts = [0 for _ in self._rpc_urls]
         self._rpc_backoff_until = [0.0 for _ in self._rpc_urls]
         self._needs_provider_reset = False
@@ -296,36 +299,55 @@ class FeaturedScout:
         if safe_block <= last_block:
             LOGGER.debug("No new finalized blocks", extra={"safe_block": safe_block, "last_block": last_block})
             return True
-        from_block = last_block + 1
-        to_block = safe_block
-        filter_params: FilterParams = {
-            "address": Web3.to_checksum_address(self._config.contract_address),
-            "fromBlock": from_block,
-            "toBlock": to_block,
-            "topics": [[topic for topic in self._event_topic_map]],
-        }
-        try:
-            logs: Sequence[LogReceipt] = web3.eth.get_logs(filter_params)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.exception(
-                "Failed to fetch logs",
-                extra={"from_block": from_block, "to_block": to_block},
-                exc_info=exc,
-            )
-            self._handle_provider_error(exc)
-            return False
-        self._mark_provider_success()
-        sorted_logs = sorted(logs, key=lambda entry: (entry["blockNumber"], entry["logIndex"]))
-        for log_entry in sorted_logs:
+        window_start = last_block + 1
+        window_end = safe_block
+        batch_size = self._config.block_batch_size
+        total_logs = 0
+        current_from = window_start
+        while current_from <= window_end:
             if self._stop_event.is_set():
                 return False
-            if not self._process_log_entry(log_entry):
+            current_to = min(current_from + batch_size - 1, window_end)
+            filter_params: FilterParams = {
+                "address": Web3.to_checksum_address(self._config.contract_address),
+                "fromBlock": current_from,
+                "toBlock": current_to,
+                "topics": [[topic for topic in self._event_topic_map]],
+            }
+            try:
+                logs: Sequence[LogReceipt] = web3.eth.get_logs(filter_params)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception(
+                    "Failed to fetch logs",
+                    extra={"from_block": current_from, "to_block": current_to},
+                    exc_info=exc,
+                )
+                self._handle_provider_error(exc)
                 return False
-        with self._lock:
-            self._save_last_block(to_block)
+            self._mark_provider_success()
+            sorted_logs = sorted(
+                logs, key=lambda entry: (entry["blockNumber"], entry["logIndex"])
+            )
+            for log_entry in sorted_logs:
+                if self._stop_event.is_set():
+                    return False
+                if not self._process_log_entry(log_entry):
+                    return False
+            with self._lock:
+                self._save_last_block(current_to)
+            total_logs += len(sorted_logs)
+            LOGGER.info(
+                "Processed block chunk",
+                extra={
+                    "from_block": current_from,
+                    "to_block": current_to,
+                    "log_count": len(sorted_logs),
+                },
+            )
+            current_from = current_to + 1
         LOGGER.info(
             "Processed blocks",
-            extra={"from_block": from_block, "to_block": to_block, "log_count": len(sorted_logs)},
+            extra={"from_block": window_start, "to_block": window_end, "log_count": total_logs},
         )
         return True
 
@@ -753,6 +775,7 @@ def _load_config_from_env() -> ScoutConfig:
     resolver_url = os.environ.get("PROJECT_ID_RESOLVER_URL")
     db_path = os.environ.get("DB_PATH", "featured_scout.db")
     poll_interval = int(os.environ.get("POLL_INTERVAL_SEC", "8"))
+    block_batch_size = int(os.environ.get("BLOCK_BATCH_SIZE", "1000"))
     reorg_conf = int(os.environ.get("REORG_CONF", "5"))
     start_block_env = os.environ.get("START_BLOCK", "latest")
     start_block_latest = start_block_env.lower() == "latest"
@@ -772,6 +795,7 @@ def _load_config_from_env() -> ScoutConfig:
         reorg_confirmations=reorg_conf,
         start_block=start_block,
         start_block_latest=start_block_latest,
+        block_batch_size=block_batch_size,
     )
 
 
