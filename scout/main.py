@@ -13,6 +13,7 @@ from dataclasses import replace
 
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
+from .env_loader import load_env_file
 from .featured_scout import FeaturedScout, _load_config_from_env
 from .pro_scout import DEFAULT_DB_PATH, ProScout
 
@@ -41,6 +42,7 @@ class ScoutApp:
     def from_env(cls) -> "ScoutApp":
         """Construct the application from environment configuration."""
 
+        load_env_file()
         db_path = os.environ.get("SCOUT_DB_PATH") or os.environ.get("DB_PATH") or DEFAULT_DB_PATH
         database = DatabaseManager(db_path)
         featured_config = _load_config_from_env()

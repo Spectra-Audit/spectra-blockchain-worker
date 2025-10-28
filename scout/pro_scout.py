@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover - websocket extras not installed
 
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
+from .env_loader import load_env_file
 
 EVENT_ABI = [
     {
@@ -717,6 +718,7 @@ class ProScout:
         database: Optional[DatabaseManager] = None,
         backend_client: Optional[BackendClient] = None,
     ) -> "ProScout":
+        load_env_file()
         rpc_http_env = os.environ.get("RPC_HTTP_URLS")
         if rpc_http_env:
             rpc_http_urls = [url.strip() for url in rpc_http_env.split(",") if url.strip()]
