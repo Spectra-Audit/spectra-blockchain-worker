@@ -175,7 +175,14 @@ class ProScout:
         self._ws_thread: Optional[threading.Thread] = None
         self._ws_reconnect_delay = max(self.poll_interval, 1)
 
-        self._active_rpc_index = self._load_active_rpc_index()
+        persisted_index = self._load_active_rpc_index()
+        if persisted_index:
+            self.logger.debug(
+                "Ignoring persisted RPC index on startup",
+                extra={"index": persisted_index},
+            )
+        self._active_rpc_index = 0
+        self._should_persist_provider_index = False
         web3 = self._ensure_provider()
         if web3 is None:
             raise RuntimeError("No RPC HTTP providers are available")
@@ -621,7 +628,8 @@ class ProScout:
         self._rpc_fail_counts[index] = 0
         self._rpc_backoff_until[index] = 0.0
         self._needs_provider_reset = False
-        self._save_active_rpc_index(index)
+        if self._should_persist_provider_index:
+            self._save_active_rpc_index(index)
 
     def _ensure_provider(self) -> Optional[Web3]:
         with self._provider_lock:
@@ -652,6 +660,9 @@ class ProScout:
         index = self._active_rpc_index
         if index is None:
             return
+        if not self._should_persist_provider_index:
+            self._should_persist_provider_index = True
+            self._save_active_rpc_index(index)
         self._rpc_fail_counts[index] = 0
         self._rpc_backoff_until[index] = 0.0
 

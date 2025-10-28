@@ -116,7 +116,14 @@ class FeaturedScout:
         self._client = backend_client or BackendClient(config.api_root, config.admin_token)
         self._ws_urls = [url for url in config.rpc_ws_urls if url]
         self._ws_reconnect_delay = max(config.poll_interval_sec, 1)
-        self._active_rpc_index = self._load_active_rpc_index()
+        persisted_index = self._load_active_rpc_index()
+        if persisted_index:
+            LOGGER.debug(
+                "Ignoring persisted RPC index on startup",
+                extra={"index": persisted_index},
+            )
+        self._active_rpc_index = 0
+        self._should_persist_provider_index = False
         self._activate_provider(self._active_rpc_index)
         self._ensure_schema()
 
@@ -192,7 +199,8 @@ class FeaturedScout:
         self._rpc_fail_counts[index] = 0
         self._rpc_backoff_until[index] = 0.0
         self._needs_provider_reset = False
-        self._save_active_rpc_index(index)
+        if self._should_persist_provider_index:
+            self._save_active_rpc_index(index)
         self._refresh_event_topic_map()
 
     def _ensure_provider(self) -> Optional[Web3]:
@@ -224,6 +232,9 @@ class FeaturedScout:
         index = self._active_rpc_index
         if index is None:
             return
+        if not self._should_persist_provider_index:
+            self._should_persist_provider_index = True
+            self._save_active_rpc_index(index)
         self._rpc_fail_counts[index] = 0
         self._rpc_backoff_until[index] = 0.0
 
