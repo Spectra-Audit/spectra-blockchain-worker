@@ -68,7 +68,7 @@ class DummyKeccak:
         self._text = text
 
     def hex(self) -> str:
-        return self._text
+        return f"0x{self._text}"
 
 
 class DummyWeb3:
@@ -76,7 +76,9 @@ class DummyWeb3:
 
     HTTPProvider = DummyHTTPProvider
     to_checksum_address = staticmethod(lambda addr: addr)
-    to_hex = staticmethod(lambda value: value)
+    @staticmethod
+    def to_hex(value: Any) -> Any:
+        return value.hex() if hasattr(value, "hex") else value
 
     def __init__(self, provider: DummyHTTPProvider) -> None:
         self.provider = provider
