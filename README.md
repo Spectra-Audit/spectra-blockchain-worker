@@ -51,6 +51,7 @@ important settings are listed below.
 | Variable | Description |
 | --- | --- |
 | `RPC_HTTP_URL` | **Required.** HTTPS URL for the Ethereum JSON-RPC endpoint used to pull logs. |
+| `RPC_WS_URLS` | Optional comma-separated list of WebSocket RPC endpoints used for live `eth_subscribe` streams. |
 | `ADMIN_ACCESS_TOKEN` | **Required.** Admin token used to authenticate with the Spectra backend. |
 | `API_BASE_URL` | Base URL for the Spectra backend API. Defaults to `http://localhost:8000/v1`. |
 | `CONTRACT_ADDRESS` | Address of the Featured contract that emits the events being tracked. |
@@ -76,9 +77,12 @@ python -m scout run
 ```
 
 This starts both the Featured and Pro scouts, waits for blockchain events, and
-publishes updates to the Spectra backend. The process listens for `SIGINT` and
-`SIGTERM` to perform a clean shutdown. To inspect the last processed blocks
-without running the worker, execute:
+publishes updates to the Spectra backend. When `RPC_WS_URLS` is provided the
+worker maintains live WebSocket subscriptions in addition to the historical HTTP
+pollers, automatically falling back to HTTP-only mode if the socket connection
+drops. The process listens for `SIGINT` and `SIGTERM` to perform a clean
+shutdown. To inspect the last processed blocks without running the worker,
+execute:
 
 ```bash
 python -m scout status

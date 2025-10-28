@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import logging
 import os
 import signal
@@ -17,6 +19,11 @@ from web3 import Web3
 from web3._utils.events import get_event_data
 from web3.datastructures import AttributeDict
 from web3.types import FilterParams, LogReceipt
+
+try:  # pragma: no cover - optional dependency at runtime
+    from web3.providers.websocket import WebsocketProvider
+except ImportError:  # pragma: no cover - web3 without websocket extras
+    WebsocketProvider = None  # type: ignore[assignment]
 
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
@@ -65,6 +72,7 @@ EVENT_ABI: List[Dict[str, Any]] = [
 @dataclass(frozen=True)
 class ScoutConfig:
     rpc_url: str
+    rpc_ws_urls: Sequence[str]
     contract_address: str
     chain_id: Optional[int]
     api_root: str
@@ -92,6 +100,7 @@ class FeaturedScout:
         self._once = once
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._ws_thread: Optional[threading.Thread] = None
         self._web3 = Web3(Web3.HTTPProvider(config.rpc_url, request_kwargs={"timeout": 30}))
         self._contract = self._web3.eth.contract(address=Web3.to_checksum_address(config.contract_address), abi=EVENT_ABI)
         self._event_topic_map = {
@@ -103,6 +112,8 @@ class FeaturedScout:
         self._lock = threading.Lock()
         self._meta_key = "featured_last_block"
         self._client = backend_client or BackendClient(config.api_root, config.admin_token)
+        self._ws_urls = [url for url in config.rpc_ws_urls if url]
+        self._ws_reconnect_delay = max(config.poll_interval_sec, 1)
         self._ensure_schema()
 
     def start(self) -> None:
@@ -110,11 +121,16 @@ class FeaturedScout:
             raise RuntimeError("FeaturedScout already running")
         self._thread = threading.Thread(target=self._run, name="FeaturedScout", daemon=True)
         self._thread.start()
+        if self._ws_urls:
+            self._start_ws_listener()
 
     def stop(self, timeout: float = 10.0) -> None:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=timeout)
+        if self._ws_thread:
+            self._ws_thread.join(timeout=timeout)
+            self._ws_thread = None
         if self._owns_db:
             self._db.close()
 
@@ -174,24 +190,8 @@ class FeaturedScout:
         for log_entry in sorted_logs:
             if self._stop_event.is_set():
                 return False
-            tx_hash = log_entry["transactionHash"].hex()
-            log_index = int(log_entry["logIndex"])
-            if self._is_log_processed(tx_hash, log_index):
-                continue
-            try:
-                handled = self._handle_log(log_entry)
-            except Exception:  # noqa: BLE001
-                LOGGER.exception(
-                    "Unhandled error while processing log",
-                    extra={
-                        "tx_hash": tx_hash,
-                        "log_index": log_index,
-                        "block": int(log_entry["blockNumber"]),
-                    },
-                )
+            if not self._process_log_entry(log_entry):
                 return False
-            if handled:
-                self._mark_log_processed(tx_hash, log_index)
         with self._lock:
             self._save_last_block(to_block)
         LOGGER.info(
@@ -285,6 +285,154 @@ class FeaturedScout:
                 )
         self._upsert_featured_projects(round_id, projects_current)
         return True
+
+    def _process_log_entry(self, log_entry: LogReceipt) -> bool:
+        tx_hash = self._coerce_hex_str(log_entry.get("transactionHash"))
+        log_index = self._coerce_int(log_entry.get("logIndex"))
+        if self._is_log_processed(tx_hash, log_index):
+            return True
+        try:
+            handled = self._handle_log(log_entry)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception(
+                "Unhandled error while processing log",
+                extra={
+                    "tx_hash": tx_hash,
+                    "log_index": log_index,
+                    "block": int(self._coerce_int(log_entry.get("blockNumber", 0))),
+                },
+            )
+            return False
+        if handled:
+            self._mark_log_processed(tx_hash, log_index)
+        return handled
+
+    def _start_ws_listener(self) -> None:
+        if not self._ws_urls:
+            return
+        if WebsocketProvider is None:
+            LOGGER.warning("web3 websocket provider unavailable; disabling live subscriptions")
+            return
+        if self._ws_thread and self._ws_thread.is_alive():
+            return
+        self._ws_thread = threading.Thread(target=self._websocket_loop, name="FeaturedScoutWS", daemon=True)
+        self._ws_thread.start()
+
+    def _websocket_loop(self) -> None:
+        while not self._stop_event.is_set():
+            for url in self._ws_urls:
+                if self._stop_event.is_set():
+                    return
+                try:
+                    self._consume_ws_url(url)
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("WebSocket listener failed", extra={"url": url})
+                if self._stop_event.is_set():
+                    return
+                time.sleep(self._ws_reconnect_delay)
+
+    def _consume_ws_url(self, url: str) -> None:
+        provider = WebsocketProvider(url, websocket_timeout=30)  # type: ignore[call-arg]
+        filter_params = {
+            "address": Web3.to_checksum_address(self._config.contract_address),
+            "topics": [[topic for topic in self._event_topic_map]],
+        }
+        response = provider.make_request("eth_subscribe", ["logs", filter_params])
+        subscription_id = response.get("result") if isinstance(response, dict) else None
+        if not subscription_id:
+            raise RuntimeError("Failed to subscribe to websocket logs")
+        try:
+            while not self._stop_event.is_set():
+                message = provider.ws.recv()
+                if not message:
+                    continue
+                try:
+                    payload = json.loads(message)
+                except json.JSONDecodeError:
+                    LOGGER.debug("Ignoring non-JSON websocket payload", extra={"payload": message})
+                    continue
+                if payload.get("method") != "eth_subscription":
+                    continue
+                self._handle_ws_payload(payload)
+        finally:
+            with contextlib.suppress(Exception):
+                provider.make_request("eth_unsubscribe", [subscription_id])
+            with contextlib.suppress(Exception):
+                if hasattr(provider, "disconnect"):
+                    provider.disconnect()
+            with contextlib.suppress(Exception):
+                if hasattr(provider, "ws") and hasattr(provider.ws, "close"):
+                    provider.ws.close()
+
+    def _handle_ws_payload(self, payload: Dict[str, Any]) -> None:
+        params = payload.get("params") if isinstance(payload, dict) else None
+        if not isinstance(params, dict):
+            return
+        result = params.get("result")
+        if not isinstance(result, dict):
+            return
+        if result.get("removed"):
+            LOGGER.debug("Skipping removed websocket log", extra={"tx": result.get("transactionHash")})
+            return
+        log_entry = self._convert_ws_result(result)
+        if log_entry is None:
+            return
+        self._process_log_entry(log_entry)
+
+    def _convert_ws_result(self, result: Dict[str, Any]) -> Optional[LogReceipt]:
+        try:
+            topics = [self._ensure_hex_bytes(topic) for topic in result.get("topics", [])]
+            log_entry: Dict[str, Any] = {
+                "address": Web3.to_checksum_address(result.get("address", self._config.contract_address)),
+                "blockHash": self._ensure_hex_bytes(result.get("blockHash")),
+                "blockNumber": self._coerce_int(result.get("blockNumber", 0)),
+                "data": self._ensure_hex_bytes(result.get("data")),
+                "logIndex": self._coerce_int(result.get("logIndex", 0)),
+                "topics": topics,
+                "transactionHash": self._ensure_hex_bytes(result.get("transactionHash")),
+                "transactionIndex": self._coerce_int(result.get("transactionIndex", 0)),
+            }
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed to normalize websocket log")
+            return None
+        return AttributeDict(log_entry)
+
+    @staticmethod
+    def _ensure_hex_bytes(value: Any) -> bytes:
+        if value is None:
+            return b""
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, str):
+            cleaned = value[2:] if value.startswith("0x") else value
+            if not cleaned:
+                return b""
+            return bytes.fromhex(cleaned)
+        if hasattr(value, "hex") and callable(getattr(value, "hex")):
+            return bytes(value)
+        raise TypeError(f"Cannot convert value to bytes: {value!r}")
+
+    @staticmethod
+    def _coerce_hex_str(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, bytes):
+            return "0x" + value.hex()
+        if hasattr(value, "hex") and callable(getattr(value, "hex")):
+            return value.hex()
+        raise TypeError(f"Cannot convert value to hex string: {value!r}")
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            return int(value, 16 if value.startswith("0x") else 10)
+        if value is None:
+            return 0
+        if hasattr(value, "__int__"):
+            return int(value)
+        raise TypeError(f"Cannot convert value to int: {value!r}")
 
     def _handle_paid(self, event_data: AttributeDict) -> bool:
         args = event_data["args"]
@@ -448,6 +596,8 @@ def _load_config_from_env() -> ScoutConfig:
     rpc_url = os.environ.get("RPC_HTTP_URL")
     if not rpc_url:
         raise RuntimeError("RPC_HTTP_URL is required")
+    rpc_ws_urls_env = os.environ.get("RPC_WS_URLS", "")
+    rpc_ws_urls = tuple(url.strip() for url in rpc_ws_urls_env.split(",") if url.strip())
     contract_address = os.environ.get("CONTRACT_ADDRESS", "0xe6733635aF5Ce7a1E022fbD87670EADa95397558")
     chain_id_env = os.environ.get("CHAIN_ID")
     chain_id = int(chain_id_env) if chain_id_env else None
@@ -466,6 +616,7 @@ def _load_config_from_env() -> ScoutConfig:
         start_block = int(start_block_env, 0)
     return ScoutConfig(
         rpc_url=rpc_url,
+        rpc_ws_urls=rpc_ws_urls,
         contract_address=contract_address,
         chain_id=chain_id,
         api_root=api_root,

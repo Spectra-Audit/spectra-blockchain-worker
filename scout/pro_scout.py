@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import logging
 import os
 import signal
@@ -15,7 +17,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from requests import Response
 from web3 import Web3
 from web3.contract import Contract, ContractEvent
+from web3.datastructures import AttributeDict
 from web3.types import EventData, FilterParams, LogReceipt
+
+try:  # pragma: no cover - optional at import time
+    from web3.providers.websocket import WebsocketProvider
+except ImportError:  # pragma: no cover - websocket extras not installed
+    WebsocketProvider = None  # type: ignore[assignment]
 
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
@@ -95,6 +103,7 @@ class ProScout:
         self,
         *,
         rpc_http_url: str,
+        rpc_ws_urls: Optional[Iterable[str]] = None,
         api_base_url: str,
         admin_access_token: str,
         contract_address: str = DEFAULT_CONTRACT_ADDRESS,
@@ -121,6 +130,7 @@ class ProScout:
         self.logger = logging.getLogger("ProScout")
 
         self.rpc_http_url = rpc_http_url
+        self.rpc_ws_urls = [url for url in (rpc_ws_urls or []) if url]
         self.api_base_url = api_base_url.rstrip("/")
         self.admin_access_token = admin_access_token
         self.contract_address = Web3.to_checksum_address(contract_address)
@@ -165,6 +175,8 @@ class ProScout:
         self._stopped = threading.Event()
         self._poller_thread: Optional[threading.Thread] = None
         self._scheduler_thread: Optional[threading.Thread] = None
+        self._ws_thread: Optional[threading.Thread] = None
+        self._ws_reconnect_delay = max(self.poll_interval, 1)
 
         stored_last_block = self._load_last_block()
         if stored_last_block is None:
@@ -191,6 +203,8 @@ class ProScout:
         )
         self._poller_thread.start()
         self._scheduler_thread.start()
+        if self.rpc_ws_urls:
+            self._start_ws_listener()
         self.logger.info("ProScout service started")
 
     def stop(self, timeout: float = 10.0) -> None:
@@ -206,6 +220,9 @@ class ProScout:
         if self._scheduler_thread:
             self._scheduler_thread.join(timeout=timeout)
             self._scheduler_thread = None
+        if self._ws_thread:
+            self._ws_thread.join(timeout=timeout)
+            self._ws_thread = None
         if self._owns_db_manager:
             self.db_manager.close()
         self.logger.info("ProScout service stopped")
@@ -239,15 +256,15 @@ class ProScout:
         self.logger.debug("Fetching logs", extra={"from_block": from_block, "to_block": to_block})
         logs: List[LogReceipt] = self.web3.eth.get_logs(filter_params)
         for log in logs:
-            self._process_log(log)
+            self._process_log_entry(log)
 
         self._last_block = to_block
         self._save_last_block(self._last_block)
 
-    def _process_log(self, log: LogReceipt) -> None:
-        tx_hash = log["transactionHash"].hex()
-        log_index = log["logIndex"]
-        block_number = log["blockNumber"]
+    def _process_log_entry(self, log: LogReceipt) -> None:
+        tx_hash = self._coerce_hex_str(log.get("transactionHash"))
+        log_index = self._coerce_int(log.get("logIndex"))
+        block_number = self._coerce_int(log.get("blockNumber"))
         if self._is_log_processed(tx_hash, log_index):
             self.logger.debug(
                 "Skipping already processed log",
@@ -255,7 +272,11 @@ class ProScout:
             )
             return
 
-        topic_hex = Web3.to_hex(log["topics"][0])
+        topic_value = log.get("topics", [None])[0]
+        if topic_value is None:
+            self.logger.warning("Log missing topic", extra={"tx_hash": tx_hash})
+            return
+        topic_hex = Web3.to_hex(topic_value)
         event = self._topic_to_event.get(topic_hex)
         if event is None:
             self.logger.warning("Unknown topic", extra={"topic": topic_hex})
@@ -274,6 +295,10 @@ class ProScout:
 
         if handler(decoded, tx_hash, log_index, block_number):
             self._mark_log_processed(tx_hash, log_index)
+        else:
+            self.logger.debug(
+                "Handler indicated log retry", extra={"tx_hash": tx_hash, "log_index": log_index}
+            )
 
     # Event handlers --------------------------------------------------------------
 
@@ -535,6 +560,8 @@ class ProScout:
         backend_client: Optional[BackendClient] = None,
     ) -> "ProScout":
         rpc_http_url = os.environ.get("RPC_HTTP_URL", "")
+        rpc_ws_env = os.environ.get("RPC_WS_URLS", "")
+        rpc_ws_urls = [url.strip() for url in rpc_ws_env.split(",") if url.strip()]
         api_base_url = os.environ.get("API_BASE_URL", "")
         admin_access_token = os.environ.get("ADMIN_ACCESS_TOKEN", "")
         contract_address = os.environ.get("CONTRACT_ADDRESS", DEFAULT_CONTRACT_ADDRESS)
@@ -567,7 +594,133 @@ class ProScout:
             log_level=log_level,
             chain_id=chain_id,
             start_block=start_block,
+            rpc_ws_urls=rpc_ws_urls,
         )
+
+    def _start_ws_listener(self) -> None:
+        if not self.rpc_ws_urls:
+            return
+        if WebsocketProvider is None:
+            self.logger.warning("web3 websocket provider unavailable; disabling live subscriptions")
+            return
+        if self._ws_thread and self._ws_thread.is_alive():
+            return
+        self._ws_thread = threading.Thread(target=self._websocket_loop, name="ProScoutWS", daemon=True)
+        self._ws_thread.start()
+
+    def _websocket_loop(self) -> None:
+        while not self._stop_event.is_set():
+            for url in self.rpc_ws_urls:
+                if self._stop_event.is_set():
+                    return
+                try:
+                    self._consume_ws_url(url)
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    self.logger.exception("WebSocket listener error", extra={"url": url, "error": str(exc)})
+                if self._stop_event.is_set():
+                    return
+                time.sleep(self._ws_reconnect_delay)
+
+    def _consume_ws_url(self, url: str) -> None:
+        provider = WebsocketProvider(url, websocket_timeout=30)  # type: ignore[call-arg]
+        filter_params = {
+            "address": self.contract_address,
+            "topics": [self.event_topics],
+        }
+        response = provider.make_request("eth_subscribe", ["logs", filter_params])
+        subscription_id = response.get("result") if isinstance(response, dict) else None
+        if not subscription_id:
+            raise RuntimeError("Failed to subscribe to websocket logs")
+        try:
+            while not self._stop_event.is_set():
+                message = provider.ws.recv()
+                if not message:
+                    continue
+                try:
+                    payload = json.loads(message)
+                except json.JSONDecodeError:
+                    self.logger.debug("Ignoring malformed websocket payload", extra={"payload": message})
+                    continue
+                if payload.get("method") != "eth_subscription":
+                    continue
+                self._handle_ws_payload(payload)
+        finally:
+            with contextlib.suppress(Exception):
+                provider.make_request("eth_unsubscribe", [subscription_id])
+            with contextlib.suppress(Exception):
+                provider.disconnect()
+
+    def _handle_ws_payload(self, payload: Dict[str, Any]) -> None:
+        params = payload.get("params") if isinstance(payload, dict) else None
+        if not isinstance(params, dict):
+            return
+        result = params.get("result")
+        if not isinstance(result, dict):
+            return
+        if result.get("removed"):
+            self.logger.debug(
+                "Skipping removed websocket log", extra={"tx_hash": result.get("transactionHash")}
+            )
+            return
+        log_entry = self._convert_ws_result(result)
+        if log_entry is None:
+            return
+        self._process_log_entry(log_entry)
+
+    def _convert_ws_result(self, result: Dict[str, Any]) -> Optional[LogReceipt]:
+        try:
+            topics = [self._ensure_hex_bytes(topic) for topic in result.get("topics", [])]
+            log_entry: Dict[str, Any] = {
+                "address": Web3.to_checksum_address(result.get("address", self.contract_address)),
+                "blockHash": self._ensure_hex_bytes(result.get("blockHash")),
+                "blockNumber": self._coerce_int(result.get("blockNumber", 0)),
+                "data": self._ensure_hex_bytes(result.get("data")),
+                "logIndex": self._coerce_int(result.get("logIndex", 0)),
+                "topics": topics,
+                "transactionHash": self._ensure_hex_bytes(result.get("transactionHash")),
+                "transactionIndex": self._coerce_int(result.get("transactionIndex", 0)),
+            }
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.exception("Failed to normalize websocket log", extra={"error": str(exc)})
+            return None
+        return AttributeDict(log_entry)
+
+    @staticmethod
+    def _ensure_hex_bytes(value: Any) -> bytes:
+        if value is None:
+            return b""
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, str):
+            cleaned = value[2:] if value.startswith("0x") else value
+            if not cleaned:
+                return b""
+            return bytes.fromhex(cleaned)
+        if hasattr(value, "hex") and callable(getattr(value, "hex")):
+            return bytes(value)
+        raise TypeError(f"Cannot convert value to bytes: {value!r}")
+
+    @staticmethod
+    def _coerce_hex_str(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, bytes):
+            return "0x" + value.hex()
+        if hasattr(value, "hex") and callable(getattr(value, "hex")):
+            return value.hex()
+        raise TypeError(f"Cannot convert value to hex string: {value!r}")
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            return int(value, 16 if value.startswith("0x") else 10)
+        if value is None:
+            return 0
+        if hasattr(value, "__int__"):
+            return int(value)
+        raise TypeError(f"Cannot convert value to int: {value!r}")
 
     # TODO: Add unit tests for event decoding and HTTP patch behavior using mocks.
 
