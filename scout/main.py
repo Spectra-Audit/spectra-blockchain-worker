@@ -17,6 +17,7 @@ from .database_manager import DatabaseManager
 from .env_loader import load_env_file
 from .featured_scout import FeaturedScout, _load_config_from_env
 from .pro_scout import DEFAULT_DB_PATH, ProScout
+from .siwe_authenticator import SiweAuthenticator
 
 LOGGER = logging.getLogger(__name__)
 
@@ -49,10 +50,11 @@ class ScoutApp:
         admin_wallet = load_or_create_admin_wallet(database)
         featured_config = _load_config_from_env(database=database)
         api_base_url = os.environ.get("API_BASE_URL") or featured_config.api_root
+        authenticator = SiweAuthenticator(api_base_url, admin_wallet, database)
         backend_client = BackendClient(
             api_base_url,
-            admin_wallet_address=admin_wallet.address,
-            admin_wallet_private_key=admin_wallet.private_key,
+            token_provider=authenticator.get_tokens,
+            token_persistor=authenticator.persist_tokens,
         )
         pro_scout = ProScout.from_env(
             database=database,

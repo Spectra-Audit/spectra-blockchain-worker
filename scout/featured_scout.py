@@ -125,8 +125,6 @@ class FeaturedScout:
             config.api_root,
             config.admin_token,
             config.admin_refresh_token,
-            admin_wallet_address=config.admin_wallet_address,
-            admin_wallet_private_key=config.admin_wallet_private_key,
         )
         self._ws_urls = [url for url in config.rpc_ws_urls if url]
         self._ws_reconnect_delay = max(config.poll_interval_sec, 1)

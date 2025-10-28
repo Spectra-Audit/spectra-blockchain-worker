@@ -22,8 +22,8 @@ class BackendClient:
         admin_token: Optional[str] = None,
         admin_refresh_token: Optional[str] = None,
         *,
-        admin_wallet_address: Optional[str] = None,
-        admin_wallet_private_key: Optional[str] = None,
+        token_provider: Optional[Callable[[bool], tuple[str, str]]] = None,
+        token_persistor: Optional[Callable[[str, str], None]] = None,
         session: Optional[Session] = None,
         max_attempts: int = 5,
         initial_delay: float = 0.5,
@@ -32,19 +32,21 @@ class BackendClient:
         if not base_url:
             raise ValueError("base_url is required")
 
-        if not admin_token or not admin_refresh_token:
-            if not admin_wallet_address or not admin_wallet_private_key:
-                raise ValueError("Admin wallet credentials are required")
-            admin_token = admin_token or admin_wallet_address
-            admin_refresh_token = admin_refresh_token or admin_wallet_private_key
-
         self.base_url = base_url.rstrip("/")
         self._session = session or requests.Session()
         self._lock = threading.Lock()
-        self._access_token = admin_token
-        self._refresh_token = admin_refresh_token
+        self._token_provider = token_provider
+        self._token_persistor = token_persistor
+        self._access_token: Optional[str] = None
+        self._refresh_token: Optional[str] = None
         self._session.headers.update({"Accept": "application/json"})
-        self.update_tokens(admin_token, admin_refresh_token)
+
+        if admin_token and admin_refresh_token:
+            self.update_tokens(admin_token, admin_refresh_token)
+        else:
+            if self._token_provider is None:
+                raise ValueError("Authentication tokens or token_provider required")
+            self._bootstrap_tokens(force=False)
         self._max_attempts = max(1, max_attempts)
         self._initial_delay = max(0.0, initial_delay)
         self._max_delay = max(max_delay, self._initial_delay)
@@ -183,34 +185,73 @@ class BackendClient:
             raise ValueError("access_token is required")
         if refresh_token is not None and not refresh_token:
             raise ValueError("refresh_token cannot be empty")
+        current_access: Optional[str]
+        current_refresh: Optional[str]
         with self._lock:
             self._access_token = access_token
             if refresh_token is not None:
                 self._refresh_token = refresh_token
-            self._session.headers.update({"Authorization": f"Bearer {self._access_token}"})
+            current_access = self._access_token
+            current_refresh = self._refresh_token
+            self._session.headers.update({"Authorization": f"Bearer {current_access}"})
+        if self._token_persistor and current_access and current_refresh:
+            self._token_persistor(current_access, current_refresh)
 
     def _refresh_access_token(self) -> None:
         refresh_token = self._refresh_token
         if not refresh_token:
-            raise RuntimeError("Refresh token not configured")
-        url = self._build_url("/auth/refresh")
+            self._bootstrap_tokens(force=True)
+            return
+        url = self._build_url("/v1/auth/refresh")
         payload = {"refresh_token": refresh_token}
+        headers = {
+            "Authorization": f"Bearer {refresh_token}",
+            "Accept": "application/json",
+        }
         try:
             with self._lock:
-                response = self._session.post(url, json=payload, timeout=10)
+                response = self._session.request(
+                    "post",
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=10,
+                )
         except (requests.Timeout, requests.ConnectionError) as exc:
-            raise RuntimeError("Refresh request failed") from exc
+            LOGGER.warning("Refresh request failed", extra={"error": str(exc)})
+            self._bootstrap_tokens(force=True)
+            return
         if response.status_code != 200:
-            raise RuntimeError(f"Refresh request failed with status {response.status_code}")
+            LOGGER.warning(
+                "Refresh request returned error",
+                extra={"status": response.status_code},
+            )
+            self._bootstrap_tokens(force=True)
+            return
         try:
             data = response.json()
         except ValueError as exc:  # pragma: no cover - invalid backend response
-            raise RuntimeError("Invalid refresh response") from exc
+            LOGGER.error("Invalid refresh response", exc_info=exc)
+            self._bootstrap_tokens(force=True)
+            return
         access_token = data.get("access_token")
         if not access_token:
-            raise RuntimeError("Refresh response missing access_token")
+            LOGGER.error("Refresh response missing access_token")
+            self._bootstrap_tokens(force=True)
+            return
         new_refresh = data.get("refresh_token") or refresh_token
         self.update_tokens(access_token, new_refresh)
+
+    def _bootstrap_tokens(self, force: bool) -> None:
+        if self._token_provider is None:
+            raise RuntimeError("Authentication tokens unavailable")
+        tokens = self._token_provider(force)
+        if not isinstance(tokens, tuple) or len(tokens) != 2:
+            raise RuntimeError("token_provider must return (access_token, refresh_token)")
+        access_token, refresh_token = tokens
+        if not access_token or not refresh_token:
+            raise RuntimeError("token_provider returned invalid tokens")
+        self.update_tokens(access_token, refresh_token)
 
     def _build_url(self, path: str) -> str:
         if path.startswith("http://") or path.startswith("https://"):
