@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import signal
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass
@@ -19,6 +18,8 @@ from requests import Response, Session
 from web3 import Web3
 from web3.contract import Contract, ContractEvent
 from web3.types import EventData, FilterParams, LogReceipt
+
+from .database_manager import DatabaseManager
 
 EVENT_ABI = [
     {
@@ -99,6 +100,7 @@ class ProScout:
         admin_access_token: str,
         contract_address: str = DEFAULT_CONTRACT_ADDRESS,
         db_path: str = DEFAULT_DB_PATH,
+        database: Optional[DatabaseManager] = None,
         poll_interval: int = DEFAULT_POLL_INTERVAL,
         reorg_conf: int = DEFAULT_REORG_CONF,
         default_user_tier: str = DEFAULT_USER_TIER,
@@ -155,11 +157,9 @@ class ProScout:
         self._http_lock = threading.Lock()
 
         self.pro_tier_set = {tier.strip() for tier in pro_tier_set or [] if tier.strip()}
-        self.db_path = db_path
-        self.db = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
-        self._db_lock = threading.Lock()
-        self._initialize_db()
+        self.db_manager = database or DatabaseManager(db_path)
+        self._owns_db_manager = database is None
+        self._meta_key = "pro_last_block"
 
         self._activation_lock = threading.Lock()
         self._activation_cond = threading.Condition(self._activation_lock)
@@ -213,8 +213,8 @@ class ProScout:
             self._scheduler_thread = None
         with self._http_lock:
             self.session.close()
-        with self._db_lock:
-            self.db.close()
+        if self._owns_db_manager:
+            self.db_manager.close()
         self.logger.info("ProScout service stopped")
 
     # Poller loop -----------------------------------------------------------------
@@ -428,19 +428,9 @@ class ProScout:
 
     def _cancel_pending_for_wallet(self, wallet: str) -> None:
         wallet = Web3.to_checksum_address(wallet)
-        with self._db_lock:
-            cur = self.db.execute(
-                "SELECT id FROM pending_activations WHERE wallet = ? AND status = 'pending'",
-                (wallet,),
-            )
-            ids = [int(row["id"]) for row in cur.fetchall()]
-            if not ids:
-                return
-            self.db.execute(
-                "UPDATE pending_activations SET status = 'cancelled' WHERE wallet = ? AND status = 'pending'",
-                (wallet,),
-            )
-            self.db.commit()
+        ids = self.db_manager.cancel_pending_activations(wallet)
+        if not ids:
+            return
         with self._activation_cond:
             for activation_id in ids:
                 self._activations.pop(activation_id, None)
@@ -448,84 +438,27 @@ class ProScout:
 
     # Database helpers -----------------------------------------------------------
 
-    def _initialize_db(self) -> None:
-        with self._db_lock:
-            self.db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS processed_logs (
-                    tx_hash TEXT NOT NULL,
-                    log_index INTEGER NOT NULL,
-                    PRIMARY KEY (tx_hash, log_index)
-                )
-                """
-            )
-            self.db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pending_activations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    wallet TEXT NOT NULL,
-                    tier TEXT NOT NULL,
-                    activates_at INTEGER NOT NULL,
-                    tx_hash TEXT NOT NULL,
-                    log_index INTEGER NOT NULL,
-                    status TEXT NOT NULL
-                )
-                """
-            )
-            self.db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-                """
-            )
-            self.db.commit()
-
     def _insert_activation(self, wallet: str, tier: str, activates_at: int, tx_hash: str, log_index: int) -> int:
-        with self._db_lock:
-            cur = self.db.execute(
-                """
-                INSERT INTO pending_activations (wallet, tier, activates_at, tx_hash, log_index, status)
-                VALUES (?, ?, ?, ?, ?, 'pending')
-                """,
-                (wallet, tier, activates_at, tx_hash, log_index),
-            )
-            self.db.commit()
-            return int(cur.lastrowid)
+        return self.db_manager.add_pending_activation(wallet, tier, activates_at, tx_hash, log_index)
 
     def _update_activation_status(self, activation_id: int, status: str) -> None:
-        with self._db_lock:
-            self.db.execute(
-                "UPDATE pending_activations SET status = ? WHERE id = ?",
-                (status, activation_id),
-            )
-            self.db.commit()
+        self.db_manager.update_pending_activation_status(activation_id, status)
 
     def _is_activation_pending(self, activation_id: int) -> bool:
-        with self._db_lock:
-            cur = self.db.execute(
-                "SELECT status FROM pending_activations WHERE id = ?",
-                (activation_id,),
-            )
-            row = cur.fetchone()
-            return bool(row and row["status"] == "pending")
+        status = self.db_manager.get_pending_activation_status(activation_id)
+        return status == "pending"
 
     def _load_pending_activations(self) -> None:
-        with self._db_lock:
-            cur = self.db.execute(
-                "SELECT id, wallet, tier, activates_at, tx_hash, log_index FROM pending_activations WHERE status = 'pending'"
-            )
-            rows = cur.fetchall()
+        rows = self.db_manager.list_pending_activations()
         now = int(time.time())
         with self._activation_cond:
             for row in rows:
                 activation = Activation(
                     activation_id=int(row["id"]),
-                    wallet=row["wallet"],
-                    tier=row["tier"],
+                    wallet=str(row["wallet"]),
+                    tier=str(row["tier"]),
                     activates_at=int(row["activates_at"]),
-                    tx_hash=row["tx_hash"],
+                    tx_hash=str(row["tx_hash"]),
                     log_index=int(row["log_index"]),
                 )
                 self._activations[activation.activation_id] = activation
@@ -534,35 +467,22 @@ class ProScout:
                 self._activation_cond.notify()
 
     def _mark_log_processed(self, tx_hash: str, log_index: int) -> None:
-        with self._db_lock:
-            self.db.execute(
-                "INSERT OR IGNORE INTO processed_logs (tx_hash, log_index) VALUES (?, ?)",
-                (tx_hash, log_index),
-            )
-            self.db.commit()
+        self.db_manager.mark_log_processed(tx_hash, log_index)
 
     def _is_log_processed(self, tx_hash: str, log_index: int) -> bool:
-        with self._db_lock:
-            cur = self.db.execute(
-                "SELECT 1 FROM processed_logs WHERE tx_hash = ? AND log_index = ?",
-                (tx_hash, log_index),
-            )
-            return cur.fetchone() is not None
+        return self.db_manager.is_log_processed(tx_hash, log_index)
 
     def _save_last_block(self, block: int) -> None:
-        with self._db_lock:
-            self.db.execute(
-                "INSERT INTO meta (key, value) VALUES ('last_block', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(block),),
-            )
-            self.db.commit()
+        self.db_manager.set_meta(self._meta_key, str(block))
 
     def _load_last_block(self) -> Optional[int]:
-        with self._db_lock:
-            cur = self.db.execute("SELECT value FROM meta WHERE key = 'last_block'")
-            row = cur.fetchone()
-            return int(row["value"]) if row else None
+        value = self.db_manager.get_meta(self._meta_key)
+        if value is None:
+            legacy = self.db_manager.get_meta("last_block")
+            if legacy is not None:
+                self.db_manager.set_meta(self._meta_key, legacy)
+                value = legacy
+        return int(value) if value is not None else None
 
     # HTTP helpers ----------------------------------------------------------------
 
@@ -654,7 +574,7 @@ class ProScout:
     # CLI ------------------------------------------------------------------------
 
     @classmethod
-    def from_env(cls) -> "ProScout":
+    def from_env(cls, *, database: Optional[DatabaseManager] = None) -> "ProScout":
         rpc_http_url = os.environ.get("RPC_HTTP_URL", "")
         api_base_url = os.environ.get("API_BASE_URL", "")
         admin_access_token = os.environ.get("ADMIN_ACCESS_TOKEN", "")
@@ -676,6 +596,7 @@ class ProScout:
             admin_access_token=admin_access_token,
             contract_address=contract_address,
             db_path=db_path,
+            database=database,
             poll_interval=poll_interval,
             reorg_conf=reorg_conf,
             default_user_tier=default_tier,

@@ -6,7 +6,6 @@ import argparse
 import logging
 import os
 import signal
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass
@@ -18,6 +17,8 @@ from web3 import Web3
 from web3._utils.events import get_event_data
 from web3.datastructures import AttributeDict
 from web3.types import FilterParams, LogReceipt
+
+from .database_manager import DatabaseManager
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,7 +79,13 @@ class ScoutConfig:
 class FeaturedScout:
     """Consumes Featured contract events and mirrors them to the backend."""
 
-    def __init__(self, config: ScoutConfig, once: bool = False) -> None:
+    def __init__(
+        self,
+        config: ScoutConfig,
+        once: bool = False,
+        *,
+        database: Optional[DatabaseManager] = None,
+    ) -> None:
         self._config = config
         self._once = once
         self._stop_event = threading.Event()
@@ -90,11 +97,10 @@ class FeaturedScout:
             self._web3.keccak(text=event["name"] + "(" + ",".join(inp["type"] for inp in event["inputs"]) + ")").hex(): event
             for event in EVENT_ABI
         }
-        self._conn = sqlite3.connect(config.db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA foreign_keys=ON;")
-        self._conn.row_factory = sqlite3.Row
+        self._db = database or DatabaseManager(config.db_path)
+        self._owns_db = database is None
         self._lock = threading.Lock()
+        self._meta_key = "featured_last_block"
         self._ensure_schema()
 
     def start(self) -> None:
@@ -107,31 +113,11 @@ class FeaturedScout:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=timeout)
+        if self._owns_db:
+            self._db.close()
 
     def _ensure_schema(self) -> None:
-        with self._conn:
-            self._conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS processed_logs (
-                    tx_hash TEXT NOT NULL,
-                    log_index INTEGER NOT NULL,
-                    PRIMARY KEY (tx_hash, log_index)
-                );
-                CREATE TABLE IF NOT EXISTS featured_projects (
-                    round_id INTEGER NOT NULL,
-                    project_hex TEXT NOT NULL,
-                    PRIMARY KEY (round_id, project_hex)
-                );
-                CREATE TABLE IF NOT EXISTS project_id_map (
-                    project_hex TEXT PRIMARY KEY,
-                    backend_id TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                """
-            )
+        self._db.ensure_featured_schema()
 
     def _run(self) -> None:
         LOGGER.info("FeaturedScout loop started")
@@ -406,12 +392,9 @@ class FeaturedScout:
     def _resolve_backend_project_id(self, project_hex: str) -> Optional[str]:
         if not project_hex:
             return None
-        with self._conn:
-            row = self._conn.execute(
-                "SELECT backend_id FROM project_id_map WHERE project_hex = ?", (project_hex,)
-            ).fetchone()
-        if row:
-            return str(row[0])
+        cached = self._db.get_project_mapping(project_hex)
+        if cached:
+            return cached
         resolver_url = self._config.project_id_resolver_url
         if not resolver_url:
             return None
@@ -443,64 +426,34 @@ class FeaturedScout:
         return None
 
     def _cache_project_mapping(self, project_hex: str, backend_id: str) -> None:
-        with self._conn:
-            self._conn.execute(
-                "INSERT INTO project_id_map(project_hex, backend_id) VALUES (?, ?) "
-                "ON CONFLICT(project_hex) DO UPDATE SET backend_id=excluded.backend_id",
-                (project_hex, backend_id),
-            )
+        self._db.set_project_mapping(project_hex, backend_id)
 
     def _get_previous_round_id(self, current_round: int) -> Optional[int]:
-        with self._conn:
-            row = self._conn.execute(
-                "SELECT DISTINCT round_id FROM featured_projects WHERE round_id < ? ORDER BY round_id DESC LIMIT 1",
-                (current_round,),
-            ).fetchone()
-        return int(row[0]) if row else None
+        return self._db.previous_featured_round(current_round)
 
     def _list_featured_projects(self, round_id: int) -> List[str]:
-        with self._conn:
-            rows = self._conn.execute(
-                "SELECT project_hex FROM featured_projects WHERE round_id = ?",
-                (round_id,),
-            ).fetchall()
-        return [str(row[0]) for row in rows]
+        return self._db.list_featured_projects(round_id)
 
     def _upsert_featured_projects(self, round_id: int, project_hex_list: Iterable[str]) -> None:
-        with self._conn:
-            self._conn.execute("DELETE FROM featured_projects WHERE round_id = ?", (round_id,))
-            self._conn.executemany(
-                "INSERT INTO featured_projects(round_id, project_hex) VALUES (?, ?)",
-                [(round_id, project_hex) for project_hex in project_hex_list],
-            )
+        self._db.replace_featured_projects(round_id, project_hex_list)
 
     def _mark_log_processed(self, tx_hash: str, log_index: int) -> None:
-        with self._conn:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO processed_logs(tx_hash, log_index) VALUES (?, ?)",
-                (tx_hash, log_index),
-            )
+        self._db.mark_log_processed(tx_hash, log_index)
 
     def _is_log_processed(self, tx_hash: str, log_index: int) -> bool:
-        with self._conn:
-            row = self._conn.execute(
-                "SELECT 1 FROM processed_logs WHERE tx_hash = ? AND log_index = ?",
-                (tx_hash, log_index),
-            ).fetchone()
-        return row is not None
+        return self._db.is_log_processed(tx_hash, log_index)
 
     def _load_last_block(self) -> Optional[int]:
-        with self._conn:
-            row = self._conn.execute("SELECT value FROM meta WHERE key = 'last_block'").fetchone()
-        return int(row[0]) if row else None
+        value = self._db.get_meta(self._meta_key)
+        if value is None:
+            legacy = self._db.get_meta("last_block")
+            if legacy is not None:
+                self._db.set_meta(self._meta_key, legacy)
+                value = legacy
+        return int(value) if value is not None else None
 
     def _save_last_block(self, block_number: int) -> None:
-        with self._conn:
-            self._conn.execute(
-                "INSERT INTO meta(key, value) VALUES('last_block', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(block_number),),
-            )
+        self._db.set_meta(self._meta_key, str(block_number))
 
     def seed_mapping(self, mapping_items: Sequence[Tuple[str, str]]) -> None:
         for project_hex, backend_id in mapping_items:
