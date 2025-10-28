@@ -48,7 +48,7 @@ def test_backend_client_retries_on_server_error() -> None:
         _make_response(200, {"ok": True}),
     ]
     client = BackendClient(
-        "http://api.local",
+        "http://api.local/v1",
         "token",
         "refresh-token",
         session=session,
@@ -67,7 +67,7 @@ def test_backend_client_abort_when_should_retry_returns_false() -> None:
     session.headers = {}
     session.request.side_effect = requests.Timeout("boom")
     client = BackendClient(
-        "http://api.local",
+        "http://api.local/v1",
         "token",
         "refresh-token",
         session=session,
@@ -80,36 +80,75 @@ def test_backend_client_refreshes_token_on_unauthorized() -> None:
     session.headers = {}
     session.request.side_effect = [
         _make_response(401),
+        _make_response(200, {"access_token": "new-access", "refresh_token": "new-refresh"}),
         _make_response(200, {"ok": True}),
     ]
-    session.post = Mock(  # type: ignore[assignment]
-        return_value=_make_response(
-            200,
-            {
-                "access_token": "new-access",
-                "refresh_token": "new-refresh",
-            },
-        )
-    )
+    token_persistor = Mock()
     client = BackendClient(
-        "http://api.local",
+        "http://api.local/v1",
         "old-access",
         "old-refresh",
         session=session,
         max_attempts=2,
+        token_persistor=token_persistor,
     )
 
     response = client.get("/resource", raise_for_status=False)
 
     assert response is not None
     assert response.status_code == 200
-    session.post.assert_called_once_with(
-        "http://api.local/auth/refresh",
-        json={"refresh_token": "old-refresh"},
-        timeout=10,
-    )
-    assert session.request.call_count == 2
+    assert session.request.call_count == 3
+    refresh_call = session.request.call_args_list[1]
+    assert refresh_call.args == ("post", "http://api.local/v1/auth/refresh")
+    assert refresh_call.kwargs["json"] == {"refresh_token": "old-refresh"}
+    assert refresh_call.kwargs["headers"] == {
+        "Authorization": "Bearer old-refresh",
+        "Accept": "application/json",
+    }
     assert getattr(client, "_refresh_token") == "new-refresh"
+    assert token_persistor.call_args_list[-1].args == ("new-access", "new-refresh")
+
+
+def test_backend_client_bootstrap_uses_provider() -> None:
+    session = Mock(spec=Session)
+    session.headers = {}
+    token_provider = Mock(return_value=("boot-access", "boot-refresh"))
+
+    client = BackendClient(
+        "http://api.local/v1",
+        token_provider=token_provider,
+        session=session,
+    )
+
+    token_provider.assert_called_once_with(False)
+    assert getattr(client, "_refresh_token") == "boot-refresh"
+    assert session.headers["Authorization"] == "Bearer boot-access"
+
+
+def test_backend_client_refresh_failure_uses_provider() -> None:
+    session = Mock(spec=Session)
+    session.headers = {}
+    session.request.side_effect = [
+        _make_response(401),
+        _make_response(500),
+        _make_response(200, {"ok": True}),
+    ]
+    token_provider = Mock(return_value=("forced-access", "forced-refresh"))
+    client = BackendClient(
+        "http://api.local/v1",
+        "old-access",
+        "old-refresh",
+        session=session,
+        max_attempts=2,
+        token_provider=token_provider,
+    )
+
+    response = client.get("/resource", raise_for_status=False)
+
+    assert response is not None
+    assert response.status_code == 200
+    assert token_provider.call_args_list[-1].args == (True,)
+    assert getattr(client, "_refresh_token") == "forced-refresh"
 
 
 def test_pro_scout_patch_user_uses_backend_client() -> None:

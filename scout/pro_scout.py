@@ -176,8 +176,6 @@ class ProScout:
             self.api_base_url,
             self.admin_access_token,
             self.admin_refresh_token,
-            admin_wallet_address=self.admin_wallet_address,
-            admin_wallet_private_key=self.admin_wallet_private_key,
             max_attempts=MAX_HTTP_RETRIES,
         )
 

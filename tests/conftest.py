@@ -165,10 +165,29 @@ class _Account:
             cls._store[key_hex] = address
         return types.SimpleNamespace(address=address, key=_HexString(key_hex))
 
+    @classmethod
+    def sign_message(cls, message, private_key: str):  # pragma: no cover - simple deterministic stub
+        if isinstance(private_key, bytes):
+            key_hex = "0x" + private_key.hex()
+        else:
+            key_hex = private_key
+        body = getattr(message, "body", "")
+        digest = f"{body}:{key_hex}"
+        signature_hex = "0x" + digest.encode("utf-8").hex()
+        return types.SimpleNamespace(signature=_HexString(signature_hex))
+
 
 eth_account_module = types.ModuleType("eth_account")
 eth_account_module.Account = _Account
 sys.modules.setdefault("eth_account", eth_account_module)
+
+def _encode_defunct(*, text: str, **_kwargs):  # pragma: no cover - deterministic stub
+    return types.SimpleNamespace(body=text)
+
+
+messages_module = types.ModuleType("eth_account.messages")
+messages_module.encode_defunct = _encode_defunct
+sys.modules.setdefault("eth_account.messages", messages_module)
 
 
 @pytest.fixture(autouse=True)
