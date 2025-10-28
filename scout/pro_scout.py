@@ -102,7 +102,7 @@ class ProScout:
     def __init__(
         self,
         *,
-        rpc_http_url: str,
+        rpc_http_urls: Iterable[str],
         rpc_ws_urls: Optional[Iterable[str]] = None,
         api_base_url: str,
         admin_access_token: str,
@@ -119,8 +119,9 @@ class ProScout:
         start_block: Optional[int] = None,
         block_batch_size: int = 1000,
     ) -> None:
-        if not rpc_http_url:
-            raise ValueError("rpc_http_url is required")
+        http_urls = [url.strip() for url in rpc_http_urls if url]
+        if not http_urls:
+            raise ValueError("At least one rpc_http_url is required")
         if not api_base_url:
             raise ValueError("api_base_url is required")
         if not admin_access_token:
@@ -129,7 +130,7 @@ class ProScout:
         logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO), format=LOG_FORMAT)
         self.logger = logging.getLogger("ProScout")
 
-        self.rpc_http_url = rpc_http_url
+        self.rpc_http_urls = http_urls
         self.rpc_ws_urls = [url for url in (rpc_ws_urls or []) if url]
         self.api_base_url = api_base_url.rstrip("/")
         self.admin_access_token = admin_access_token
@@ -139,15 +140,11 @@ class ProScout:
         self.default_user_tier = default_user_tier
         self.chain_id = chain_id
         self.block_batch_size = max(block_batch_size, 1)
-        self.web3 = Web3(Web3.HTTPProvider(rpc_http_url))
-        if not self.web3.is_connected():
-            raise ConnectionError("Unable to connect to RPC node")
-        if self.chain_id is not None:
-            node_chain_id = self.web3.eth.chain_id
-            if node_chain_id != self.chain_id:
-                raise ValueError(f"Connected to chain {node_chain_id}, expected {self.chain_id}")
+        self._provider_lock = threading.Lock()
+        self._rpc_fail_counts = [0 for _ in self.rpc_http_urls]
+        self._rpc_backoff_until = [0.0 for _ in self.rpc_http_urls]
+        self._needs_provider_reset = False
 
-        self.contract: Contract = self.web3.eth.contract(address=self.contract_address, abi=EVENT_ABI)
         self.event_handlers = {
             "StakeStarted": self._handle_stake_started,
             "TierUpgraded": self._handle_tier_upgraded,
@@ -155,7 +152,6 @@ class ProScout:
         }
         self.event_topics: List[str] = []
         self._topic_to_event: Dict[str, ContractEvent] = {}
-        self._setup_event_registry()
 
         self.backend_client = backend_client or BackendClient(
             self.api_base_url, self.admin_access_token, max_attempts=MAX_HTTP_RETRIES
@@ -165,6 +161,7 @@ class ProScout:
         self.db_manager = database or DatabaseManager(db_path)
         self._owns_db_manager = database is None
         self._meta_key = "pro_last_block"
+        self._meta_provider_key = "pro_active_rpc_index"
 
         self._activation_lock = threading.Lock()
         self._activation_cond = threading.Condition(self._activation_lock)
@@ -177,6 +174,20 @@ class ProScout:
         self._scheduler_thread: Optional[threading.Thread] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._ws_reconnect_delay = max(self.poll_interval, 1)
+
+        self._active_rpc_index = self._load_active_rpc_index()
+        web3 = self._ensure_provider()
+        if web3 is None:
+            raise RuntimeError("No RPC HTTP providers are available")
+        if not web3.is_connected():
+            raise ConnectionError("Unable to connect to RPC node")
+        if self.chain_id is not None:
+            node_chain_id = web3.eth.chain_id
+            if node_chain_id != self.chain_id:
+                raise ValueError(f"Connected to chain {node_chain_id}, expected {self.chain_id}")
+
+        self.contract = self.web3.eth.contract(address=self.contract_address, abi=EVENT_ABI)
+        self._setup_event_registry()
 
         stored_last_block = self._load_last_block()
         if stored_last_block is None:
@@ -238,7 +249,17 @@ class ProScout:
                 time.sleep(self.poll_interval)
 
     def _poll_once(self) -> None:
-        latest_block = self.web3.eth.block_number
+        web3 = self._ensure_provider()
+        if web3 is None:
+            time.sleep(self.poll_interval)
+            return
+        try:
+            latest_block = web3.eth.block_number
+        except Exception as exc:  # noqa: BLE001
+            self._handle_provider_error(exc)
+            time.sleep(self.poll_interval)
+            return
+        self._mark_provider_success()
         safe_block = latest_block - self.reorg_conf
         from_block = self._last_block + 1
         if safe_block < from_block:
@@ -254,7 +275,17 @@ class ProScout:
         }
 
         self.logger.debug("Fetching logs", extra={"from_block": from_block, "to_block": to_block})
-        logs: List[LogReceipt] = self.web3.eth.get_logs(filter_params)
+        try:
+            logs: List[LogReceipt] = web3.eth.get_logs(filter_params)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.exception(
+                "Failed to fetch logs",
+                extra={"from_block": from_block, "to_block": to_block},
+            )
+            self._handle_provider_error(exc)
+            time.sleep(self.poll_interval)
+            return
+        self._mark_provider_success()
         for log in logs:
             self._process_log_entry(log)
 
@@ -550,6 +581,98 @@ class ProScout:
         types = ",".join(param["type"] for param in inputs)
         return f"{name}({types})"
 
+    def _load_active_rpc_index(self) -> int:
+        stored = None
+        with contextlib.suppress(Exception):
+            stored = self.db_manager.get_meta(self._meta_provider_key)
+        if stored is not None:
+            try:
+                index = int(stored)
+            except ValueError:
+                index = 0
+        else:
+            index = 0
+        if not self.rpc_http_urls:
+            return 0
+        return max(0, min(index, len(self.rpc_http_urls) - 1))
+
+    def _save_active_rpc_index(self, index: int) -> None:
+        self.db_manager.set_meta(self._meta_provider_key, str(index))
+
+    def _select_provider_index(self, now: float) -> Optional[int]:
+        count = len(self.rpc_http_urls)
+        if count == 0:
+            return None
+        current = self._active_rpc_index if self._active_rpc_index is not None else 0
+        offsets = range(count) if not self._needs_provider_reset else range(1, count + 1)
+        for offset in offsets:
+            idx = (current + offset) % count
+            if self._rpc_backoff_until[idx] <= now:
+                return idx
+        return None
+
+    def _activate_provider(self, index: int) -> None:
+        url = self.rpc_http_urls[index]
+        self.logger.info("Switching RPC provider", extra={"url": url, "index": index})
+        self.web3 = Web3(Web3.HTTPProvider(url))
+        self.contract = self.web3.eth.contract(address=self.contract_address, abi=EVENT_ABI)
+        self._setup_event_registry()
+        self._active_rpc_index = index
+        self._rpc_fail_counts[index] = 0
+        self._rpc_backoff_until[index] = 0.0
+        self._needs_provider_reset = False
+        self._save_active_rpc_index(index)
+
+    def _ensure_provider(self) -> Optional[Web3]:
+        with self._provider_lock:
+            now = time.time()
+            if (
+                self._active_rpc_index is not None
+                and not self._needs_provider_reset
+                and self._rpc_backoff_until[self._active_rpc_index] <= now
+                and getattr(self, "web3", None) is not None
+            ):
+                return self.web3
+            next_index = self._select_provider_index(now)
+            if next_index is None:
+                retry_in = min(self._rpc_backoff_until) - now
+                self.logger.warning(
+                    "All RPC providers are in backoff", extra={"retry_in": max(retry_in, 0.0)}
+                )
+                return None
+            if (
+                getattr(self, "web3", None) is None
+                or self._active_rpc_index != next_index
+                or self._needs_provider_reset
+            ):
+                self._activate_provider(next_index)
+            return self.web3
+
+    def _mark_provider_success(self) -> None:
+        index = self._active_rpc_index
+        if index is None:
+            return
+        self._rpc_fail_counts[index] = 0
+        self._rpc_backoff_until[index] = 0.0
+
+    def _handle_provider_error(self, exc: Exception) -> None:
+        self.logger.warning("RPC provider error", exc_info=exc)
+        index = self._active_rpc_index
+        if index is None:
+            return
+        self._rpc_fail_counts[index] += 1
+        backoff = min(self.poll_interval * (2 ** (self._rpc_fail_counts[index] - 1)), 60)
+        self._rpc_backoff_until[index] = time.time() + backoff
+        self._needs_provider_reset = True
+        self.logger.info(
+            "Scheduled RPC provider backoff",
+            extra={
+                "url": self.rpc_http_urls[index],
+                "index": index,
+                "backoff": backoff,
+            },
+        )
+
     # CLI ------------------------------------------------------------------------
 
     @classmethod
@@ -559,7 +682,12 @@ class ProScout:
         database: Optional[DatabaseManager] = None,
         backend_client: Optional[BackendClient] = None,
     ) -> "ProScout":
-        rpc_http_url = os.environ.get("RPC_HTTP_URL", "")
+        rpc_http_env = os.environ.get("RPC_HTTP_URLS")
+        if rpc_http_env:
+            rpc_http_urls = [url.strip() for url in rpc_http_env.split(",") if url.strip()]
+        else:
+            rpc_http_url = os.environ.get("RPC_HTTP_URL", "")
+            rpc_http_urls = [rpc_http_url] if rpc_http_url else []
         rpc_ws_env = os.environ.get("RPC_WS_URLS", "")
         rpc_ws_urls = [url.strip() for url in rpc_ws_env.split(",") if url.strip()]
         api_base_url = os.environ.get("API_BASE_URL", "")
@@ -580,7 +708,7 @@ class ProScout:
             api_base_url = backend_client.base_url
 
         return cls(
-            rpc_http_url=rpc_http_url,
+            rpc_http_urls=rpc_http_urls,
             api_base_url=api_base_url,
             admin_access_token=admin_access_token,
             contract_address=contract_address,

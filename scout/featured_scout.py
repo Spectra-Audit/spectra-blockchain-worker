@@ -71,7 +71,7 @@ EVENT_ABI: List[Dict[str, Any]] = [
 
 @dataclass(frozen=True)
 class ScoutConfig:
-    rpc_url: str
+    rpc_http_urls: Sequence[str]
     rpc_ws_urls: Sequence[str]
     contract_address: str
     chain_id: Optional[int]
@@ -101,19 +101,23 @@ class FeaturedScout:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._ws_thread: Optional[threading.Thread] = None
-        self._web3 = Web3(Web3.HTTPProvider(config.rpc_url, request_kwargs={"timeout": 30}))
-        self._contract = self._web3.eth.contract(address=Web3.to_checksum_address(config.contract_address), abi=EVENT_ABI)
-        self._event_topic_map = {
-            self._web3.keccak(text=event["name"] + "(" + ",".join(inp["type"] for inp in event["inputs"]) + ")").hex(): event
-            for event in EVENT_ABI
-        }
+        self._provider_lock = threading.Lock()
+        self._rpc_urls = [url for url in config.rpc_http_urls if url]
+        if not self._rpc_urls:
+            raise ValueError("At least one RPC HTTP URL must be configured")
+        self._rpc_fail_counts = [0 for _ in self._rpc_urls]
+        self._rpc_backoff_until = [0.0 for _ in self._rpc_urls]
+        self._needs_provider_reset = False
         self._db = database or DatabaseManager(config.db_path)
         self._owns_db = database is None
         self._lock = threading.Lock()
         self._meta_key = "featured_last_block"
+        self._meta_provider_key = "featured_active_rpc_index"
         self._client = backend_client or BackendClient(config.api_root, config.admin_token)
         self._ws_urls = [url for url in config.rpc_ws_urls if url]
         self._ws_reconnect_delay = max(config.poll_interval_sec, 1)
+        self._active_rpc_index = self._load_active_rpc_index()
+        self._activate_provider(self._active_rpc_index)
         self._ensure_schema()
 
     def start(self) -> None:
@@ -137,6 +141,113 @@ class FeaturedScout:
     def _ensure_schema(self) -> None:
         self._db.ensure_featured_schema()
 
+    def _refresh_event_topic_map(self) -> None:
+        self._event_topic_map = {
+            self._web3.keccak(text=event["name"] + "(" + ",".join(inp["type"] for inp in event["inputs"]) + ")").hex(): event
+            for event in EVENT_ABI
+        }
+
+    def _load_active_rpc_index(self) -> int:
+        stored = None
+        with contextlib.suppress(Exception):
+            stored = self._db.get_meta(self._meta_provider_key)
+        if stored is not None:
+            try:
+                index = int(stored)
+            except ValueError:
+                index = 0
+        else:
+            index = 0
+        if not self._rpc_urls:
+            return 0
+        return max(0, min(index, len(self._rpc_urls) - 1))
+
+    def _save_active_rpc_index(self, index: int) -> None:
+        self._db.set_meta(self._meta_provider_key, str(index))
+
+    def _select_provider_index(self, now: float) -> Optional[int]:
+        count = len(self._rpc_urls)
+        if count == 0:
+            return None
+        current = self._active_rpc_index if self._active_rpc_index is not None else 0
+        offsets = range(count) if not self._needs_provider_reset else range(1, count + 1)
+        for offset in offsets:
+            idx = (current + offset) % count
+            if self._rpc_backoff_until[idx] <= now:
+                return idx
+        return None
+
+    def _activate_provider(self, index: int) -> None:
+        url = self._rpc_urls[index]
+        LOGGER.info(
+            "Switching RPC provider", extra={"url": url, "index": index}
+        )
+        self._web3 = Web3(
+            Web3.HTTPProvider(url, request_kwargs={"timeout": 30})
+        )
+        self._contract = self._web3.eth.contract(
+            address=Web3.to_checksum_address(self._config.contract_address), abi=EVENT_ABI
+        )
+        self._active_rpc_index = index
+        self._rpc_fail_counts[index] = 0
+        self._rpc_backoff_until[index] = 0.0
+        self._needs_provider_reset = False
+        self._save_active_rpc_index(index)
+        self._refresh_event_topic_map()
+
+    def _ensure_provider(self) -> Optional[Web3]:
+        with self._provider_lock:
+            now = time.time()
+            if (
+                self._active_rpc_index is not None
+                and not self._needs_provider_reset
+                and self._rpc_backoff_until[self._active_rpc_index] <= now
+                and self._web3 is not None
+            ):
+                return self._web3
+            next_index = self._select_provider_index(now)
+            if next_index is None:
+                retry_in = min(self._rpc_backoff_until) - now
+                LOGGER.warning(
+                    "All RPC providers are in backoff", extra={"retry_in": max(retry_in, 0.0)}
+                )
+                return None
+            if (
+                self._web3 is None
+                or self._active_rpc_index != next_index
+                or self._needs_provider_reset
+            ):
+                self._activate_provider(next_index)
+            return self._web3
+
+    def _mark_provider_success(self) -> None:
+        index = self._active_rpc_index
+        if index is None:
+            return
+        self._rpc_fail_counts[index] = 0
+        self._rpc_backoff_until[index] = 0.0
+
+    def _handle_provider_error(self, exc: Exception) -> None:
+        LOGGER.warning("RPC provider error", exc_info=exc)
+        index = self._active_rpc_index
+        if index is None:
+            return
+        self._rpc_fail_counts[index] += 1
+        backoff = min(
+            self._config.poll_interval_sec * (2 ** (self._rpc_fail_counts[index] - 1)),
+            60,
+        )
+        self._rpc_backoff_until[index] = time.time() + backoff
+        self._needs_provider_reset = True
+        LOGGER.info(
+            "Scheduled RPC provider backoff",
+            extra={
+                "url": self._rpc_urls[index],
+                "index": index,
+                "backoff": backoff,
+            },
+        )
+
     def _run(self) -> None:
         LOGGER.info("FeaturedScout loop started")
         try:
@@ -152,11 +263,15 @@ class FeaturedScout:
             LOGGER.info("FeaturedScout loop exited")
 
     def _poll_once(self) -> bool:
-        try:
-            latest_block = self._web3.eth.block_number
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Failed to fetch latest block", exc_info=exc)
+        web3 = self._ensure_provider()
+        if web3 is None:
             return False
+        try:
+            latest_block = web3.eth.block_number
+        except Exception as exc:  # noqa: BLE001
+            self._handle_provider_error(exc)
+            return False
+        self._mark_provider_success()
         safe_block = max(latest_block - (self._config.reorg_confirmations - 1), 0)
         with self._lock:
             last_block = self._load_last_block()
@@ -178,14 +293,16 @@ class FeaturedScout:
             "topics": [[topic for topic in self._event_topic_map]],
         }
         try:
-            logs: Sequence[LogReceipt] = self._web3.eth.get_logs(filter_params)
+            logs: Sequence[LogReceipt] = web3.eth.get_logs(filter_params)
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception(
                 "Failed to fetch logs",
                 extra={"from_block": from_block, "to_block": to_block},
                 exc_info=exc,
             )
+            self._handle_provider_error(exc)
             return False
+        self._mark_provider_success()
         sorted_logs = sorted(logs, key=lambda entry: (entry["blockNumber"], entry["logIndex"]))
         for log_entry in sorted_logs:
             if self._stop_event.is_set():
@@ -593,9 +710,14 @@ class FeaturedScout:
 
 
 def _load_config_from_env() -> ScoutConfig:
-    rpc_url = os.environ.get("RPC_HTTP_URL")
-    if not rpc_url:
-        raise RuntimeError("RPC_HTTP_URL is required")
+    rpc_urls_env = os.environ.get("RPC_HTTP_URLS")
+    if rpc_urls_env:
+        rpc_http_urls = tuple(url.strip() for url in rpc_urls_env.split(",") if url.strip())
+    else:
+        rpc_url = os.environ.get("RPC_HTTP_URL")
+        if not rpc_url:
+            raise RuntimeError("RPC_HTTP_URL is required")
+        rpc_http_urls = (rpc_url,)
     rpc_ws_urls_env = os.environ.get("RPC_WS_URLS", "")
     rpc_ws_urls = tuple(url.strip() for url in rpc_ws_urls_env.split(",") if url.strip())
     contract_address = os.environ.get("CONTRACT_ADDRESS", "0xe6733635aF5Ce7a1E022fbD87670EADa95397558")
@@ -615,7 +737,7 @@ def _load_config_from_env() -> ScoutConfig:
     if not start_block_latest:
         start_block = int(start_block_env, 0)
     return ScoutConfig(
-        rpc_url=rpc_url,
+        rpc_http_urls=rpc_http_urls,
         rpc_ws_urls=rpc_ws_urls,
         contract_address=contract_address,
         chain_id=chain_id,
