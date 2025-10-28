@@ -48,7 +48,8 @@ class ScoutApp:
         featured_config = _load_config_from_env()
         api_base_url = os.environ.get("API_BASE_URL") or featured_config.api_root
         admin_access_token = featured_config.admin_token
-        backend_client = BackendClient(api_base_url, admin_access_token)
+        admin_refresh_token = featured_config.admin_refresh_token
+        backend_client = BackendClient(api_base_url, admin_access_token, admin_refresh_token)
         pro_scout = ProScout.from_env(database=database, backend_client=backend_client)
         if featured_config.db_path != db_path:
             featured_config = replace(featured_config, db_path=db_path)

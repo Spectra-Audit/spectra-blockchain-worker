@@ -115,6 +115,7 @@ class ProScout:
         rpc_ws_urls: Optional[Iterable[str]] = None,
         api_base_url: str,
         admin_access_token: str,
+        admin_refresh_token: str,
         contract_address: str = DEFAULT_CONTRACT_ADDRESS,
         db_path: str = DEFAULT_DB_PATH,
         database: Optional[DatabaseManager] = None,
@@ -135,6 +136,8 @@ class ProScout:
             raise ValueError("api_base_url is required")
         if not admin_access_token:
             raise ValueError("admin_access_token is required")
+        if not admin_refresh_token:
+            raise ValueError("admin_refresh_token is required")
 
         logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO), format=LOG_FORMAT)
         self.logger = logging.getLogger("ProScout")
@@ -143,6 +146,7 @@ class ProScout:
         self.rpc_ws_urls = [url for url in (rpc_ws_urls or []) if url]
         self.api_base_url = api_base_url.rstrip("/")
         self.admin_access_token = admin_access_token
+        self.admin_refresh_token = admin_refresh_token
         self.contract_address = Web3.to_checksum_address(contract_address)
         self.poll_interval = poll_interval
         self.reorg_conf = max(reorg_conf, 0)
@@ -163,7 +167,10 @@ class ProScout:
         self._topic_to_event: Dict[str, ContractEvent] = {}
 
         self.backend_client = backend_client or BackendClient(
-            self.api_base_url, self.admin_access_token, max_attempts=MAX_HTTP_RETRIES
+            self.api_base_url,
+            self.admin_access_token,
+            self.admin_refresh_token,
+            max_attempts=MAX_HTTP_RETRIES,
         )
 
         self.pro_tier_set = {tier.strip() for tier in pro_tier_set or [] if tier.strip()}
@@ -729,6 +736,7 @@ class ProScout:
         rpc_ws_urls = [url.strip() for url in rpc_ws_env.split(",") if url.strip()]
         api_base_url = os.environ.get("API_BASE_URL", "")
         admin_access_token = os.environ.get("ADMIN_ACCESS_TOKEN", "")
+        admin_refresh_token = os.environ.get("ADMIN_REFRESH_TOKEN", "")
         contract_address = os.environ.get("CONTRACT_ADDRESS", DEFAULT_CONTRACT_ADDRESS)
         db_path = os.environ.get("DB_PATH", DEFAULT_DB_PATH)
         poll_interval = int(os.environ.get("POLL_INTERVAL_SEC", str(DEFAULT_POLL_INTERVAL)))
@@ -741,13 +749,19 @@ class ProScout:
         chain_id = int(chain_id_env) if chain_id_env else None
         start_block_env = os.environ.get("START_BLOCK")
         start_block = int(start_block_env) if start_block_env else None
-        if backend_client is not None and not api_base_url:
-            api_base_url = backend_client.base_url
+        if backend_client is not None:
+            if not api_base_url:
+                api_base_url = backend_client.base_url
+            if not admin_access_token:
+                admin_access_token = getattr(backend_client, "_access_token", "")
+            if not admin_refresh_token:
+                admin_refresh_token = getattr(backend_client, "_refresh_token", "")
 
         return cls(
             rpc_http_urls=rpc_http_urls,
             api_base_url=api_base_url,
             admin_access_token=admin_access_token,
+            admin_refresh_token=admin_refresh_token,
             contract_address=contract_address,
             db_path=db_path,
             database=database,
