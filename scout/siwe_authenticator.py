@@ -93,7 +93,10 @@ class SiweAuthenticator:
 
     # ----------------------------------------------------------------- internals
     def _perform_handshake_locked(self) -> Tuple[str, str]:
-        nonce_payload = {"wallet_address": self._wallet.address}
+        nonce_payload = {
+            "wallet_address": self._wallet.address,
+            "address": self._wallet.address,
+        }
         nonce_response = self._post("auth/nonce", json=nonce_payload)
         if nonce_response.status_code != 200:
             raise SiweAuthenticationError(
@@ -112,6 +115,7 @@ class SiweAuthenticator:
         signature = signed.signature.hex()
         verify_payload = {
             "wallet_address": self._wallet.address,
+            "address": self._wallet.address,
             "message": message,
             "signature": signature,
         }
