@@ -28,15 +28,11 @@ except ImportError:  # pragma: no cover - ContractEvent moved in newer web3 rele
 from web3.datastructures import AttributeDict
 from web3.types import EventData, FilterParams, LogReceipt
 
-try:  # pragma: no cover - optional at import time
-    from web3.providers.websocket import WebsocketProvider
-except ImportError:  # pragma: no cover - websocket extras not installed
-    WebsocketProvider = None  # type: ignore[assignment]
-
 from .auth_wallet import AdminWallet, load_or_create_admin_wallet
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
+from .featured_scout import resolve_ws_provider_class
 
 EVENT_ABI = [
     {
@@ -198,6 +194,7 @@ class ProScout:
         self._ws_reconnect_delay = max(self.poll_interval, 1)
         self._poll_gate = threading.Event()
         self._poll_gate.set()
+        self._ws_provider_class: Optional[type] = None
         self._last_safe_block = -1
         self._ws_ready = threading.Event()
         self._ws_state_lock = threading.Lock()
@@ -821,13 +818,19 @@ class ProScout:
     def _start_ws_listener(self) -> None:
         if not self.rpc_ws_urls:
             return
-        if WebsocketProvider is None:
+        provider_class = self._get_ws_provider_class()
+        if provider_class is None:
             self.logger.warning("web3 websocket provider unavailable; disabling live subscriptions")
             return
         if self._ws_thread and self._ws_thread.is_alive():
             return
         self._ws_thread = threading.Thread(target=self._websocket_loop, name="ProScoutWS", daemon=True)
         self._ws_thread.start()
+
+    def _get_ws_provider_class(self) -> Optional[type]:
+        if self._ws_provider_class is None:
+            self._ws_provider_class = resolve_ws_provider_class()
+        return self._ws_provider_class
 
     def _websocket_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -853,7 +856,10 @@ class ProScout:
                         break
 
     def _consume_ws_url(self, url: str) -> None:
-        provider = WebsocketProvider(url, websocket_timeout=30)  # type: ignore[call-arg]
+        provider_class = self._get_ws_provider_class()
+        if provider_class is None:
+            raise RuntimeError("Websocket provider class unavailable")
+        provider = provider_class(url, websocket_timeout=30)  # type: ignore[call-arg]
         filter_params = {
             "address": self.contract_address,
             "topics": [self.event_topics],
