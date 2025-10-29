@@ -726,3 +726,147 @@ def test_pro_scout_websocket_retries_then_advances(monkeypatch, tmp_path, scout_
         ("ws://two", 1),
     ]
     assert sleep_calls == [service._ws_reconnect_delay]
+
+
+def test_featured_scout_ws_provider_fallback(monkeypatch, caplog, tmp_path, scout_modules):
+    featured, _ = scout_modules
+
+    websocket_module = sys.modules["web3.providers.websocket"]
+    monkeypatch.delattr(websocket_module, "WebsocketProvider", raising=False)
+
+    class FallbackProvider(FakeWebsocketProvider):
+        pass
+
+    monkeypatch.setattr(websocket_module, "WebsocketProviderV2", FallbackProvider, raising=False)
+
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=("ws://one", "ws://two"),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        admin_refresh_token="refresh",
+        admin_wallet_address="0x0000000000000000000000000000000000000001",
+        admin_wallet_private_key="0x01",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_ws_fallback.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=1,
+        start_block=None,
+        start_block_latest=True,
+    )
+    scout = featured.FeaturedScout(config, once=True)
+
+    class ImmediateThread:
+        def __init__(self, target, name=None, daemon=None):
+            self._target = target
+            self._started = False
+
+        def start(self):
+            self._started = True
+            try:
+                self._target()
+            finally:
+                self._started = False
+
+        def is_alive(self):
+            return self._started
+
+        def join(self, timeout=None):  # pragma: no cover - interface compatibility
+            return None
+
+    monkeypatch.setattr(featured.threading, "Thread", ImmediateThread)
+
+    call_log = []
+
+    def fake_consume(url: str) -> None:
+        call_log.append(url)
+        if len(call_log) >= len(scout._ws_urls):
+            scout._stop_event.set()
+
+    monkeypatch.setattr(scout, "_consume_ws_url", fake_consume)
+
+    caplog.set_level("WARNING")
+    scout._start_ws_listener()
+
+    assert scout._ws_thread is not None
+    assert scout._ws_provider_class is FallbackProvider
+    assert call_log == ["ws://one", "ws://two"]
+    assert not any(
+        "disabling live subscriptions" in record.message for record in caplog.records
+    )
+
+    scout.stop()
+
+
+def test_pro_scout_ws_provider_fallback(monkeypatch, caplog, tmp_path, scout_modules):
+    _, pro = scout_modules
+
+    websocket_module = sys.modules["web3.providers.websocket"]
+    monkeypatch.delattr(websocket_module, "WebsocketProvider", raising=False)
+
+    class FallbackProvider(FakeWebsocketProvider):
+        pass
+
+    monkeypatch.setattr(websocket_module, "WebsocketProviderV2", FallbackProvider, raising=False)
+
+    class DummyBackendClient:
+        base_url = "http://api"
+
+        def patch(self, *args, **kwargs):
+            return types.SimpleNamespace(status_code=200, text="")
+
+    service = pro.ProScout(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=["ws://one", "ws://two"],
+        api_base_url="http://api",
+        admin_access_token="token",
+        admin_refresh_token="refresh",
+        contract_address="0xabc",
+        db_path=str(tmp_path / "pro_ws_fallback.db"),
+        backend_client=DummyBackendClient(),
+        poll_interval=1,
+        reorg_conf=0,
+    )
+
+    class ImmediateThread:
+        def __init__(self, target, name=None, daemon=None):
+            self._target = target
+            self._started = False
+
+        def start(self):
+            self._started = True
+            try:
+                self._target()
+            finally:
+                self._started = False
+
+        def is_alive(self):
+            return self._started
+
+        def join(self, timeout=None):  # pragma: no cover - interface compatibility
+            return None
+
+    monkeypatch.setattr(pro.threading, "Thread", ImmediateThread)
+
+    call_log = []
+
+    def fake_consume(url: str) -> None:
+        call_log.append(url)
+        if len(call_log) >= len(service.rpc_ws_urls):
+            service._stop_event.set()
+
+    monkeypatch.setattr(service, "_consume_ws_url", fake_consume)
+
+    caplog.set_level("WARNING")
+    service._start_ws_listener()
+
+    assert service._ws_thread is not None
+    assert service._ws_provider_class is FallbackProvider
+    assert call_log == ["ws://one", "ws://two"]
+    assert not any(
+        "disabling live subscriptions" in record.message for record in caplog.records
+    )
+
+    service.stop()

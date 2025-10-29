@@ -25,17 +25,33 @@ try:  # pragma: no cover - compatibility with older web3 versions
 except ImportError:  # pragma: no cover - fallback for environments without HexStr
     HexStr = NewType("HexStr", str)
 
-try:  # pragma: no cover - optional dependency at runtime
-    from web3.providers.websocket import WebsocketProvider
-except ImportError:  # pragma: no cover - web3 without websocket extras
-    WebsocketProvider = None  # type: ignore[assignment]
-
 from .auth_wallet import load_or_create_admin_wallet
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
 
 LOGGER = logging.getLogger(__name__)
+
+
+def resolve_ws_provider_class() -> Optional[type]:
+    """Return the first available websocket provider class for the current web3 install."""
+
+    with contextlib.suppress(ImportError, AttributeError):
+        from web3.providers.websocket import WebsocketProvider as provider
+
+        if isinstance(provider, type):
+            return provider
+    with contextlib.suppress(ImportError, AttributeError):
+        from web3.providers.websocket import WebsocketProviderV2 as provider_v2
+
+        if isinstance(provider_v2, type):
+            return provider_v2
+    with contextlib.suppress(ImportError, AttributeError):
+        legacy_provider = getattr(Web3, "WebsocketProvider", None)
+
+        if isinstance(legacy_provider, type):
+            return legacy_provider
+    return None
 
 EVENT_ABI: List[Dict[str, Any]] = [
     {
@@ -149,6 +165,7 @@ class FeaturedScout:
         self._ws_stale_threshold = max(
             self._config.poll_interval_sec * 3, self._config.poll_interval_sec + 2
         )
+        self._ws_provider_class: Optional[type] = None
         persisted_index = self._load_active_rpc_index()
         if persisted_index:
             LOGGER.debug(
@@ -522,13 +539,19 @@ class FeaturedScout:
     def _start_ws_listener(self) -> None:
         if not self._ws_urls:
             return
-        if WebsocketProvider is None:
+        provider_class = self._get_ws_provider_class()
+        if provider_class is None:
             LOGGER.warning("web3 websocket provider unavailable; disabling live subscriptions")
             return
         if self._ws_thread and self._ws_thread.is_alive():
             return
         self._ws_thread = threading.Thread(target=self._websocket_loop, name="FeaturedScoutWS", daemon=True)
         self._ws_thread.start()
+
+    def _get_ws_provider_class(self) -> Optional[type]:
+        if self._ws_provider_class is None:
+            self._ws_provider_class = resolve_ws_provider_class()
+        return self._ws_provider_class
 
     def _websocket_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -554,7 +577,10 @@ class FeaturedScout:
                         break
 
     def _consume_ws_url(self, url: str) -> None:
-        provider = WebsocketProvider(url, websocket_timeout=30)  # type: ignore[call-arg]
+        provider_class = self._get_ws_provider_class()
+        if provider_class is None:
+            raise RuntimeError("Websocket provider class unavailable")
+        provider = provider_class(url, websocket_timeout=30)  # type: ignore[call-arg]
         filter_params = {
             "address": self._checksum_contract_address,
             "topics": [[topic for topic in self._event_topic_map]],
