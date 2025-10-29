@@ -162,7 +162,14 @@ class FeaturedScout:
 
     def _refresh_event_topic_map(self) -> None:
         self._event_topic_map = {
-            self._web3.keccak(text=event["name"] + "(" + ",".join(inp["type"] for inp in event["inputs"]) + ")").hex(): event
+            Web3.to_hex(
+                self._web3.keccak(
+                    text=event["name"]
+                    + "("
+                    + ",".join(inp["type"] for inp in event["inputs"])
+                    + ")"
+                )
+            ): event
             for event in EVENT_ABI
         }
 
@@ -360,7 +367,7 @@ class FeaturedScout:
         return True
 
     def _handle_log(self, log_entry: LogReceipt) -> bool:
-        topic0 = log_entry["topics"][0].hex()
+        topic0 = Web3.to_hex(log_entry["topics"][0])
         event_abi = self._event_topic_map.get(topic0)
         if event_abi is None:
             LOGGER.warning("Unknown event topic", extra={"topic": topic0})
