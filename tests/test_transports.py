@@ -436,7 +436,7 @@ def test_featured_scout_batches_get_logs_requests(tmp_path, scout_modules):
     scout._web3.eth.get_logs = fake_get_logs  # type: ignore[assignment]
 
     assert scout._poll_once() is True
-    assert calls == [(5, 6), (7, 8), (9, 10)]
+    assert calls == [("0x5", "0x6"), ("0x7", "0x8"), ("0x9", "0xa")]
     assert scout._db.get_meta("featured_last_block") == "10"
 
 
@@ -478,7 +478,7 @@ def test_featured_scout_persists_progress_across_batch_failures(
     scout._web3.eth.get_logs = flaky_get_logs  # type: ignore[assignment]
 
     assert scout._poll_once() is False
-    assert calls == [(5, 6), (7, 8)]
+    assert calls == [("0x5", "0x6"), ("0x7", "0x8")]
     assert scout._db.get_meta("featured_last_block") == "6"
 
 
