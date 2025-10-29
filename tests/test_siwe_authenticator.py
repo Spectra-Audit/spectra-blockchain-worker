@@ -80,6 +80,12 @@ def test_siwe_authenticator_performs_handshake(temp_db: DatabaseManager) -> None
         "http://api.local/v1/auth/nonce",
         "http://api.local/v1/auth/verify",
     ]
+    assert session.calls[0].kwargs["json"] == {
+        "wallet_address": "0xabc",
+        "address": "0xabc",
+    }
+    assert session.calls[1].kwargs["json"]["wallet_address"] == "0xabc"
+    assert session.calls[1].kwargs["json"]["address"] == "0xabc"
 
 
 def test_siwe_authenticator_reuses_refresh_token(temp_db: DatabaseManager) -> None:
