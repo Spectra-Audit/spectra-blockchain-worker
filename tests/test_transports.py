@@ -185,6 +185,45 @@ def scout_modules(monkeypatch):
         sys.modules[name] = module
 
 
+def test_featured_scout_topics_are_hex_prefixed(tmp_path, scout_modules):
+    featured, _ = scout_modules
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=(),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        admin_refresh_token="refresh",
+        admin_wallet_address="0x0000000000000000000000000000000000000001",
+        admin_wallet_private_key="0x01",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_topics.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=1,
+        start_block=None,
+        start_block_latest=True,
+    )
+    scout = featured.FeaturedScout(config, once=True)
+    topics = list(scout._event_topic_map.keys())
+    assert topics, "Expected FeaturedScout to register event topics"
+    assert all(topic.startswith("0x") for topic in topics)
+
+    topic_key = topics[0]
+    scout._handle_round_finalized = lambda *args, **kwargs: True  # type: ignore[assignment]
+    scout._handle_paid = lambda *args, **kwargs: True  # type: ignore[assignment]
+
+    log_entry = FakeAttributeDict(
+        {
+            "transactionHash": bytes.fromhex("06" * 32),
+            "logIndex": 0,
+            "blockNumber": 7,
+            "topics": [bytes.fromhex(topic_key[2:])],
+        }
+    )
+    assert scout._handle_log(log_entry) is True
+
+
 def test_featured_scout_processes_http_and_websocket_logs(tmp_path, scout_modules):
     featured, _ = scout_modules
     config = featured.ScoutConfig(
