@@ -334,6 +334,49 @@ def test_featured_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modul
     assert scout._poll_gate.is_set()
 
 
+def test_featured_scout_http_catch_up_synchronizes_ws_progress(
+    tmp_path, scout_modules, caplog
+):
+    featured, _ = scout_modules
+
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=("ws://rpc",),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        admin_refresh_token="refresh",
+        admin_wallet_address="0x0000000000000000000000000000000000000001",
+        admin_wallet_private_key="0x01",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_sync.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=1,
+        start_block=None,
+        start_block_latest=True,
+    )
+
+    scout = featured.FeaturedScout(config, once=True)
+    scout._handle_log = lambda *args, **kwargs: True  # type: ignore[assignment]
+
+    caplog.set_level("INFO")
+    assert scout._poll_once() is True
+    scout._notify_ws_connected()
+    assert not scout._poll_gate.is_set()
+
+    scout._web3.eth.block_number = scout._last_block + 1
+    scout._web3.eth.logs = []
+    scout._resume_http_polling()
+    caplog.clear()
+
+    assert scout._poll_once() is True
+    assert "HTTP poller caught up; relying on websocket stream" in caplog.messages
+    assert not scout._poll_gate.is_set()
+    with scout._ws_state_lock:
+        assert scout._ws_last_block == scout._last_block
+
+
 def test_pro_scout_processes_http_and_websocket_logs(tmp_path, scout_modules):
     _, pro = scout_modules
 

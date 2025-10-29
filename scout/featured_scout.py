@@ -682,6 +682,8 @@ class FeaturedScout:
             return
         with self._ws_state_lock:
             ws_ready = self._ws_ready.is_set()
+            if ws_ready and self._ws_last_block < self._last_block:
+                self._ws_last_block = self._last_block
             ws_last_block = self._ws_last_block
             ws_last_message = self._ws_last_message
         if not ws_ready:
