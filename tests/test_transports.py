@@ -1,5 +1,6 @@
 import importlib
 import sys
+import time
 import types
 from typing import Any, Dict, List
 
@@ -282,6 +283,57 @@ def test_featured_scout_processes_http_and_websocket_logs(tmp_path, scout_module
     assert count_after == 2
 
 
+def test_featured_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modules):
+    featured, _ = scout_modules
+
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=("ws://rpc",),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        admin_refresh_token="refresh",
+        admin_wallet_address="0x0000000000000000000000000000000000000001",
+        admin_wallet_private_key="0x01",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_pause.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=1,
+        start_block=None,
+        start_block_latest=True,
+    )
+
+    scout = featured.FeaturedScout(config, once=True)
+    scout._handle_log = lambda *args, **kwargs: True  # type: ignore[assignment]
+
+    http_log = FakeAttributeDict(
+        {
+            "transactionHash": bytes.fromhex("08" * 32),
+            "logIndex": 0,
+            "blockNumber": 10,
+            "topics": [bytes.fromhex("aa" * 32)],
+        }
+    )
+    scout._web3.eth.logs = [http_log]
+    assert scout._poll_once() is True
+
+    assert scout._poll_gate.is_set()
+    scout._notify_ws_connected()
+    assert not scout._poll_gate.is_set()
+
+    with scout._ws_state_lock:
+        scout._ws_last_message = time.time() - (scout._ws_stale_threshold + 1)
+    scout._evaluate_polling_state()
+    assert scout._poll_gate.is_set()
+
+    scout._notify_ws_connected()
+    assert not scout._poll_gate.is_set()
+
+    scout._notify_ws_disconnected()
+    assert scout._poll_gate.is_set()
+
+
 def test_pro_scout_processes_http_and_websocket_logs(tmp_path, scout_modules):
     _, pro = scout_modules
 
@@ -351,6 +403,68 @@ def test_pro_scout_processes_http_and_websocket_logs(tmp_path, scout_modules):
     with service.db_manager.read_connection() as conn:
         count_after = conn.execute("SELECT COUNT(*) FROM processed_logs").fetchone()[0]
     assert count_after == 2
+
+
+def test_pro_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modules):
+    _, pro = scout_modules
+
+    class DummyBackendClient:
+        base_url = "http://api"
+
+        def patch(self, *args, **kwargs):
+            return types.SimpleNamespace(status_code=200, text="")
+
+    service = pro.ProScout(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=["ws://rpc"],
+        api_base_url="http://api",
+        admin_access_token="token",
+        admin_refresh_token="refresh",
+        contract_address="0xabc",
+        db_path=str(tmp_path / "pro_pause.db"),
+        backend_client=DummyBackendClient(),
+        poll_interval=1,
+        reorg_conf=0,
+    )
+
+    handler = lambda *args, **kwargs: True  # noqa: E731 - simple stub
+    service._handle_stake_started = handler  # type: ignore[assignment]
+    service._handle_tier_upgraded = handler  # type: ignore[assignment]
+    service._handle_unstake_requested = handler  # type: ignore[assignment]
+    service.event_handlers = {
+        "StakeStarted": service._handle_stake_started,
+        "TierUpgraded": service._handle_tier_upgraded,
+        "UnstakeRequested": service._handle_unstake_requested,
+    }
+
+    topic_key = next(iter(service._topic_to_event))
+    topic_bytes = bytes.fromhex(topic_key[2:] if topic_key.startswith("0x") else topic_key)
+
+    http_log = FakeAttributeDict(
+        {
+            "transactionHash": bytes.fromhex("07" * 32),
+            "logIndex": 0,
+            "blockNumber": 10,
+            "topics": [topic_bytes],
+        }
+    )
+    service.web3.eth.logs = [http_log]
+    service._poll_once()
+
+    assert service._poll_gate.is_set()
+    service._notify_ws_connected()
+    assert not service._poll_gate.is_set()
+
+    with service._ws_state_lock:
+        service._ws_last_message = time.time() - (service._ws_stale_threshold + 1)
+    service._evaluate_polling_state()
+    assert service._poll_gate.is_set()
+
+    service._notify_ws_connected()
+    assert not service._poll_gate.is_set()
+
+    service._notify_ws_disconnected()
+    assert service._poll_gate.is_set()
 
 
 def test_featured_scout_rotates_rpc_endpoints(tmp_path, scout_modules):

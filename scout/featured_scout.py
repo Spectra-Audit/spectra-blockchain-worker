@@ -137,6 +137,18 @@ class FeaturedScout:
         )
         self._ws_urls = [url for url in config.rpc_ws_urls if url]
         self._ws_reconnect_delay = max(config.poll_interval_sec, 1)
+        self._poll_gate = threading.Event()
+        self._poll_gate.set()
+        self._last_safe_block = 0
+        self._last_block = 0
+        self._ws_ready = threading.Event()
+        self._ws_state_lock = threading.Lock()
+        self._ws_last_block = 0
+        self._ws_last_message = 0.0
+        self._ws_pause_logged = False
+        self._ws_stale_threshold = max(
+            self._config.poll_interval_sec * 3, self._config.poll_interval_sec + 2
+        )
         persisted_index = self._load_active_rpc_index()
         if persisted_index:
             LOGGER.debug(
@@ -158,6 +170,7 @@ class FeaturedScout:
 
     def stop(self, timeout: float = 10.0) -> None:
         self._stop_event.set()
+        self._poll_gate.set()
         if self._thread:
             self._thread.join(timeout=timeout)
         if self._ws_thread:
@@ -291,6 +304,9 @@ class FeaturedScout:
         LOGGER.info("FeaturedScout loop started")
         try:
             while not self._stop_event.is_set():
+                if not self._poll_gate.wait(timeout=self._config.poll_interval_sec):
+                    self._evaluate_polling_state()
+                    continue
                 success = self._poll_once()
                 if self._once:
                     break
@@ -312,6 +328,7 @@ class FeaturedScout:
             return False
         self._mark_provider_success()
         safe_block = max(latest_block - (self._config.reorg_confirmations - 1), 0)
+        self._last_safe_block = safe_block
         with self._lock:
             last_block = self._load_last_block()
             if last_block is None:
@@ -320,8 +337,10 @@ class FeaturedScout:
                 else:
                     last_block = max((self._config.start_block or 0) - 1, 0)
                 self._save_last_block(last_block)
+            self._last_block = last_block
         if safe_block <= last_block:
             LOGGER.debug("No new finalized blocks", extra={"safe_block": safe_block, "last_block": last_block})
+            self._evaluate_polling_state()
             return True
         window_start = last_block + 1
         window_end = safe_block
@@ -361,6 +380,7 @@ class FeaturedScout:
                     return False
             with self._lock:
                 self._save_last_block(current_to)
+                self._last_block = current_to
             total_logs += len(sorted_logs)
             LOGGER.info(
                 "Processed block chunk",
@@ -375,6 +395,7 @@ class FeaturedScout:
             "Processed blocks",
             extra={"from_block": window_start, "to_block": window_end, "log_count": total_logs},
         )
+        self._evaluate_polling_state()
         return True
 
     def _to_hex_block(self, value: int) -> HexStr:
@@ -542,6 +563,7 @@ class FeaturedScout:
         subscription_id = response.get("result") if isinstance(response, dict) else None
         if not subscription_id:
             raise RuntimeError("Failed to subscribe to websocket logs")
+        self._notify_ws_connected()
         try:
             while not self._stop_event.is_set():
                 message = provider.ws.recv()
@@ -556,6 +578,7 @@ class FeaturedScout:
                     continue
                 self._handle_ws_payload(payload)
         finally:
+            self._notify_ws_disconnected()
             with contextlib.suppress(Exception):
                 provider.make_request("eth_unsubscribe", [subscription_id])
             with contextlib.suppress(Exception):
@@ -579,6 +602,8 @@ class FeaturedScout:
         if log_entry is None:
             return
         self._process_log_entry(log_entry)
+        block_number = self._coerce_int(result.get("blockNumber", 0))
+        self._update_ws_progress(block_number)
 
     def _convert_ws_result(self, result: Dict[str, Any]) -> Optional[LogReceipt]:
         try:
@@ -597,6 +622,70 @@ class FeaturedScout:
             LOGGER.exception("Failed to normalize websocket log")
             return None
         return AttributeDict(log_entry)
+
+    def _notify_ws_connected(self) -> None:
+        with self._ws_state_lock:
+            self._ws_ready.set()
+            self._ws_last_block = max(self._last_block, 0)
+            self._ws_last_message = time.time()
+        self._evaluate_polling_state()
+
+    def _notify_ws_disconnected(self) -> None:
+        with self._ws_state_lock:
+            self._ws_ready.clear()
+            self._ws_last_block = max(self._last_block, 0)
+            self._ws_last_message = 0.0
+        self._resume_http_polling()
+
+    def _update_ws_progress(self, block_number: int) -> None:
+        with self._ws_state_lock:
+            self._ws_last_block = max(self._ws_last_block, block_number)
+            self._ws_last_message = time.time()
+        if block_number > self._last_block:
+            with self._lock:
+                self._save_last_block(block_number)
+                self._last_block = block_number
+        self._evaluate_polling_state()
+
+    def _evaluate_polling_state(self) -> None:
+        if self._stop_event.is_set():
+            self._resume_http_polling()
+            return
+        with self._ws_state_lock:
+            ws_ready = self._ws_ready.is_set()
+            ws_last_block = self._ws_last_block
+            ws_last_message = self._ws_last_message
+        if not ws_ready:
+            self._resume_http_polling()
+            return
+        if self._last_safe_block <= 0:
+            self._resume_http_polling()
+            return
+        now = time.time()
+        if ws_last_message == 0.0 or (now - ws_last_message) > self._ws_stale_threshold:
+            self._resume_http_polling()
+            return
+        if ws_last_block < self._last_block:
+            self._resume_http_polling()
+            return
+        if self._last_block >= self._last_safe_block:
+            self._pause_http_polling()
+        else:
+            self._resume_http_polling()
+
+    def _pause_http_polling(self) -> None:
+        if self._poll_gate.is_set():
+            if not self._ws_pause_logged:
+                LOGGER.info("HTTP poller caught up; relying on websocket stream")
+                self._ws_pause_logged = True
+            self._poll_gate.clear()
+
+    def _resume_http_polling(self) -> None:
+        if not self._poll_gate.is_set():
+            if self._ws_pause_logged:
+                LOGGER.info("Resuming HTTP polling after websocket stall")
+            self._ws_pause_logged = False
+            self._poll_gate.set()
 
     @staticmethod
     def _ensure_hex_bytes(value: Any) -> bytes:
