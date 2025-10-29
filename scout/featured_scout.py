@@ -11,7 +11,7 @@ import signal
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NewType, Optional, Sequence, Tuple
 
 import requests
 from requests import Response
@@ -19,6 +19,11 @@ from web3 import Web3
 from web3._utils.events import get_event_data
 from web3.datastructures import AttributeDict
 from web3.types import FilterParams, LogReceipt
+
+try:  # pragma: no cover - compatibility with older web3 versions
+    from web3.types import HexStr
+except ImportError:  # pragma: no cover - fallback for environments without HexStr
+    HexStr = NewType("HexStr", str)
 
 try:  # pragma: no cover - optional dependency at runtime
     from web3.providers.websocket import WebsocketProvider
@@ -108,6 +113,7 @@ class FeaturedScout:
         self._thread: Optional[threading.Thread] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._provider_lock = threading.Lock()
+        self._web3: Optional[Web3] = None
         self._rpc_urls = [url for url in config.rpc_http_urls if url]
         if not self._rpc_urls:
             raise ValueError("At least one RPC HTTP URL must be configured")
@@ -125,6 +131,9 @@ class FeaturedScout:
             config.api_root,
             config.admin_token,
             config.admin_refresh_token,
+        )
+        self._checksum_contract_address = Web3.to_checksum_address(
+            self._config.contract_address
         )
         self._ws_urls = [url for url in config.rpc_ws_urls if url]
         self._ws_reconnect_delay = max(config.poll_interval_sec, 1)
@@ -212,7 +221,7 @@ class FeaturedScout:
             Web3.HTTPProvider(url, request_kwargs={"timeout": 30})
         )
         self._contract = self._web3.eth.contract(
-            address=Web3.to_checksum_address(self._config.contract_address), abi=EVENT_ABI
+            address=self._checksum_contract_address, abi=EVENT_ABI
         )
         self._active_rpc_index = index
         self._rpc_fail_counts[index] = 0
@@ -323,10 +332,12 @@ class FeaturedScout:
             if self._stop_event.is_set():
                 return False
             current_to = min(current_from + batch_size - 1, window_end)
+            from_block = self._to_hex_block(current_from)
+            to_block = self._to_hex_block(current_to)
             filter_params: FilterParams = {
-                "address": Web3.to_checksum_address(self._config.contract_address),
-                "fromBlock": current_from,
-                "toBlock": current_to,
+                "address": self._checksum_contract_address,
+                "fromBlock": from_block,
+                "toBlock": to_block,
                 "topics": [[topic for topic in self._event_topic_map]],
             }
             try:
@@ -365,6 +376,20 @@ class FeaturedScout:
             extra={"from_block": window_start, "to_block": window_end, "log_count": total_logs},
         )
         return True
+
+    def _to_hex_block(self, value: int) -> HexStr:
+        to_hex_fn = Web3.to_hex
+        if self._web3 is not None:
+            to_hex_fn = getattr(self._web3, "to_hex", to_hex_fn)
+        try:
+            converted = to_hex_fn(value)  # type: ignore[misc]
+        except TypeError:
+            converted = hex(value)
+        if not isinstance(converted, str):
+            converted = str(converted)
+        if not converted.startswith("0x"):
+            converted = hex(value)
+        return HexStr(converted)
 
     def _handle_log(self, log_entry: LogReceipt) -> bool:
         topic0 = Web3.to_hex(log_entry["topics"][0])
@@ -510,7 +535,7 @@ class FeaturedScout:
     def _consume_ws_url(self, url: str) -> None:
         provider = WebsocketProvider(url, websocket_timeout=30)  # type: ignore[call-arg]
         filter_params = {
-            "address": Web3.to_checksum_address(self._config.contract_address),
+            "address": self._checksum_contract_address,
             "topics": [[topic for topic in self._event_topic_map]],
         }
         response = provider.make_request("eth_subscribe", ["logs", filter_params])
