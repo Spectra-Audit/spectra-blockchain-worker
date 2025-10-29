@@ -196,6 +196,15 @@ class ProScout:
         self._scheduler_thread: Optional[threading.Thread] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._ws_reconnect_delay = max(self.poll_interval, 1)
+        self._poll_gate = threading.Event()
+        self._poll_gate.set()
+        self._last_safe_block = -1
+        self._ws_ready = threading.Event()
+        self._ws_state_lock = threading.Lock()
+        self._ws_last_block = -1
+        self._ws_last_message = 0.0
+        self._ws_pause_logged = False
+        self._ws_stale_threshold = max(self.poll_interval * 3, self.poll_interval + 2)
 
         persisted_index = self._load_active_rpc_index()
         if persisted_index:
@@ -241,6 +250,7 @@ class ProScout:
             self._save_last_block(self._last_block)
         else:
             self._last_block = stored_last_block
+        self._last_safe_block = max(self._last_block, 0)
 
         self._load_pending_activations()
         self.logger.info(
@@ -268,6 +278,7 @@ class ProScout:
             return
         self._stopped.set()
         self._stop_event.set()
+        self._poll_gate.set()
         with self._activation_cond:
             self._activation_cond.notify_all()
         if self._poller_thread:
@@ -287,6 +298,9 @@ class ProScout:
 
     def _poller_loop(self) -> None:
         while not self._stop_event.is_set():
+            if not self._poll_gate.wait(timeout=self.poll_interval):
+                self._evaluate_polling_state()
+                continue
             try:
                 self._poll_once()
             except Exception as exc:  # pragma: no cover - defensive logging
@@ -306,8 +320,10 @@ class ProScout:
             return
         self._mark_provider_success()
         safe_block = latest_block - self.reorg_conf
+        self._last_safe_block = max(safe_block, 0)
         from_block = self._last_block + 1
         if safe_block < from_block:
+            self._evaluate_polling_state()
             time.sleep(self.poll_interval)
             return
 
@@ -336,6 +352,7 @@ class ProScout:
 
         self._last_block = to_block
         self._save_last_block(self._last_block)
+        self._evaluate_polling_state()
 
     def _process_log_entry(self, log: LogReceipt) -> None:
         tx_hash = self._coerce_hex_str(log.get("transactionHash"))
@@ -845,6 +862,7 @@ class ProScout:
         subscription_id = response.get("result") if isinstance(response, dict) else None
         if not subscription_id:
             raise RuntimeError("Failed to subscribe to websocket logs")
+        self._notify_ws_connected()
         try:
             while not self._stop_event.is_set():
                 message = provider.ws.recv()
@@ -859,6 +877,7 @@ class ProScout:
                     continue
                 self._handle_ws_payload(payload)
         finally:
+            self._notify_ws_disconnected()
             with contextlib.suppress(Exception):
                 provider.make_request("eth_unsubscribe", [subscription_id])
             with contextlib.suppress(Exception):
@@ -880,6 +899,73 @@ class ProScout:
         if log_entry is None:
             return
         self._process_log_entry(log_entry)
+        block_number = self._coerce_int(result.get("blockNumber", 0))
+        self._update_ws_progress(block_number)
+
+    def _notify_ws_connected(self) -> None:
+        with self._ws_state_lock:
+            self._ws_ready.set()
+            self._ws_last_block = max(self._last_block, 0)
+            self._ws_last_message = time.time()
+        self._evaluate_polling_state()
+
+    def _notify_ws_disconnected(self) -> None:
+        with self._ws_state_lock:
+            self._ws_ready.clear()
+            self._ws_last_block = max(self._last_block, 0)
+            self._ws_last_message = 0.0
+        self._resume_http_polling()
+
+    def _update_ws_progress(self, block_number: int) -> None:
+        with self._ws_state_lock:
+            self._ws_last_block = max(self._ws_last_block, block_number)
+            self._ws_last_message = time.time()
+        confirmations_buffer = max(self.reorg_conf - 1, 0)
+        confirmed_block = max(block_number - confirmations_buffer, 0)
+        if confirmed_block > self._last_block:
+            self._last_block = confirmed_block
+            self._save_last_block(self._last_block)
+        self._evaluate_polling_state()
+
+    def _evaluate_polling_state(self) -> None:
+        if self._stop_event.is_set():
+            self._resume_http_polling()
+            return
+        with self._ws_state_lock:
+            ws_ready = self._ws_ready.is_set()
+            ws_last_block = self._ws_last_block
+            ws_last_message = self._ws_last_message
+        if not ws_ready:
+            self._resume_http_polling()
+            return
+        if self._last_safe_block <= 0:
+            self._resume_http_polling()
+            return
+        now = time.time()
+        if ws_last_message == 0.0 or (now - ws_last_message) > self._ws_stale_threshold:
+            self._resume_http_polling()
+            return
+        if ws_last_block < self._last_block:
+            self._resume_http_polling()
+            return
+        if self._last_block >= self._last_safe_block:
+            self._pause_http_polling()
+        else:
+            self._resume_http_polling()
+
+    def _pause_http_polling(self) -> None:
+        if self._poll_gate.is_set():
+            if not self._ws_pause_logged:
+                self.logger.info("HTTP poller caught up; relying on websocket stream")
+                self._ws_pause_logged = True
+            self._poll_gate.clear()
+
+    def _resume_http_polling(self) -> None:
+        if not self._poll_gate.is_set():
+            if self._ws_pause_logged:
+                self.logger.info("Resuming HTTP polling after websocket stall")
+            self._ws_pause_logged = False
+            self._poll_gate.set()
 
     def _convert_ws_result(self, result: Dict[str, Any]) -> Optional[LogReceipt]:
         try:
