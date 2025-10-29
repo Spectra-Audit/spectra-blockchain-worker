@@ -641,10 +641,13 @@ class FeaturedScout:
         with self._ws_state_lock:
             self._ws_last_block = max(self._ws_last_block, block_number)
             self._ws_last_message = time.time()
-        if block_number > self._last_block:
+        confirmations_buffer = max(self._config.reorg_confirmations - 1, 0)
+        confirmed_block = max(block_number - confirmations_buffer, 0)
+        if confirmed_block > self._last_block:
             with self._lock:
-                self._save_last_block(block_number)
-                self._last_block = block_number
+                if confirmed_block > self._last_block:
+                    self._save_last_block(confirmed_block)
+                    self._last_block = confirmed_block
         self._evaluate_polling_state()
 
     def _evaluate_polling_state(self) -> None:
