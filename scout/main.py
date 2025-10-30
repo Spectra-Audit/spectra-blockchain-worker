@@ -11,6 +11,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import replace
 
+from .async_runner import shutdown_shared_async_runner
 from .auth_wallet import load_or_create_admin_wallet
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
@@ -102,6 +103,7 @@ class ScoutApp:
             self.stop()
         self.database.close()
         self.backend_client.close()
+        shutdown_shared_async_runner()
         self._closed = True
 
     def run(self) -> None:

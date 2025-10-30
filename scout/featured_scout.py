@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import contextlib
 import inspect
 import json
@@ -27,6 +26,7 @@ try:  # pragma: no cover - compatibility with older web3 versions
 except ImportError:  # pragma: no cover - fallback for environments without HexStr
     HexStr = NewType("HexStr", str)
 
+from .async_runner import get_shared_async_runner
 from .auth_wallet import load_or_create_admin_wallet
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
@@ -701,13 +701,7 @@ class FeaturedScout:
     @staticmethod
     def _resolve_provider_response(response: Any) -> Any:
         if inspect.isawaitable(response):
-            loop = asyncio.new_event_loop()
-            try:
-                asyncio.set_event_loop(loop)
-                return loop.run_until_complete(response)
-            finally:
-                asyncio.set_event_loop(None)
-                loop.close()
+            return get_shared_async_runner().run(response)
         return response
 
     def _handle_ws_payload(self, payload: Dict[str, Any]) -> None:
