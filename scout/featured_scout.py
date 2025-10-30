@@ -37,6 +37,16 @@ def resolve_ws_provider_class() -> Optional[type]:
     """Return the first available websocket provider class for the current web3 install."""
 
     with contextlib.suppress(ImportError, AttributeError):
+        from web3.providers.persistent import WebSocketProvider as provider
+
+        if isinstance(provider, type):
+            return provider
+    with contextlib.suppress(ImportError, AttributeError):
+        from web3.providers.persistent import AsyncWebSocketProvider as async_provider
+
+        if isinstance(async_provider, type):
+            return async_provider
+    with contextlib.suppress(ImportError, AttributeError):
         from web3.providers.websocket import WebsocketProvider as provider
 
         if isinstance(provider, type):

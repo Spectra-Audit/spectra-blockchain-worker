@@ -156,6 +156,11 @@ def install_web3_stub(monkeypatch):
     websocket_module.WebsocketProvider = FakeWebsocketProvider
     providers_module.websocket = websocket_module
 
+    persistent_module = types.ModuleType("web3.providers.persistent")
+    persistent_module.WebSocketProvider = FakeWebsocketProvider
+    persistent_module.AsyncWebSocketProvider = FakeWebsocketProvider
+    providers_module.persistent = persistent_module
+
     contract_module = types.ModuleType("web3.contract")
     contract_module.Contract = type("Contract", (), {})
     contract_module.ContractEvent = type("ContractEvent", (), {})
@@ -167,6 +172,7 @@ def install_web3_stub(monkeypatch):
     monkeypatch.setitem(sys.modules, "web3.types", types_module)
     monkeypatch.setitem(sys.modules, "web3.providers", providers_module)
     monkeypatch.setitem(sys.modules, "web3.providers.websocket", websocket_module)
+    monkeypatch.setitem(sys.modules, "web3.providers.persistent", persistent_module)
     monkeypatch.setitem(sys.modules, "web3.contract", contract_module)
 
     return modules
@@ -771,9 +777,27 @@ def test_pro_scout_websocket_retries_then_advances(monkeypatch, tmp_path, scout_
     assert sleep_calls == [service._ws_reconnect_delay]
 
 
+def test_ws_provider_prefers_persistent(monkeypatch, scout_modules):
+    featured, _ = scout_modules
+
+    persistent_module = sys.modules["web3.providers.persistent"]
+
+    class PersistentProvider(FakeWebsocketProvider):
+        pass
+
+    monkeypatch.setattr(
+        persistent_module, "WebSocketProvider", PersistentProvider, raising=False
+    )
+
+    assert featured.resolve_ws_provider_class() is PersistentProvider
+
+
 def test_featured_scout_ws_provider_fallback(monkeypatch, caplog, tmp_path, scout_modules):
     featured, _ = scout_modules
 
+    persistent_module = sys.modules["web3.providers.persistent"]
+    monkeypatch.delattr(persistent_module, "WebSocketProvider", raising=False)
+    monkeypatch.delattr(persistent_module, "AsyncWebSocketProvider", raising=False)
     websocket_module = sys.modules["web3.providers.websocket"]
     monkeypatch.delattr(websocket_module, "WebsocketProvider", raising=False)
 
@@ -846,6 +870,9 @@ def test_featured_scout_ws_provider_fallback(monkeypatch, caplog, tmp_path, scou
 def test_pro_scout_ws_provider_fallback(monkeypatch, caplog, tmp_path, scout_modules):
     _, pro = scout_modules
 
+    persistent_module = sys.modules["web3.providers.persistent"]
+    monkeypatch.delattr(persistent_module, "WebSocketProvider", raising=False)
+    monkeypatch.delattr(persistent_module, "AsyncWebSocketProvider", raising=False)
     websocket_module = sys.modules["web3.providers.websocket"]
     monkeypatch.delattr(websocket_module, "WebsocketProvider", raising=False)
 
