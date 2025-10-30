@@ -37,6 +37,20 @@ def resolve_ws_provider_class() -> Optional[type]:
     """Return the first available websocket provider class for the current web3 install."""
 
     with contextlib.suppress(ImportError, AttributeError):
+        from web3.providers.persistent import WebSocketProvider as provider
+
+        if isinstance(provider, type):
+            return provider
+    with contextlib.suppress(ImportError, AttributeError):
+        # Web3's persistent AsyncWebSocketProvider exposes coroutine-based APIs
+        # that are incompatible with the synchronous workflow used by the
+        # scouts. If only the async provider is available we must continue
+        # searching for a synchronous implementation.
+        from web3.providers.persistent import AsyncWebSocketProvider as async_provider
+
+        if isinstance(async_provider, type):
+            LOGGER.debug("Skipping async WebSocket provider in synchronous scout")
+    with contextlib.suppress(ImportError, AttributeError):
         from web3.providers.websocket import WebsocketProvider as provider
 
         if isinstance(provider, type):
