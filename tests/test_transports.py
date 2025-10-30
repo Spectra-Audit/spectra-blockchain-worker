@@ -1084,3 +1084,30 @@ def test_pro_scout_ws_provider_fallback(monkeypatch, caplog, tmp_path, scout_mod
     )
 
     service.stop()
+
+
+def test_iter_websocket_messages_handles_nested_request_processor_queue():
+    from scout.websocket_helpers import iter_websocket_messages
+
+    payloads = [{"result": 1}, {"result": 2}]
+
+    class FakeRequestProcessor:
+        def __init__(self, messages):
+            self.ws_messages = queue.Queue()
+            for message in messages:
+                self.ws_messages.put(message)
+
+    class NestedQueuePersistentProvider:
+        def __init__(self, messages):
+            self._request_processor = FakeRequestProcessor(messages)
+
+    NestedQueuePersistentProvider.__module__ = "web3.providers.persistent.fake"
+
+    provider = NestedQueuePersistentProvider(payloads)
+    collected = []
+    stop_event = types.SimpleNamespace(is_set=lambda: len(collected) >= len(payloads))
+
+    for message in iter_websocket_messages(provider, stop_event, poll_interval=0.01):
+        collected.append(message)
+
+    assert collected == payloads
