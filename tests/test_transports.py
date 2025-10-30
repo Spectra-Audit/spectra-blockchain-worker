@@ -731,6 +731,54 @@ def test_featured_scout_websocket_retries_before_switch(monkeypatch, tmp_path, s
     assert sleep_calls == []
 
 
+def test_featured_scout_ws_provider_without_timeout(monkeypatch, tmp_path, scout_modules):
+    featured, _ = scout_modules
+
+    class NoTimeoutProvider:
+        last_kwargs = None
+
+        def __init__(self, url: str):
+            type(self).last_kwargs = {}
+            self.url = url
+            self.ws = types.SimpleNamespace(recv=lambda: None, close=lambda: None)
+
+        def make_request(self, method, params):  # noqa: ANN001 - mimic Web3 signature
+            if method == "eth_subscribe":
+                return {"result": "sub"}
+            if method == "eth_unsubscribe":
+                return {"result": True}
+            return {"result": None}
+
+        def disconnect(self):
+            return None
+
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=("ws://one",),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        admin_refresh_token="refresh",
+        admin_wallet_address="0x0000000000000000000000000000000000000001",
+        admin_wallet_private_key="0x01",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_ws_no_timeout.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=1,
+        start_block=None,
+        start_block_latest=True,
+    )
+    scout = featured.FeaturedScout(config, once=True)
+
+    monkeypatch.setattr(scout, "_get_ws_provider_class", lambda: NoTimeoutProvider)
+
+    scout._stop_event.set()
+    scout._consume_ws_url("ws://one")
+
+    assert NoTimeoutProvider.last_kwargs == {}
+
+
 def test_pro_scout_websocket_retries_then_advances(monkeypatch, tmp_path, scout_modules):
     _, pro = scout_modules
 
