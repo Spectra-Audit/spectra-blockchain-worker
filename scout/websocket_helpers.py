@@ -33,20 +33,54 @@ def _iter_from_ws_object(ws: Any, stop_event: Any) -> Iterator[Any]:
 
 
 def _resolve_message_getter(provider: Any) -> Optional[MessageGetter]:
-    get_message = getattr(provider, "get_message", None)
-    if callable(get_message):
-        return lambda timeout: _call_with_optional_timeout(get_message, timeout)
+    visited: set[int] = set()
 
-    message_queue = getattr(provider, "ws_messages", None)
-    if message_queue is None:
-        message_queue = getattr(provider, "message_queue", None)
-    if message_queue is not None and hasattr(message_queue, "get"):
+    def _wrap_queue(message_queue: Any) -> MessageGetter:
         return lambda timeout: message_queue.get(timeout=timeout)
 
-    iterator = getattr(provider, "__iter__", None)
-    if callable(iterator):
-        iterator_obj = iterator()
-        return lambda timeout: next(iterator_obj)
+    def _wrap_get_message(get_message: Callable[..., Any]) -> MessageGetter:
+        return lambda timeout: _call_with_optional_timeout(get_message, timeout)
+
+    def _search(obj: Any, allow_iterator: bool = False) -> Optional[MessageGetter]:
+        if obj is None:
+            return None
+
+        obj_id = id(obj)
+        if obj_id in visited:
+            return None
+        visited.add(obj_id)
+
+        get_message = getattr(obj, "get_message", None)
+        if callable(get_message):
+            return _wrap_get_message(get_message)
+
+        for attr_name in ("ws_messages", "message_queue", "_ws_messages"):
+            message_queue = getattr(obj, attr_name, None)
+            if message_queue is not None and hasattr(message_queue, "get"):
+                return _wrap_queue(message_queue)
+
+        if allow_iterator:
+            iterator = getattr(obj, "__iter__", None)
+            if callable(iterator):
+                iterator_obj = iterator()
+                return lambda timeout: next(iterator_obj)
+
+        for attr_name in dir(obj):
+            if "request_processor" not in attr_name:
+                continue
+            try:
+                nested = getattr(obj, attr_name)
+            except AttributeError:
+                continue
+            getter = _search(nested)
+            if getter is not None:
+                return getter
+
+        return None
+
+    getter = _search(provider, allow_iterator=True)
+    if getter is not None:
+        return getter
 
     return None
 
