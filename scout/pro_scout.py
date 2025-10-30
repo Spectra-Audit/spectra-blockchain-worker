@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -859,7 +860,22 @@ class ProScout:
         provider_class = self._get_ws_provider_class()
         if provider_class is None:
             raise RuntimeError("Websocket provider class unavailable")
-        provider = provider_class(url, websocket_timeout=30)  # type: ignore[call-arg]
+        provider_kwargs: Dict[str, Any] = {}
+        signature_target = None
+
+        init = getattr(provider_class, "__init__", None)
+        if init is not None and (inspect.isfunction(init) or inspect.ismethod(init)):
+            signature_target = init
+        elif inspect.isfunction(provider_class) or inspect.ismethod(provider_class):
+            signature_target = provider_class
+
+        if signature_target is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                signature = inspect.signature(signature_target)
+                if "websocket_timeout" in signature.parameters:
+                    provider_kwargs["websocket_timeout"] = 30
+
+        provider = provider_class(url, **provider_kwargs)  # type: ignore[call-arg]
         filter_params = {
             "address": self.contract_address,
             "topics": [self.event_topics],
