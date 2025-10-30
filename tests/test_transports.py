@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import sys
 import time
@@ -107,7 +108,10 @@ class FakeWeb3:
 
 
 class FakeWebsocketProvider:
-    def __init__(self, *args, **kwargs):
+    def __init__(self, url=None, websocket_timeout=None, websocket_kwargs=None):
+        self.url = url
+        self.websocket_timeout = websocket_timeout
+        self.websocket_kwargs = websocket_kwargs or {}
         self.ws = types.SimpleNamespace(recv=lambda: None, close=lambda: None)
 
     def make_request(self, method, params):  # noqa: ANN001 - mimic Web3 signature
@@ -117,8 +121,59 @@ class FakeWebsocketProvider:
             return {"result": True}
         return {"result": None}
 
-    def disconnect(self):
+    async def disconnect(self):
         return None
+
+
+class FakeAsyncEth:
+    def __init__(self, web3: "FakeAsyncWeb3") -> None:
+        self._web3 = web3
+
+    async def subscribe(self, *args, **kwargs):  # noqa: ANN001 - mimic Web3 signature
+        self._web3._subscriptions.append((args, kwargs))
+        return "sub"
+
+    async def unsubscribe(self, *args, **kwargs):  # noqa: ANN001 - mimic Web3 signature
+        self._web3._unsubscriptions.append((args, kwargs))
+        return True
+
+
+class FakeAsyncSubscriptionStream:
+    def __init__(self, web3: "FakeAsyncWeb3") -> None:
+        self._web3 = web3
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._web3._should_stop and not self._web3._subscription_payloads:
+            raise StopAsyncIteration
+        if self._web3._subscription_payloads:
+            return self._web3._subscription_payloads.pop(0)
+        await asyncio.sleep(0.01)
+        if self._web3._should_stop:
+            raise StopAsyncIteration
+        return None
+
+
+class FakeAsyncSocket:
+    def __init__(self, web3: "FakeAsyncWeb3") -> None:
+        self._web3 = web3
+
+    def process_subscriptions(self) -> FakeAsyncSubscriptionStream:  # noqa: D401 - mimic web3 API
+        return FakeAsyncSubscriptionStream(self._web3)
+
+
+class FakeAsyncWeb3:
+    def __init__(self, provider):  # noqa: ANN001 - mimic Web3 signature
+        self.provider = provider
+        self.eth = FakeAsyncEth(self)
+        self.socket = FakeAsyncSocket(self)
+        self._subscription_payloads: List[Any] = []
+        self._subscriptions: List[Any] = []
+        self._unsubscriptions: List[Any] = []
+        self._should_stop = False
+
 
 
 def install_web3_stub(monkeypatch):
@@ -129,6 +184,7 @@ def install_web3_stub(monkeypatch):
 
     web3_module = types.ModuleType("web3")
     web3_module.Web3 = FakeWeb3
+    web3_module.AsyncWeb3 = FakeAsyncWeb3
     web3_module.HTTPProvider = FakeHTTPProvider
     FakeWeb3.default_block_number = 10
     FakeWeb3.default_logs = []

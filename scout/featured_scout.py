@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import json
 import logging
@@ -15,7 +16,11 @@ from typing import Any, Dict, Iterable, List, NewType, Optional, Sequence, Tuple
 
 import requests
 from requests import Response
-from web3 import Web3
+try:
+    from web3 import AsyncWeb3, Web3
+except ImportError:  # pragma: no cover - AsyncWeb3 introduced in newer web3 releases
+    AsyncWeb3 = None  # type: ignore[assignment]
+    from web3 import Web3
 from web3._utils.events import get_event_data
 from web3.datastructures import AttributeDict
 from web3.types import FilterParams, LogReceipt
@@ -591,42 +596,43 @@ class FeaturedScout:
                         break
 
     def _consume_ws_url(self, url: str) -> None:
+        asyncio.run(self._consume_ws_url_async(url))
+
+    async def _consume_ws_url_async(self, url: str) -> None:
         provider_class = self._get_ws_provider_class()
         if provider_class is None:
             raise RuntimeError("Websocket provider class unavailable")
-        provider = provider_class(url, websocket_timeout=30)  # type: ignore[call-arg]
+        if AsyncWeb3 is None:
+            raise RuntimeError("AsyncWeb3 unavailable; websocket subscriptions require async support")
+        try:
+            provider = provider_class(url, websocket_kwargs={"open_timeout": 30})  # type: ignore[call-arg]
+        except TypeError:
+            provider = provider_class(url, websocket_timeout=30)  # type: ignore[call-arg]
+        w3 = AsyncWeb3(provider)
         filter_params = {
             "address": self._checksum_contract_address,
             "topics": [[topic for topic in self._event_topic_map]],
         }
-        response = provider.make_request("eth_subscribe", ["logs", filter_params])
-        subscription_id = response.get("result") if isinstance(response, dict) else None
+        subscription_id = await w3.eth.subscribe("logs", filter_params)
         if not subscription_id:
             raise RuntimeError("Failed to subscribe to websocket logs")
         self._notify_ws_connected()
         try:
-            while not self._stop_event.is_set():
-                message = provider.ws.recv()
-                if not message:
-                    continue
-                try:
-                    payload = json.loads(message)
-                except json.JSONDecodeError:
-                    LOGGER.debug("Ignoring non-JSON websocket payload", extra={"payload": message})
-                    continue
-                if payload.get("method") != "eth_subscription":
-                    continue
+            async for payload in w3.socket.process_subscriptions():
+                if self._stop_event.is_set():
+                    break
                 self._handle_ws_payload(payload)
         finally:
             self._notify_ws_disconnected()
             with contextlib.suppress(Exception):
-                provider.make_request("eth_unsubscribe", [subscription_id])
+                if subscription_id:
+                    await w3.eth.unsubscribe(subscription_id)
             with contextlib.suppress(Exception):
-                if hasattr(provider, "disconnect"):
-                    provider.disconnect()
-            with contextlib.suppress(Exception):
-                if hasattr(provider, "ws") and hasattr(provider.ws, "close"):
-                    provider.ws.close()
+                disconnect = getattr(w3.provider, "disconnect", None)
+                if disconnect is not None:
+                    result = disconnect()
+                    if asyncio.iscoroutine(result):
+                        await result
 
     def _handle_ws_payload(self, payload: Dict[str, Any]) -> None:
         params = payload.get("params") if isinstance(payload, dict) else None
