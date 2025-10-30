@@ -35,8 +35,16 @@ def _iter_from_ws_object(ws: Any, stop_event: Any) -> Iterator[Any]:
 def _resolve_message_getter(provider: Any) -> Optional[MessageGetter]:
     visited: set[int] = set()
 
-    def _wrap_queue(message_queue: Any) -> MessageGetter:
-        return lambda timeout: message_queue.get(timeout=timeout)
+    def _wrap_queue(message_queue: Any) -> Optional[MessageGetter]:
+        get = getattr(message_queue, "get", None)
+        if callable(get):
+            return lambda timeout: _call_with_optional_timeout(get, timeout)
+
+        get_nowait = getattr(message_queue, "get_nowait", None)
+        if callable(get_nowait):
+            return lambda timeout: get_nowait()
+
+        return None
 
     def _wrap_get_message(get_message: Callable[..., Any]) -> MessageGetter:
         return lambda timeout: _call_with_optional_timeout(get_message, timeout)
@@ -50,14 +58,28 @@ def _resolve_message_getter(provider: Any) -> Optional[MessageGetter]:
             return None
         visited.add(obj_id)
 
+        if isinstance(obj, (str, bytes, bytearray)):
+            return None
+
         get_message = getattr(obj, "get_message", None)
         if callable(get_message):
             return _wrap_get_message(get_message)
 
-        for attr_name in ("ws_messages", "message_queue", "_ws_messages"):
-            message_queue = getattr(obj, attr_name, None)
-            if message_queue is not None and hasattr(message_queue, "get"):
-                return _wrap_queue(message_queue)
+        queue_getter = _wrap_queue(obj)
+        if queue_getter is not None:
+            return queue_getter
+
+        if isinstance(obj, dict):
+            for value in obj.values():
+                getter = _search(value)
+                if getter is not None:
+                    return getter
+
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            for value in obj:
+                getter = _search(value)
+                if getter is not None:
+                    return getter
 
         if allow_iterator:
             iterator = getattr(obj, "__iter__", None)
@@ -65,13 +87,34 @@ def _resolve_message_getter(provider: Any) -> Optional[MessageGetter]:
                 iterator_obj = iterator()
                 return lambda timeout: next(iterator_obj)
 
-        for attr_name in dir(obj):
-            if "request_processor" not in attr_name:
-                continue
+        attribute_names: set[str] = set()
+        try:
+            attribute_names.update(vars(obj).keys())
+        except TypeError:
+            pass
+
+        for attr_name in getattr(obj, "__slots__", ()):  # type: ignore[attr-defined]
+            if isinstance(attr_name, str):
+                attribute_names.add(attr_name)
+
+        if not attribute_names:
+            attribute_names.update(
+                name
+                for name in dir(obj)
+                if not name.startswith("__") and not name.endswith("__")
+            )
+
+        for attr_name in attribute_names:
             try:
                 nested = getattr(obj, attr_name)
             except AttributeError:
                 continue
+            except Exception:
+                continue
+
+            if inspect.ismethod(nested) or inspect.isfunction(nested):
+                continue
+
             getter = _search(nested)
             if getter is not None:
                 return getter
