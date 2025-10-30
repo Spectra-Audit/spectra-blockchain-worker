@@ -172,11 +172,17 @@ def test_pro_scout_handles_async_websocket_provider(
             self.requests: List[Tuple[str, Any]] = []
             self.subscribe_awaited = False
             self.unsubscribe_awaited = False
+            self.handshake_calls = 0
+            self.cleanup_calls = 0
+            self.disconnect_calls = 0
+            self.handshake_ready = False
             self.ws = self._WebSocket(self.stop_event)
             AsyncProvider.instances.append(self)
 
         def make_request(self, method: str, params: Any) -> Any:
             async def _call() -> Dict[str, Any]:
+                if not self.handshake_ready:
+                    raise RuntimeError("handshake not completed")
                 self.requests.append((method, params))
                 if method == "eth_subscribe":
                     self.subscribe_awaited = True
@@ -188,8 +194,16 @@ def test_pro_scout_handles_async_websocket_provider(
 
             return _call()
 
+        async def socket_connect(self) -> None:
+            self.handshake_calls += 1
+            self.handshake_ready = True
+
+        async def socket_disconnect(self) -> None:
+            self.cleanup_calls += 1
+            self.handshake_ready = False
+
         def disconnect(self) -> None:
-            return None
+            self.disconnect_calls += 1
 
     monkeypatch.setattr(pro_module, "resolve_ws_provider_class", lambda: AsyncProvider)
 
@@ -206,5 +220,8 @@ def test_pro_scout_handles_async_websocket_provider(
         methods = [method for method, _ in provider.requests]
         assert methods.count("eth_subscribe") == 1
         assert "eth_unsubscribe" in methods
+        assert provider.handshake_calls == 1
+        assert provider.cleanup_calls == 1
+        assert provider.disconnect_calls == 1
     finally:
         scout.db_manager.close()
