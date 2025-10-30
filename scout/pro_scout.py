@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import dataclass
 from heapq import heappop, heappush
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from requests import Response
 from web3 import Web3
@@ -877,6 +877,49 @@ class ProScout:
                     provider_kwargs["websocket_timeout"] = 30
 
         provider = provider_class(url, **provider_kwargs)  # type: ignore[call-arg]
+        cleanup_name: Optional[str] = None
+
+        def _select_hook(names: Sequence[str]) -> Tuple[Optional[str], Optional[Any]]:
+            for hook_name in names:
+                hook = getattr(provider, hook_name, None)
+                if callable(hook):
+                    return hook_name, hook
+            return None, None
+
+        handshake_candidates: Sequence[Tuple[str, Sequence[str]]] = (
+            ("socket_connect", ("socket_disconnect", "disconnect", "close")),
+            ("connect", ("disconnect", "close")),
+            ("start", ("stop", "close", "disconnect")),
+            ("open", ("close", "disconnect")),
+        )
+
+        handshake_hook: Optional[Any] = None
+        cleanup_hook: Optional[Any] = None
+
+        for candidate_name, cleanup_candidates in handshake_candidates:
+            hook = getattr(provider, candidate_name, None)
+            if callable(hook):
+                handshake_hook = hook
+                cleanup_name, cleanup_hook = _select_hook(cleanup_candidates)
+                break
+
+        if handshake_hook is None:
+            for attribute in dir(provider):
+                if attribute.startswith("_"):
+                    continue
+                lowered = attribute.lower()
+                if "connect" not in lowered or "disconnect" in lowered:
+                    continue
+                hook = getattr(provider, attribute, None)
+                if callable(hook):
+                    handshake_hook = hook
+                    cleanup_name, cleanup_hook = _select_hook(("disconnect", "close", "stop", "socket_disconnect"))
+                    break
+
+        if handshake_hook is not None:
+            response = handshake_hook()
+            self._resolve_provider_response(response)
+
         filter_params = {
             "address": self.contract_address,
             "topics": [self.event_topics],
@@ -905,8 +948,16 @@ class ProScout:
             with contextlib.suppress(Exception):
                 response = provider.make_request("eth_unsubscribe", [subscription_id])
                 self._resolve_provider_response(response)
+            performed_disconnect = False
             with contextlib.suppress(Exception):
-                provider.disconnect()
+                if cleanup_hook is not None:
+                    self._resolve_provider_response(cleanup_hook())
+                    performed_disconnect = cleanup_name == "disconnect"
+            if not performed_disconnect:
+                with contextlib.suppress(Exception):
+                    disconnect = getattr(provider, "disconnect", None)
+                    if callable(disconnect):
+                        self._resolve_provider_response(disconnect())
 
     @staticmethod
     def _resolve_provider_response(response: Any) -> Any:
