@@ -3,10 +3,13 @@ import json
 import queue
 import sys
 import time
+import threading
 import types
 from typing import Any, Dict, List
 
 import pytest
+
+from scout.websocket_helpers import iter_websocket_messages
 
 
 class FakeAttributeDict(dict):
@@ -152,6 +155,41 @@ class PersistentFakeWebsocketProvider:
 
     def disconnect(self):
         return None
+
+
+class ModernListenerConnection:
+    def __init__(self, messages):
+        self._inbound_messages = queue.Queue()
+        for message in messages:
+            self._inbound_messages.put(message)
+
+
+class ModernListener:
+    def __init__(self, messages):
+        self.connection = ModernListenerConnection(messages)
+
+
+class ModernPersistentProvider:
+    def __init__(self, messages):
+        self._listener = ModernListener(messages)
+
+
+def test_iter_websocket_messages_discovers_nested_listener_queue():
+    messages = [{"number": 1}, {"number": 2}]
+    provider = ModernPersistentProvider(messages)
+    stop_event = threading.Event()
+
+    iterator = iter_websocket_messages(provider, stop_event, poll_interval=0)
+
+    received = []
+    for _ in messages:
+        received.append(next(iterator))
+
+    assert received == messages
+
+    stop_event.set()
+    with pytest.raises(StopIteration):
+        next(iterator)
 
 
 def install_web3_stub(monkeypatch):
