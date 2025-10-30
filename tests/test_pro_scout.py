@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pytest
 
@@ -128,5 +129,82 @@ def test_pro_scout_event_topics_are_prefixed(monkeypatch: pytest.MonkeyPatch, tm
     try:
         assert scout.event_topics
         assert all(topic.startswith("0x") for topic in scout.event_topics)
+    finally:
+        scout.db_manager.close()
+
+
+def test_pro_scout_handles_async_websocket_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Ensure websocket providers returning coroutines are awaited by the scout."""
+
+    monkeypatch.setattr(pro_module, "Web3", DummyWeb3)
+
+    scout = ProScout(
+        rpc_http_urls=["http://dummy"],
+        rpc_ws_urls=["ws://dummy"],
+        api_base_url="https://api",
+        admin_access_token="token",
+        admin_refresh_token="refresh",
+        contract_address="0x0123456789012345678901234567890123456789",
+        db_path=str(tmp_path / "pro.db"),
+        backend_client=DummyBackendClient(),
+    )
+
+    class AsyncProvider:
+        instances: List["AsyncProvider"] = []
+        stop_event: Optional[threading.Event] = None
+
+        class _WebSocket:
+            def __init__(self, stop_event: Optional[threading.Event]) -> None:
+                self._stop_event = stop_event
+                self.recv_calls = 0
+
+            def recv(self) -> Optional[str]:
+                self.recv_calls += 1
+                if self._stop_event is not None:
+                    self._stop_event.set()
+                return None
+
+        def __init__(self, url: str, **kwargs: Any) -> None:
+            self.url = url
+            self.kwargs = kwargs
+            self.requests: List[Tuple[str, Any]] = []
+            self.subscribe_awaited = False
+            self.unsubscribe_awaited = False
+            self.ws = self._WebSocket(self.stop_event)
+            AsyncProvider.instances.append(self)
+
+        def make_request(self, method: str, params: Any) -> Any:
+            async def _call() -> Dict[str, Any]:
+                self.requests.append((method, params))
+                if method == "eth_subscribe":
+                    self.subscribe_awaited = True
+                    return {"result": "sub-id"}
+                if method == "eth_unsubscribe":
+                    self.unsubscribe_awaited = True
+                    return {"result": True}
+                return {}
+
+            return _call()
+
+        def disconnect(self) -> None:
+            return None
+
+    monkeypatch.setattr(pro_module, "resolve_ws_provider_class", lambda: AsyncProvider)
+
+    scout._stop_event.clear()
+    AsyncProvider.instances.clear()
+    AsyncProvider.stop_event = scout._stop_event
+
+    try:
+        scout._consume_ws_url("ws://dummy")
+        assert AsyncProvider.instances, "provider was not instantiated"
+        provider = AsyncProvider.instances[-1]
+        assert provider.subscribe_awaited
+        assert provider.unsubscribe_awaited
+        methods = [method for method, _ in provider.requests]
+        assert methods.count("eth_subscribe") == 1
+        assert "eth_unsubscribe" in methods
     finally:
         scout.db_manager.close()

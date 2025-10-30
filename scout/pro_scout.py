@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import inspect
 import json
@@ -881,6 +882,7 @@ class ProScout:
             "topics": [self.event_topics],
         }
         response = provider.make_request("eth_subscribe", ["logs", filter_params])
+        response = self._resolve_provider_response(response)
         subscription_id = response.get("result") if isinstance(response, dict) else None
         if not subscription_id:
             raise RuntimeError("Failed to subscribe to websocket logs")
@@ -901,9 +903,22 @@ class ProScout:
         finally:
             self._notify_ws_disconnected()
             with contextlib.suppress(Exception):
-                provider.make_request("eth_unsubscribe", [subscription_id])
+                response = provider.make_request("eth_unsubscribe", [subscription_id])
+                self._resolve_provider_response(response)
             with contextlib.suppress(Exception):
                 provider.disconnect()
+
+    @staticmethod
+    def _resolve_provider_response(response: Any) -> Any:
+        if inspect.isawaitable(response):
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(response)
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+        return response
 
     def _handle_ws_payload(self, payload: Dict[str, Any]) -> None:
         params = payload.get("params") if isinstance(payload, dict) else None
