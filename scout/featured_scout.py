@@ -671,20 +671,29 @@ class FeaturedScout:
             for message in iter_websocket_messages(provider, self._stop_event):
                 if self._stop_event.is_set():
                     break
-                if isinstance(message, bytes):
+                if isinstance(message, (bytes, bytearray)):
                     try:
-                        message = message.decode("utf-8")
+                        message = bytes(message).decode("utf-8")
                     except UnicodeDecodeError:
                         LOGGER.debug(
                             "Ignoring undecodable websocket payload",
                             extra={"payload": message},
                         )
                         continue
+                elif not isinstance(message, str):
+                    LOGGER.debug(
+                        "Ignoring non-text websocket payload",
+                        extra={
+                            "payload": message,
+                            "payload_type": type(message).__name__,
+                        },
+                    )
+                    continue
                 if not message:
                     continue
                 try:
                     payload = json.loads(message)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, TypeError):
                     LOGGER.debug(
                         "Ignoring non-JSON websocket payload",
                         extra={"payload": message},

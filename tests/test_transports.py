@@ -913,6 +913,71 @@ def test_featured_scout_consumes_persistent_provider(monkeypatch, tmp_path, scou
     assert provider_cls.instances[-1].cleanup_calls == 1
 
 
+def test_featured_scout_skips_non_text_websocket_payload(
+    monkeypatch, tmp_path, scout_modules
+):
+    featured, _ = scout_modules
+
+    persistent_module = sys.modules["web3.providers.persistent"]
+    provider_cls = persistent_module.WebSocketProvider
+    provider_cls.instances.clear()
+
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=("ws://queue",),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        admin_refresh_token="refresh",
+        admin_wallet_address="0x0000000000000000000000000000000000000001",
+        admin_wallet_private_key="0x01",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_persistent_non_text.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=1,
+        start_block=None,
+        start_block_latest=True,
+    )
+
+    scout = featured.FeaturedScout(config, once=True)
+    topic_key = next(iter(scout._event_topic_map))
+
+    payload = {
+        "method": "eth_subscription",
+        "params": {
+            "result": {
+                "transactionHash": "0x" + "05" * 32,
+                "logIndex": "0x2",
+                "blockNumber": "0x7",
+                "transactionIndex": "0x0",
+                "address": "0xabc",
+                "data": "0x",
+                "topics": [topic_key],
+            }
+        },
+    }
+
+    provider_cls.default_messages = [3.14, json.dumps(payload)]
+
+    handled = []
+
+    def fake_handle_ws_payload(event_payload):
+        handled.append(event_payload)
+        scout._stop_event.set()
+
+    monkeypatch.setattr(scout, "_handle_ws_payload", fake_handle_ws_payload)
+
+    try:
+        scout._consume_ws_url("ws://queue")
+    finally:
+        provider_cls.default_messages = []
+
+    assert handled == [payload], "Expected websocket payload to be processed"
+    assert provider_cls.instances and provider_cls.instances[-1].handshake_calls == 1
+    assert provider_cls.instances[-1].cleanup_calls == 1
+
+
 def test_pro_scout_websocket_retries_then_advances(monkeypatch, tmp_path, scout_modules):
     _, pro = scout_modules
 
