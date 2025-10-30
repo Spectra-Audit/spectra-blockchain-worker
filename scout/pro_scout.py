@@ -36,6 +36,7 @@ from .database_manager import DatabaseManager
 from .env_loader import load_env_file
 from .featured_scout import resolve_ws_provider_class
 from .websocket_helpers import iter_websocket_messages
+from .websocket_provider_pool import WebSocketProviderHandle, WebSocketProviderPool
 
 EVENT_ABI = [
     {
@@ -130,6 +131,7 @@ class ProScout:
         chain_id: Optional[int] = None,
         start_block: Optional[int] = None,
         block_batch_size: int = 1000,
+        ws_provider_pool: Optional[WebSocketProviderPool] = None,
     ) -> None:
         http_urls = [url.strip() for url in rpc_http_urls if url]
         if not http_urls:
@@ -197,7 +199,11 @@ class ProScout:
         self._ws_reconnect_delay = max(self.poll_interval, 1)
         self._poll_gate = threading.Event()
         self._poll_gate.set()
+        self._ws_provider_pool = ws_provider_pool or WebSocketProviderPool(
+            provider_resolver=resolve_ws_provider_class
+        )
         self._ws_provider_class: Optional[type] = None
+        self._ws_provider_handles: Dict[str, WebSocketProviderHandle] = {}
         self._last_safe_block = -1
         self._ws_ready = threading.Event()
         self._ws_state_lock = threading.Lock()
@@ -290,6 +296,10 @@ class ProScout:
         if self._ws_thread:
             self._ws_thread.join(timeout=timeout)
             self._ws_thread = None
+        for handle in self._ws_provider_handles.values():
+            with contextlib.suppress(Exception):
+                handle.close()
+        self._ws_provider_handles.clear()
         if self._owns_db_manager:
             self.db_manager.close()
         self.logger.info("ProScout service stopped")
@@ -825,6 +835,9 @@ class ProScout:
         if provider_class is None:
             self.logger.warning("web3 websocket provider unavailable; disabling live subscriptions")
             return
+        self._ws_provider_pool.set_provider_class(provider_class)
+        for url in self.rpc_ws_urls:
+            self._get_ws_provider_handle(url)
         if self._ws_thread and self._ws_thread.is_alive():
             return
         self._ws_thread = threading.Thread(target=self._websocket_loop, name="ProScoutWS", daemon=True)
@@ -832,8 +845,22 @@ class ProScout:
 
     def _get_ws_provider_class(self) -> Optional[type]:
         if self._ws_provider_class is None:
-            self._ws_provider_class = resolve_ws_provider_class()
+            provider_class = self._ws_provider_pool.get_provider_class()
+            if provider_class is None:
+                provider_class = resolve_ws_provider_class()
+            self._ws_provider_class = provider_class
         return self._ws_provider_class
+
+    def _get_ws_provider_handle(self, url: str):
+        handle = self._ws_provider_handles.get(url)
+        if handle is None:
+            provider_class = self._get_ws_provider_class()
+            if provider_class is None:
+                raise RuntimeError("Websocket provider class unavailable")
+            self._ws_provider_pool.set_provider_class(provider_class)
+            handle = self._ws_provider_pool.attach(url)
+            self._ws_provider_handles[url] = handle
+        return handle
 
     def _websocket_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -859,128 +886,66 @@ class ProScout:
                         break
 
     def _consume_ws_url(self, url: str) -> None:
-        provider_class = self._get_ws_provider_class()
-        if provider_class is None:
-            raise RuntimeError("Websocket provider class unavailable")
-        provider_kwargs: Dict[str, Any] = {}
-        signature_target = None
-
-        init = getattr(provider_class, "__init__", None)
-        if init is not None and (inspect.isfunction(init) or inspect.ismethod(init)):
-            signature_target = init
-        elif inspect.isfunction(provider_class) or inspect.ismethod(provider_class):
-            signature_target = provider_class
-
-        if signature_target is not None:
-            with contextlib.suppress(TypeError, ValueError):
-                signature = inspect.signature(signature_target)
-                if "websocket_timeout" in signature.parameters:
-                    provider_kwargs["websocket_timeout"] = 30
-
-        provider = provider_class(url, **provider_kwargs)  # type: ignore[call-arg]
-        cleanup_name: Optional[str] = None
-
-        def _select_hook(names: Sequence[str]) -> Tuple[Optional[str], Optional[Any]]:
-            for hook_name in names:
-                hook = getattr(provider, hook_name, None)
-                if callable(hook):
-                    return hook_name, hook
-            return None, None
-
-        handshake_candidates: Sequence[Tuple[str, Sequence[str]]] = (
-            ("socket_connect", ("socket_disconnect", "disconnect", "close")),
-            ("connect", ("disconnect", "close")),
-            ("start", ("stop", "close", "disconnect")),
-            ("open", ("close", "disconnect")),
-        )
-
-        handshake_hook: Optional[Any] = None
-        cleanup_hook: Optional[Any] = None
-
-        for candidate_name, cleanup_candidates in handshake_candidates:
-            hook = getattr(provider, candidate_name, None)
-            if callable(hook):
-                handshake_hook = hook
-                cleanup_name, cleanup_hook = _select_hook(cleanup_candidates)
-                break
-
-        if handshake_hook is None:
-            for attribute in dir(provider):
-                if attribute.startswith("_"):
-                    continue
-                lowered = attribute.lower()
-                if "connect" not in lowered or "disconnect" in lowered:
-                    continue
-                hook = getattr(provider, attribute, None)
-                if callable(hook):
-                    handshake_hook = hook
-                    cleanup_name, cleanup_hook = _select_hook(("disconnect", "close", "stop", "socket_disconnect"))
-                    break
-
-        if handshake_hook is not None:
-            response = handshake_hook()
-            self._resolve_provider_response(response)
-
-        filter_params = {
-            "address": self.contract_address,
-            "topics": [self.event_topics],
-        }
-        response = provider.make_request("eth_subscribe", ["logs", filter_params])
-        response = self._resolve_provider_response(response)
-        subscription_id = response.get("result") if isinstance(response, dict) else None
-        if not subscription_id:
-            raise RuntimeError("Failed to subscribe to websocket logs")
-        self._notify_ws_connected()
-        try:
-            for message in iter_websocket_messages(provider, self._stop_event):
-                if self._stop_event.is_set():
-                    break
-                if isinstance(message, (bytes, bytearray)):
-                    try:
-                        message = bytes(message).decode("utf-8")
-                    except UnicodeDecodeError:
-                        self.logger.debug(
-                            "Ignoring undecodable websocket payload",
-                            extra={"payload": message},
-                        )
-                        continue
-                elif not isinstance(message, str):
-                    self.logger.debug(
-                        "Ignoring non-text websocket payload",
-                        extra={
-                            "payload": message,
-                            "payload_type": type(message).__name__,
-                        },
-                    )
-                    continue
-                if not message:
-                    continue
+        handle = self._get_ws_provider_handle(url)
+        with handle.checkout() as session:
+            provider = session.provider
+            filter_params = {
+                "address": self.contract_address,
+                "topics": [self.event_topics],
+            }
+            subscription_id: Optional[str] = None
+            try:
+                response = provider.make_request("eth_subscribe", ["logs", filter_params])
+                response = self._resolve_provider_response(response)
+                subscription_id = response.get("result") if isinstance(response, dict) else None
+                if not subscription_id:
+                    raise RuntimeError("Failed to subscribe to websocket logs")
+                self._notify_ws_connected()
                 try:
-                    payload = json.loads(message)
-                except (json.JSONDecodeError, TypeError):
-                    self.logger.debug(
-                        "Ignoring malformed websocket payload",
-                        extra={"payload": message},
-                    )
-                    continue
-                if payload.get("method") != "eth_subscription":
-                    continue
-                self._handle_ws_payload(payload)
-        finally:
-            self._notify_ws_disconnected()
-            with contextlib.suppress(Exception):
-                response = provider.make_request("eth_unsubscribe", [subscription_id])
-                self._resolve_provider_response(response)
-            performed_disconnect = False
-            with contextlib.suppress(Exception):
-                if cleanup_hook is not None:
-                    self._resolve_provider_response(cleanup_hook())
-                    performed_disconnect = cleanup_name == "disconnect"
-            if not performed_disconnect:
-                with contextlib.suppress(Exception):
-                    disconnect = getattr(provider, "disconnect", None)
-                    if callable(disconnect):
-                        self._resolve_provider_response(disconnect())
+                    for message in iter_websocket_messages(provider, self._stop_event):
+                        if self._stop_event.is_set():
+                            break
+                        if isinstance(message, (bytes, bytearray)):
+                            try:
+                                message = bytes(message).decode("utf-8")
+                            except UnicodeDecodeError:
+                                self.logger.debug(
+                                    "Ignoring undecodable websocket payload",
+                                    extra={"payload": message},
+                                )
+                                continue
+                        elif not isinstance(message, str):
+                            self.logger.debug(
+                                "Ignoring non-text websocket payload",
+                                extra={
+                                    "payload": message,
+                                    "payload_type": type(message).__name__,
+                                },
+                            )
+                            continue
+                        if not message:
+                            continue
+                        try:
+                            payload = json.loads(message)
+                        except (json.JSONDecodeError, TypeError):
+                            self.logger.debug(
+                                "Ignoring malformed websocket payload",
+                                extra={"payload": message},
+                            )
+                            continue
+                        if payload.get("method") != "eth_subscription":
+                            continue
+                        self._handle_ws_payload(payload)
+                finally:
+                    self._notify_ws_disconnected()
+                    with contextlib.suppress(Exception):
+                        response = provider.make_request("eth_unsubscribe", [subscription_id])
+                        self._resolve_provider_response(response)
+                    with contextlib.suppress(Exception):
+                        session.perform_cleanup()
+            except Exception:
+                session.invalidate()
+                raise
 
     @staticmethod
     def _resolve_provider_response(response: Any) -> Any:
