@@ -35,6 +35,7 @@ from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
 from .featured_scout import resolve_ws_provider_class
+from .websocket_helpers import iter_websocket_messages
 
 EVENT_ABI = [
     {
@@ -931,14 +932,27 @@ class ProScout:
             raise RuntimeError("Failed to subscribe to websocket logs")
         self._notify_ws_connected()
         try:
-            while not self._stop_event.is_set():
-                message = provider.ws.recv()
+            for message in iter_websocket_messages(provider, self._stop_event):
+                if self._stop_event.is_set():
+                    break
+                if isinstance(message, bytes):
+                    try:
+                        message = message.decode("utf-8")
+                    except UnicodeDecodeError:
+                        self.logger.debug(
+                            "Ignoring undecodable websocket payload",
+                            extra={"payload": message},
+                        )
+                        continue
                 if not message:
                     continue
                 try:
                     payload = json.loads(message)
                 except json.JSONDecodeError:
-                    self.logger.debug("Ignoring malformed websocket payload", extra={"payload": message})
+                    self.logger.debug(
+                        "Ignoring malformed websocket payload",
+                        extra={"payload": message},
+                    )
                     continue
                 if payload.get("method") != "eth_subscription":
                     continue
