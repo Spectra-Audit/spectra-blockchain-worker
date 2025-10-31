@@ -205,6 +205,7 @@ class ProScout:
         self._ws_provider_class: Optional[type] = None
         self._ws_provider_handles: Dict[str, WebSocketProviderHandle] = {}
         self._last_safe_block = -1
+        self._last_event_block = -1
         self._ws_ready = threading.Event()
         self._ws_state_lock = threading.Lock()
         self._ws_last_block = -1
@@ -269,6 +270,7 @@ class ProScout:
         else:
             self._last_block = stored_last_block
         self._last_safe_block = max(self._last_block, 0)
+        self._last_event_block = self._last_block
 
         self._load_pending_activations()
         self.logger.info(
@@ -430,6 +432,7 @@ class ProScout:
             return
 
         if handler(decoded, tx_hash, log_index, block_number):
+            self._last_event_block = max(self._last_event_block, block_number)
             self._mark_log_processed(tx_hash, log_index)
         else:
             self.logger.debug(
@@ -1092,7 +1095,7 @@ class ProScout:
             self._mark_ws_unhealthy(ws_last_block)
             self._resume_http_polling()
             return
-        if ws_last_block < self._last_block:
+        if ws_last_block < self._last_event_block:
             http_resume_block = self._last_http_resume_block
             if ws_progress_block < http_resume_block:
                 self.logger.debug(
@@ -1102,6 +1105,7 @@ class ProScout:
                         "ws_progress_block": ws_progress_block,
                         "http_resume_block": http_resume_block,
                         "last_block": self._last_block,
+                        "last_event_block": self._last_event_block,
                     },
                 )
                 self._mark_ws_unhealthy(ws_last_block)
@@ -1114,6 +1118,7 @@ class ProScout:
                     "ws_progress_block": ws_progress_block,
                     "http_resume_block": http_resume_block,
                     "last_block": self._last_block,
+                    "last_event_block": self._last_event_block,
                 },
             )
         healthy_since_time, healthy_since_block = self._ensure_ws_health_marker(
@@ -1140,8 +1145,8 @@ class ProScout:
                 self._ws_pause_logged = True
             self._poll_gate.clear()
             self._last_http_pause_time = time.time()
-            self._last_http_pause_block = self._last_block
-            self._last_http_resume_block = self._last_block
+            self._last_http_pause_block = self._last_event_block
+            self._last_http_resume_block = self._last_event_block
 
     def _resume_http_polling(self) -> None:
         if not self._poll_gate.is_set():
@@ -1150,7 +1155,7 @@ class ProScout:
             self._ws_pause_logged = False
             self._poll_gate.set()
             self._last_http_resume_time = time.time()
-            self._last_http_resume_block = self._last_block
+            self._last_http_resume_block = self._last_event_block
         else:
             self._ws_pause_logged = False
 
