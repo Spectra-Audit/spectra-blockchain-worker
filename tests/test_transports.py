@@ -195,14 +195,22 @@ class FakeAsyncEth:
         return True
 
 
-class FakeAsyncWebsocketProvider:
-    instances: List["FakeAsyncWebsocketProvider"] = []
+class FakeWebsocketProviderV2:
+    instances: List["FakeWebsocketProviderV2"] = []
 
     def __init__(self, endpoint_uri, websocket_kwargs=None):  # noqa: ANN001 - mimic Web3 signature
         self.endpoint_uri = endpoint_uri
         self.websocket_kwargs = websocket_kwargs
         self.disconnect_calls = 0
+        self.socket_connect_calls = 0
+        self.socket_disconnect_calls = 0
         type(self).instances.append(self)
+
+    def socket_connect(self):
+        self.socket_connect_calls += 1
+
+    def socket_disconnect(self):
+        self.socket_disconnect_calls += 1
 
     async def disconnect(self):
         self.disconnect_calls += 1
@@ -211,7 +219,7 @@ class FakeAsyncWebsocketProvider:
 def test_async_iter_websocket_messages_uses_async_web3(monkeypatch):
     messages = ["payload-1", "payload-2"]
     stop_event = threading.Event()
-    FakeAsyncWebsocketProvider.instances.clear()
+    FakeWebsocketProviderV2.instances.clear()
 
     class FakeAsyncWeb3:
         instances: List["FakeAsyncWeb3"] = []
@@ -219,10 +227,34 @@ def test_async_iter_websocket_messages_uses_async_web3(monkeypatch):
         def __init__(self, provider):
             self.provider = provider
             self.eth = FakeAsyncEth(messages)
+            self.ws = FakeAsyncWS(messages)
             type(self).instances.append(self)
 
+        @classmethod
+        def persistent_websocket(cls, provider):
+            class _Manager:
+                async def __aenter__(self_inner):
+                    provider.socket_connect()
+                    self_inner.instance = cls(provider)
+                    return self_inner.instance
+
+                async def __aexit__(self_inner, exc_type, exc, tb):
+                    provider.socket_disconnect()
+
+            return _Manager()
+
+    class FakeAsyncWS:
+        def __init__(self, items):
+            self._items = list(items)
+            self.process_calls: List[Any] = []
+
+        async def process_subscriptions(self, subscription):
+            self.process_calls.append(subscription)
+            for item in self._items:
+                yield item
+
     monkeypatch.setattr(websocket_helpers, "_AsyncWeb3", FakeAsyncWeb3)
-    monkeypatch.setattr(websocket_helpers, "_AsyncWebsocketProvider", FakeAsyncWebsocketProvider)
+    monkeypatch.setattr(websocket_helpers, "_WebsocketProviderFactory", FakeWebsocketProviderV2)
 
     connected = 0
     disconnected = 0
@@ -255,16 +287,19 @@ def test_async_iter_websocket_messages_uses_async_web3(monkeypatch):
     assert connected == 1
     assert disconnected == 1
 
-    assert FakeAsyncWebsocketProvider.instances
-    provider_instance = FakeAsyncWebsocketProvider.instances[-1]
+    assert FakeWebsocketProviderV2.instances
+    provider_instance = FakeWebsocketProviderV2.instances[-1]
     assert provider_instance.endpoint_uri == "wss://example"
     assert provider_instance.websocket_kwargs == {"ping": 1}
+    assert provider_instance.socket_connect_calls == 1
+    assert provider_instance.socket_disconnect_calls == 1
     assert provider_instance.disconnect_calls == 1
 
     web3_instance = FakeAsyncWeb3.instances[-1]
     assert web3_instance.eth.subscribe_calls == [("logs", {"topics": ["topic"]})]
     assert web3_instance.eth.subscription is not None
     assert web3_instance.eth.subscription.unsubscribe_calls == 1
+    assert web3_instance.ws.process_calls == [web3_instance.eth.subscription]
 
 
 def test_iter_websocket_messages_bridges_async_iterator(monkeypatch):
@@ -349,6 +384,8 @@ def install_web3_stub(monkeypatch):
     providers_module = types.ModuleType("web3.providers")
     websocket_module = types.ModuleType("web3.providers.websocket")
     websocket_module.WebsocketProvider = FakeWebsocketProvider
+    websocket_module.WebsocketProviderV2 = FakeWebsocketProvider
+    websocket_module.WebSocketProvider = FakeWebsocketProvider
     providers_module.websocket = websocket_module
 
     persistent_module = types.ModuleType("web3.providers.persistent")
@@ -360,6 +397,66 @@ def install_web3_stub(monkeypatch):
     contract_module.Contract = type("Contract", (), {})
     contract_module.ContractEvent = type("ContractEvent", (), {})
 
+    class StubAsyncSubscription:
+        def __init__(self, provider):
+            self.provider = provider
+            self.unsubscribe_calls = 0
+            self.subscription_id = "stub"
+
+        async def unsubscribe(self):
+            self.unsubscribe_calls += 1
+
+    class StubAsyncEth:
+        def __init__(self, provider):
+            self.provider = provider
+            self.subscribe_calls: List[Any] = []
+
+        async def subscribe(self, method, params):
+            self.subscribe_calls.append((method, params))
+            return StubAsyncSubscription(self.provider)
+
+    class StubAsyncWS:
+        def __init__(self, provider):
+            self.provider = provider
+            self.process_calls: List[Any] = []
+
+        async def process_subscriptions(self, subscription):
+            self.process_calls.append(subscription)
+            queue_source = getattr(self.provider, "ws_messages", None)
+            if queue_source is None:
+                request_processor = getattr(self.provider, "_request_processor", None)
+                queue_source = getattr(request_processor, "ws_messages", None)
+            if queue_source is None:
+                return
+            while True:
+                try:
+                    yield queue_source.get_nowait()
+                except queue.Empty:
+                    break
+
+    class StubAsyncWeb3:
+        def __init__(self, provider):
+            self.provider = provider
+            self.eth = StubAsyncEth(provider)
+            self.ws = StubAsyncWS(provider)
+
+        @classmethod
+        def persistent_websocket(cls, provider):
+            class _Manager:
+                async def __aenter__(self_inner):
+                    connect = getattr(provider, "socket_connect", None)
+                    if callable(connect):
+                        connect()
+                    self_inner.instance = cls(provider)
+                    return self_inner.instance
+
+                async def __aexit__(self_inner, exc_type, exc, tb):
+                    disconnect = getattr(provider, "socket_disconnect", None)
+                    if callable(disconnect):
+                        disconnect()
+
+            return _Manager()
+
     monkeypatch.setitem(sys.modules, "web3", web3_module)
     monkeypatch.setitem(sys.modules, "web3._utils", utils_module)
     monkeypatch.setitem(sys.modules, "web3._utils.events", events_module)
@@ -369,6 +466,19 @@ def install_web3_stub(monkeypatch):
     monkeypatch.setitem(sys.modules, "web3.providers.websocket", websocket_module)
     monkeypatch.setitem(sys.modules, "web3.providers.persistent", persistent_module)
     monkeypatch.setitem(sys.modules, "web3.contract", contract_module)
+
+    monkeypatch.setattr(
+        websocket_helpers,
+        "_WebsocketProviderFactory",
+        PersistentFakeWebsocketProvider,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        websocket_helpers,
+        "_AsyncWeb3",
+        StubAsyncWeb3,
+        raising=False,
+    )
 
     return modules
 
@@ -1313,7 +1423,8 @@ def test_pro_scout_ws_provider_fallback(monkeypatch, caplog, tmp_path, scout_mod
     service.stop()
 
 
-def test_iter_websocket_messages_handles_nested_request_processor_queue():
+def test_iter_websocket_messages_handles_nested_request_processor_queue(monkeypatch):
+    install_web3_stub(monkeypatch)
     from scout.websocket_helpers import iter_websocket_messages
 
     payloads = [{"result": 1}, {"result": 2}]
@@ -1327,8 +1438,24 @@ def test_iter_websocket_messages_handles_nested_request_processor_queue():
     class NestedQueuePersistentProvider:
         def __init__(self, messages):
             self._request_processor = FakeRequestProcessor(messages)
+            self.url = "ws://nested"
+            self.websocket_kwargs = {"queue_source": self._request_processor.ws_messages}
 
     NestedQueuePersistentProvider.__module__ = "web3.providers.persistent.fake"
+
+    class QueueAwarePersistentProvider(PersistentFakeWebsocketProvider):
+        def __init__(self, url: str, websocket_kwargs=None, **kwargs):  # noqa: ANN001
+            super().__init__(url, **kwargs)
+            queue_source = (websocket_kwargs or {}).get("queue_source")
+            if queue_source is not None:
+                self.ws_messages = queue_source
+
+    monkeypatch.setattr(
+        websocket_helpers,
+        "_WebsocketProviderFactory",
+        QueueAwarePersistentProvider,
+        raising=False,
+    )
 
     provider = NestedQueuePersistentProvider(payloads)
     collected = []

@@ -11,10 +11,19 @@ from typing import Any, AsyncIterator, Callable, Iterable, Optional
 
 try:  # pragma: no cover - optional dependency
     from web3 import AsyncWeb3 as _AsyncWeb3
-    from web3.providers.async_rpc import AsyncWebsocketProvider as _AsyncWebsocketProvider
 except Exception:  # pragma: no cover - gracefully handle missing web3
     _AsyncWeb3 = None  # type: ignore[assignment]
-    _AsyncWebsocketProvider = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency
+    from web3.providers.websocket import WebsocketProviderV2 as _WebsocketProviderFactory
+except Exception:  # pragma: no cover - gracefully handle missing implementations
+    try:
+        from web3.providers.websocket import WebSocketProvider as _WebsocketProviderFactory
+    except Exception:
+        try:
+            from web3.providers.async_rpc import AsyncWebsocketProvider as _WebsocketProviderFactory
+        except Exception:
+            _WebsocketProviderFactory = None  # type: ignore[assignment]
 
 
 MessageCallback = Optional[Callable[[], None]]
@@ -87,7 +96,7 @@ async def async_iter_websocket_messages(
     if stop_event.is_set():
         return
 
-    if _AsyncWeb3 is None or _AsyncWebsocketProvider is None:
+    if _AsyncWeb3 is None or _WebsocketProviderFactory is None:
         raise RuntimeError("web3 async websocket provider is not available")
 
     endpoint_uri = getattr(provider, "endpoint_uri", None) or getattr(
@@ -97,17 +106,21 @@ async def async_iter_websocket_messages(
         raise RuntimeError("Websocket provider is missing an endpoint URI")
 
     websocket_kwargs = getattr(provider, "websocket_kwargs", None)
-    async_provider = _AsyncWebsocketProvider(endpoint_uri, websocket_kwargs=websocket_kwargs)
-    web3 = _AsyncWeb3(async_provider)
+    provider_kwargs: dict[str, Any] = {}
+    if websocket_kwargs is not None:
+        provider_kwargs["websocket_kwargs"] = websocket_kwargs
+
+    async_provider = _WebsocketProviderFactory(endpoint_uri, **provider_kwargs)
 
     try:
-        async with _managed_subscription(web3, subscription_params) as subscription:
-            if on_connect is not None:
-                on_connect()
-            async for payload in subscription:
-                if stop_event.is_set():
-                    break
-                yield payload
+        async with _AsyncWeb3.persistent_websocket(async_provider) as web3:
+            async with _managed_subscription(web3, subscription_params) as subscription:
+                if on_connect is not None:
+                    on_connect()
+                async for payload in web3.ws.process_subscriptions(subscription):
+                    if stop_event.is_set():
+                        break
+                    yield payload
     finally:
         if on_disconnect is not None:
             on_disconnect()
