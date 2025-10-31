@@ -893,16 +893,15 @@ class ProScout:
                 "address": self.contract_address,
                 "topics": [self.event_topics],
             }
-            subscription_id: Optional[str] = None
             try:
-                response = provider.make_request("eth_subscribe", ["logs", filter_params])
-                response = self._resolve_provider_response(response)
-                subscription_id = response.get("result") if isinstance(response, dict) else None
-                if not subscription_id:
-                    raise RuntimeError("Failed to subscribe to websocket logs")
-                self._notify_ws_connected()
                 try:
-                    for message in iter_websocket_messages(provider, self._stop_event):
+                    for message in iter_websocket_messages(
+                        provider,
+                        self._stop_event,
+                        subscription_params=filter_params,
+                        on_connect=self._notify_ws_connected,
+                        on_disconnect=self._notify_ws_disconnected,
+                    ):
                         if self._stop_event.is_set():
                             break
                         if isinstance(message, (bytes, bytearray)):
@@ -937,10 +936,6 @@ class ProScout:
                             continue
                         self._handle_ws_payload(payload)
                 finally:
-                    self._notify_ws_disconnected()
-                    with contextlib.suppress(Exception):
-                        response = provider.make_request("eth_unsubscribe", [subscription_id])
-                        self._resolve_provider_response(response)
                     with contextlib.suppress(Exception):
                         session.perform_cleanup()
             except Exception:
