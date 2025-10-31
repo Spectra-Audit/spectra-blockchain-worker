@@ -362,7 +362,12 @@ class ProScout:
             "topics": [self.event_topics],
         }
 
-        self.logger.debug("Fetching logs", extra={"from_block": from_block, "to_block": to_block})
+        self.logger.debug(
+            "Fetching logs from %s to %s",
+            from_block,
+            to_block,
+            extra={"from_block": from_block, "to_block": to_block},
+        )
         try:
             logs: List[LogReceipt] = web3.eth.get_logs(filter_params)
         except Exception as exc:  # noqa: BLE001
@@ -374,6 +379,16 @@ class ProScout:
             time.sleep(self.poll_interval)
             return
         self._mark_provider_success()
+        self.logger.info(
+            "Processed logs from %s to %s",
+            from_block,
+            to_block,
+            extra={
+                "from_block": from_block,
+                "to_block": to_block,
+                "log_count": len(logs),
+            },
+        )
         for log in logs:
             self._process_log_entry(log)
 
