@@ -665,6 +665,12 @@ def test_featured_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modul
 
     assert scout._poll_gate.is_set()
     scout._notify_ws_connected()
+    # Initial websocket connection should not immediately pause HTTP polling due to grace period.
+    assert scout._poll_gate.is_set()
+
+    scout._last_http_resume_time -= scout._http_resume_grace_period + 1
+    scout._ws_healthy_since_time = time.time() - (scout._ws_healthy_time_requirement + 1)
+    scout._evaluate_polling_state()
     assert not scout._poll_gate.is_set()
 
     with scout._ws_state_lock:
@@ -673,6 +679,12 @@ def test_featured_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modul
     assert scout._poll_gate.is_set()
 
     scout._notify_ws_connected()
+    # Grace period after resuming keeps HTTP polling active.
+    assert scout._poll_gate.is_set()
+
+    scout._last_http_resume_time -= scout._http_resume_grace_period + 1
+    scout._ws_healthy_since_time = time.time() - (scout._ws_healthy_time_requirement + 1)
+    scout._evaluate_polling_state()
     assert not scout._poll_gate.is_set()
 
     scout._notify_ws_disconnected()
@@ -708,11 +720,17 @@ def test_featured_scout_http_catch_up_synchronizes_ws_progress(
     caplog.set_level("INFO")
     assert scout._poll_once() is True
     scout._notify_ws_connected()
+    assert scout._poll_gate.is_set()
+    scout._last_http_resume_time -= scout._http_resume_grace_period + 1
+    scout._ws_healthy_since_time = time.time() - (scout._ws_healthy_time_requirement + 1)
+    scout._evaluate_polling_state()
     assert not scout._poll_gate.is_set()
 
     scout._web3.eth.block_number = scout._last_block + 1
     scout._web3.eth.logs = []
     scout._resume_http_polling()
+    scout._last_http_resume_time -= scout._http_resume_grace_period + 1
+    scout._ws_healthy_since_time = time.time() - (scout._ws_healthy_time_requirement + 1)
     caplog.clear()
 
     assert scout._poll_once() is True
@@ -841,6 +859,14 @@ def test_pro_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modules):
 
     assert service._poll_gate.is_set()
     service._notify_ws_connected()
+    # Initial websocket connection should keep HTTP polling running until grace elapses.
+    assert service._poll_gate.is_set()
+
+    service._last_http_resume_time -= service._http_resume_grace_period + 1
+    service._ws_healthy_since_time = time.time() - (
+        service._ws_healthy_time_requirement + 1
+    )
+    service._evaluate_polling_state()
     assert not service._poll_gate.is_set()
 
     with service._ws_state_lock:
@@ -849,6 +875,14 @@ def test_pro_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modules):
     assert service._poll_gate.is_set()
 
     service._notify_ws_connected()
+    # Grace period after resuming keeps HTTP polling active.
+    assert service._poll_gate.is_set()
+
+    service._last_http_resume_time -= service._http_resume_grace_period + 1
+    service._ws_healthy_since_time = time.time() - (
+        service._ws_healthy_time_requirement + 1
+    )
+    service._evaluate_polling_state()
     assert not service._poll_gate.is_set()
 
     service._notify_ws_disconnected()

@@ -211,6 +211,16 @@ class ProScout:
         self._ws_last_message = 0.0
         self._ws_pause_logged = False
         self._ws_stale_threshold = max(self.poll_interval * 3, self.poll_interval + 2)
+        now = time.time()
+        self._last_http_pause_time = 0.0
+        self._last_http_pause_block = -1
+        self._last_http_resume_time = now
+        self._last_http_resume_block = -1
+        self._http_resume_grace_period = max(self.poll_interval, 1)
+        self._ws_healthy_time_requirement = max(self.poll_interval, 1)
+        self._ws_healthy_block_requirement = 1
+        self._ws_healthy_since_time = 0.0
+        self._ws_healthy_since_block = -1
 
         persisted_index = self._load_active_rpc_index()
         if persisted_index:
@@ -974,6 +984,8 @@ class ProScout:
             self._ws_ready.set()
             self._ws_last_block = max(self._last_block, 0)
             self._ws_last_message = time.time()
+            self._ws_healthy_since_time = 0.0
+            self._ws_healthy_since_block = self._ws_last_block
         self._evaluate_polling_state()
 
     def _notify_ws_disconnected(self) -> None:
@@ -981,6 +993,8 @@ class ProScout:
             self._ws_ready.clear()
             self._ws_last_block = max(self._last_block, 0)
             self._ws_last_message = 0.0
+            self._ws_healthy_since_time = 0.0
+            self._ws_healthy_since_block = self._ws_last_block
         self._resume_http_polling()
 
     def _update_ws_progress(self, block_number: int) -> None:
@@ -994,6 +1008,18 @@ class ProScout:
             self._save_last_block(self._last_block)
         self._evaluate_polling_state()
 
+    def _mark_ws_unhealthy(self, block_number: int) -> None:
+        with self._ws_state_lock:
+            self._ws_healthy_since_time = 0.0
+            self._ws_healthy_since_block = max(block_number, -1)
+
+    def _ensure_ws_health_marker(self, block_number: int, timestamp: float) -> Tuple[float, int]:
+        with self._ws_state_lock:
+            if self._ws_healthy_since_time == 0.0:
+                self._ws_healthy_since_time = timestamp
+                self._ws_healthy_since_block = max(block_number, -1)
+            return self._ws_healthy_since_time, self._ws_healthy_since_block
+
     def _evaluate_polling_state(self) -> None:
         if self._stop_event.is_set():
             self._resume_http_polling()
@@ -1002,20 +1028,33 @@ class ProScout:
             ws_ready = self._ws_ready.is_set()
             ws_last_block = self._ws_last_block
             ws_last_message = self._ws_last_message
+        now = time.time()
         if not ws_ready:
+            self._mark_ws_unhealthy(ws_last_block)
             self._resume_http_polling()
             return
         if self._last_safe_block <= 0:
+            self._mark_ws_unhealthy(ws_last_block)
             self._resume_http_polling()
             return
-        now = time.time()
         if ws_last_message == 0.0 or (now - ws_last_message) > self._ws_stale_threshold:
+            self._mark_ws_unhealthy(ws_last_block)
             self._resume_http_polling()
             return
         if ws_last_block < self._last_block:
+            self._mark_ws_unhealthy(ws_last_block)
             self._resume_http_polling()
             return
-        if self._last_block >= self._last_safe_block:
+        healthy_since_time, healthy_since_block = self._ensure_ws_health_marker(
+            ws_last_block, now
+        )
+        healthy_time_elapsed = (now - healthy_since_time) >= self._ws_healthy_time_requirement
+        healthy_block_span = ws_last_block - healthy_since_block
+        healthy_enough = healthy_time_elapsed or (
+            healthy_block_span >= self._ws_healthy_block_requirement
+        )
+        http_grace_elapsed = (now - self._last_http_resume_time) >= self._http_resume_grace_period
+        if self._last_block >= self._last_safe_block and healthy_enough and http_grace_elapsed:
             self._pause_http_polling()
         else:
             self._resume_http_polling()
@@ -1026,6 +1065,8 @@ class ProScout:
                 self.logger.info("HTTP poller caught up; relying on websocket stream")
                 self._ws_pause_logged = True
             self._poll_gate.clear()
+            self._last_http_pause_time = time.time()
+            self._last_http_pause_block = self._last_block
 
     def _resume_http_polling(self) -> None:
         if not self._poll_gate.is_set():
@@ -1033,6 +1074,10 @@ class ProScout:
                 self.logger.info("Resuming HTTP polling after websocket stall")
             self._ws_pause_logged = False
             self._poll_gate.set()
+            self._last_http_resume_time = time.time()
+            self._last_http_resume_block = self._last_block
+        else:
+            self._ws_pause_logged = False
 
     def _convert_ws_result(self, result: Dict[str, Any]) -> Optional[LogReceipt]:
         try:
