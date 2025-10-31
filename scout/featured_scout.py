@@ -180,6 +180,7 @@ class FeaturedScout:
         self._ws_state_lock = threading.Lock()
         self._ws_last_block = 0
         self._ws_last_message = 0.0
+        self._ws_start_block: Optional[int] = None
         self._ws_pause_logged = False
         self._ws_stale_threshold = max(
             self._config.poll_interval_sec * 3, self._config.poll_interval_sec + 2
@@ -383,6 +384,9 @@ class FeaturedScout:
         self._mark_provider_success()
         safe_block = max(latest_block - (self._config.reorg_confirmations - 1), 0)
         self._last_safe_block = safe_block
+        with self._ws_state_lock:
+            ws_ready = self._ws_ready.is_set()
+            ws_start_block = self._ws_start_block
         with self._lock:
             last_block = self._load_last_block()
             if last_block is None:
@@ -392,12 +396,18 @@ class FeaturedScout:
                     last_block = max((self._config.start_block or 0) - 1, 0)
                 self._save_last_block(last_block)
             self._last_block = last_block
-        if safe_block <= last_block:
-            LOGGER.debug("No new finalized blocks", extra={"safe_block": safe_block, "last_block": last_block})
+        poll_end_block = safe_block
+        if ws_ready and ws_start_block is not None:
+            poll_end_block = min(poll_end_block, ws_start_block)
+        if poll_end_block <= last_block:
+            LOGGER.debug(
+                "No new finalized blocks",
+                extra={"safe_block": safe_block, "last_block": last_block},
+            )
             self._evaluate_polling_state()
             return True
         window_start = last_block + 1
-        window_end = safe_block
+        window_end = poll_end_block
         batch_size = self._config.block_batch_size
         total_logs = 0
         current_from = window_start
@@ -708,6 +718,7 @@ class FeaturedScout:
             return
         self._process_log_entry(log_entry)
         block_number = self._coerce_int(result.get("blockNumber", 0))
+        self._update_ws_start_block(block_number)
         self._update_ws_progress(block_number)
 
     def _convert_ws_result(self, result: Dict[str, Any]) -> Optional[LogReceipt]:
@@ -735,6 +746,7 @@ class FeaturedScout:
             self._ws_last_message = time.time()
             self._ws_healthy_since_time = 0.0
             self._ws_healthy_since_block = self._ws_last_block
+            self._ws_start_block = None
         self._evaluate_polling_state()
 
     def _notify_ws_disconnected(self) -> None:
@@ -744,7 +756,14 @@ class FeaturedScout:
             self._ws_last_message = 0.0
             self._ws_healthy_since_time = 0.0
             self._ws_healthy_since_block = self._ws_last_block
+            self._ws_start_block = None
         self._resume_http_polling()
+
+    def _update_ws_start_block(self, block_number: int) -> None:
+        normalized = max(block_number, 0)
+        with self._ws_state_lock:
+            if self._ws_start_block is None or normalized < self._ws_start_block:
+                self._ws_start_block = normalized
 
     def _update_ws_progress(self, block_number: int) -> None:
         with self._ws_state_lock:
@@ -781,6 +800,7 @@ class FeaturedScout:
                 self._ws_last_block = self._last_block
             ws_last_block = self._ws_last_block
             ws_last_message = self._ws_last_message
+            ws_start_block = self._ws_start_block
         now = time.time()
         if not ws_ready:
             self._mark_ws_unhealthy(ws_last_block)
@@ -807,7 +827,10 @@ class FeaturedScout:
             healthy_block_span >= self._ws_healthy_block_requirement
         )
         http_grace_elapsed = (now - self._last_http_resume_time) >= self._http_resume_grace_period
-        if self._last_block >= self._last_safe_block and healthy_enough and http_grace_elapsed:
+        pause_threshold = self._last_safe_block
+        if ws_start_block is not None:
+            pause_threshold = min(pause_threshold, ws_start_block)
+        if self._last_block >= pause_threshold and healthy_enough and http_grace_elapsed:
             self._pause_http_polling()
         else:
             self._resume_http_polling()

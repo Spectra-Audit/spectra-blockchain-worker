@@ -209,6 +209,7 @@ class ProScout:
         self._ws_state_lock = threading.Lock()
         self._ws_last_block = -1
         self._ws_last_message = 0.0
+        self._ws_start_block: Optional[int] = None
         self._ws_pause_logged = False
         self._ws_stale_threshold = max(self.poll_interval * 3, self.poll_interval + 2)
         now = time.time()
@@ -341,13 +342,19 @@ class ProScout:
         self._mark_provider_success()
         safe_block = latest_block - self.reorg_conf
         self._last_safe_block = max(safe_block, 0)
+        with self._ws_state_lock:
+            ws_ready = self._ws_ready.is_set()
+            ws_start_block = self._ws_start_block
         from_block = self._last_block + 1
-        if safe_block < from_block:
+        poll_end_block = self._last_safe_block
+        if ws_ready and ws_start_block is not None:
+            poll_end_block = min(poll_end_block, ws_start_block)
+        if poll_end_block < from_block:
             self._evaluate_polling_state()
             time.sleep(self.poll_interval)
             return
 
-        to_block = min(safe_block, from_block + self.block_batch_size - 1)
+        to_block = min(poll_end_block, from_block + self.block_batch_size - 1)
         filter_params: FilterParams = {
             "fromBlock": from_block,
             "toBlock": to_block,
@@ -977,6 +984,7 @@ class ProScout:
             return
         self._process_log_entry(log_entry)
         block_number = self._coerce_int(result.get("blockNumber", 0))
+        self._update_ws_start_block(block_number)
         self._update_ws_progress(block_number)
 
     def _notify_ws_connected(self) -> None:
@@ -986,6 +994,7 @@ class ProScout:
             self._ws_last_message = time.time()
             self._ws_healthy_since_time = 0.0
             self._ws_healthy_since_block = self._ws_last_block
+            self._ws_start_block = None
         self._evaluate_polling_state()
 
     def _notify_ws_disconnected(self) -> None:
@@ -995,7 +1004,14 @@ class ProScout:
             self._ws_last_message = 0.0
             self._ws_healthy_since_time = 0.0
             self._ws_healthy_since_block = self._ws_last_block
+            self._ws_start_block = None
         self._resume_http_polling()
+
+    def _update_ws_start_block(self, block_number: int) -> None:
+        normalized = max(block_number, 0)
+        with self._ws_state_lock:
+            if self._ws_start_block is None or normalized < self._ws_start_block:
+                self._ws_start_block = normalized
 
     def _update_ws_progress(self, block_number: int) -> None:
         with self._ws_state_lock:
@@ -1028,6 +1044,7 @@ class ProScout:
             ws_ready = self._ws_ready.is_set()
             ws_last_block = self._ws_last_block
             ws_last_message = self._ws_last_message
+            ws_start_block = self._ws_start_block
         now = time.time()
         if not ws_ready:
             self._mark_ws_unhealthy(ws_last_block)
@@ -1054,7 +1071,10 @@ class ProScout:
             healthy_block_span >= self._ws_healthy_block_requirement
         )
         http_grace_elapsed = (now - self._last_http_resume_time) >= self._http_resume_grace_period
-        if self._last_block >= self._last_safe_block and healthy_enough and http_grace_elapsed:
+        pause_threshold = self._last_safe_block
+        if ws_start_block is not None:
+            pause_threshold = min(pause_threshold, ws_start_block)
+        if self._last_block >= pause_threshold and healthy_enough and http_grace_elapsed:
             self._pause_http_polling()
         else:
             self._resume_http_polling()

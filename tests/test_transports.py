@@ -706,6 +706,78 @@ def test_featured_scout_processes_http_and_websocket_logs(tmp_path, scout_module
     assert count_after == 2
 
 
+def test_featured_scout_limits_http_window_when_ws_ready(tmp_path, scout_modules):
+    featured, _ = scout_modules
+    config = featured.ScoutConfig(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=("ws://rpc",),
+        contract_address="0xabc",
+        chain_id=None,
+        api_root="http://api",
+        admin_token="token",
+        admin_refresh_token="refresh",
+        admin_wallet_address="0x0000000000000000000000000000000000000001",
+        admin_wallet_private_key="0x01",
+        project_id_resolver_url=None,
+        db_path=str(tmp_path / "featured_window.db"),
+        poll_interval_sec=1,
+        reorg_confirmations=2,
+        start_block=None,
+        start_block_latest=True,
+    )
+    scout = featured.FeaturedScout(config, once=True)
+    scout._process_log_entry = lambda *args, **kwargs: True  # type: ignore[assignment]
+
+    captured: List[Dict[str, Any]] = []
+    original_get_logs = scout._web3.eth.get_logs
+
+    def _capturing_get_logs(params):  # noqa: ANN001 - test helper
+        captured.append(dict(params))
+        return original_get_logs(params)
+
+    scout._web3.eth.get_logs = _capturing_get_logs  # type: ignore[assignment]
+
+    scout._web3.eth.block_number = 10
+    scout._web3.eth.logs = []
+    scout._poll_once()
+
+    topic_key = next(iter(scout._event_topic_map))
+    ws_payload = {
+        "params": {
+            "result": {
+                "transactionHash": "0x" + "05" * 32,
+                "logIndex": "0x0",
+                "blockNumber": hex(12),
+                "transactionIndex": "0x0",
+                "address": "0xabc",
+                "data": "0x",
+                "topics": [topic_key],
+            }
+        }
+    }
+
+    scout._notify_ws_connected()
+    scout._handle_ws_payload(ws_payload)
+
+    scout._resume_http_polling()
+    scout._last_http_resume_time = time.time() - (scout._http_resume_grace_period + 1)
+    scout._ws_healthy_since_time = time.time() - (scout._ws_healthy_time_requirement + 1)
+    scout._ws_healthy_since_block = scout._ws_last_block
+    scout._web3.eth.block_number = 30
+    scout._web3.eth.logs = []
+    captured.clear()
+
+    scout._poll_once()
+
+    assert captured, "Expected HTTP poll to run"
+    to_block = captured[-1]["toBlock"]
+    assert scout._ws_start_block is not None
+    assert to_block == scout._to_hex_block(scout._ws_start_block)
+    assert scout._ws_start_block == 12
+    assert scout._last_block == 12
+    assert not scout._poll_gate.is_set()
+
+
 def test_featured_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modules):
     featured, _ = scout_modules
 
@@ -965,6 +1037,89 @@ def test_pro_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modules):
 
     service._notify_ws_disconnected()
     assert service._poll_gate.is_set()
+
+
+def test_pro_scout_limits_http_window_when_ws_ready(tmp_path, scout_modules):
+    _, pro = scout_modules
+
+    class DummyBackendClient:
+        base_url = "http://api"
+
+        def patch(self, *args, **kwargs):
+            return types.SimpleNamespace(status_code=200, text="")
+
+    service = pro.ProScout(
+        rpc_http_urls=("http://rpc",),
+        rpc_ws_urls=["ws://rpc"],
+        api_base_url="http://api",
+        admin_access_token="token",
+        admin_refresh_token="refresh",
+        contract_address="0xabc",
+        db_path=str(tmp_path / "pro_window.db"),
+        backend_client=DummyBackendClient(),
+        poll_interval=1,
+        reorg_conf=2,
+        start_block=0,
+    )
+
+    handler = lambda *args, **kwargs: True  # noqa: E731 - simple stub
+    service._handle_stake_started = handler  # type: ignore[assignment]
+    service._handle_tier_upgraded = handler  # type: ignore[assignment]
+    service._handle_unstake_requested = handler  # type: ignore[assignment]
+    service.event_handlers = {
+        "StakeStarted": service._handle_stake_started,
+        "TierUpgraded": service._handle_tier_upgraded,
+        "UnstakeRequested": service._handle_unstake_requested,
+    }
+
+    captured: List[Dict[str, Any]] = []
+    original_get_logs = service.web3.eth.get_logs
+
+    def _capturing_get_logs(params):  # noqa: ANN001 - test helper
+        captured.append(dict(params))
+        return original_get_logs(params)
+
+    service.web3.eth.get_logs = _capturing_get_logs  # type: ignore[assignment]
+
+    service.web3.eth.block_number = 8
+    service.web3.eth.logs = []
+    service._poll_once()
+
+    topic_key = next(iter(service._topic_to_event))
+    ws_payload = {
+        "params": {
+            "result": {
+                "transactionHash": "0x" + "06" * 32,
+                "logIndex": "0x0",
+                "blockNumber": hex(10),
+                "transactionIndex": "0x0",
+                "address": "0xabc",
+                "data": "0x",
+                "topics": [topic_key],
+            }
+        }
+    }
+
+    service._notify_ws_connected()
+    service._handle_ws_payload(ws_payload)
+
+    service._resume_http_polling()
+    service._last_http_resume_time = time.time() - (service._http_resume_grace_period + 1)
+    service._ws_healthy_since_time = time.time() - (service._ws_healthy_time_requirement + 1)
+    service._ws_healthy_since_block = service._ws_last_block
+    service.web3.eth.block_number = 30
+    service.web3.eth.logs = []
+    captured.clear()
+
+    service._poll_once()
+
+    assert captured, "Expected HTTP poll to run"
+    to_block = captured[-1]["toBlock"]
+    assert service._ws_start_block is not None
+    assert to_block == service._ws_start_block
+    assert service._ws_start_block == 10
+    assert service._last_block == 10
+    assert not service._poll_gate.is_set()
 
 
 def test_featured_scout_rotates_rpc_endpoints(tmp_path, scout_modules):
