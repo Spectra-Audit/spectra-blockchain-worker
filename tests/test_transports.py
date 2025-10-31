@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from scout.websocket_helpers import iter_websocket_messages
+from scout.websocket_helpers import _resolve_message_getter, iter_websocket_messages
 
 
 class FakeAttributeDict(dict):
@@ -172,6 +172,48 @@ class ModernListener:
 class ModernPersistentProvider:
     def __init__(self, messages):
         self._listener = ModernListener(messages)
+
+
+def test_resolve_message_getter_handles_deeply_nested_graph_without_recursing_forever():
+    class Node:
+        def __init__(self, child=None):
+            self.child = child
+
+    root = Node()
+    current = root
+    for _ in range(256):
+        next_node = Node()
+        current.child = next_node
+        current = next_node
+
+    getter = _resolve_message_getter(root)
+
+    assert getter is None
+
+
+def test_resolve_message_getter_discovers_queue_within_depth_limit():
+    class Node:
+        def __init__(self, child=None):
+            self.child = child
+
+    queue_node = Node()
+    queue_node.message_queue = queue.Queue()
+    queue_node.message_queue.put("payload")
+
+    root = Node()
+    current = root
+    # Build a chain that stays within the recursion limit.
+    for _ in range(10):
+        next_node = Node()
+        current.child = next_node
+        current = next_node
+
+    current.child = queue_node
+
+    getter = _resolve_message_getter(root)
+
+    assert getter is not None
+    assert getter(0.01) == "payload"
 
 
 def test_iter_websocket_messages_discovers_nested_listener_queue():

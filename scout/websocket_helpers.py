@@ -49,8 +49,17 @@ def _resolve_message_getter(provider: Any) -> Optional[MessageGetter]:
     def _wrap_get_message(get_message: Callable[..., Any]) -> MessageGetter:
         return lambda timeout: _call_with_optional_timeout(get_message, timeout)
 
-    def _search(obj: Any, allow_iterator: bool = False) -> Optional[MessageGetter]:
+    def _search(
+        obj: Any,
+        allow_iterator: bool = False,
+        *,
+        depth: int = 0,
+        max_depth: int = 64,
+    ) -> Optional[MessageGetter]:
         if obj is None:
+            return None
+
+        if depth >= max_depth:
             return None
 
         obj_id = id(obj)
@@ -71,19 +80,21 @@ def _resolve_message_getter(provider: Any) -> Optional[MessageGetter]:
 
         if isinstance(obj, dict):
             for value in obj.values():
-                getter = _search(value)
+                getter = _search(value, depth=depth + 1, max_depth=max_depth)
                 if getter is not None:
                     return getter
 
         if isinstance(obj, (list, tuple, set, frozenset)):
             for value in obj:
-                getter = _search(value)
+                getter = _search(value, depth=depth + 1, max_depth=max_depth)
                 if getter is not None:
                     return getter
 
         if allow_iterator:
             iterator = getattr(obj, "__iter__", None)
             if callable(iterator):
+                if depth + 1 >= max_depth:
+                    return None
                 iterator_obj = iterator()
                 return lambda timeout: next(iterator_obj)
 
@@ -115,7 +126,7 @@ def _resolve_message_getter(provider: Any) -> Optional[MessageGetter]:
             if inspect.ismethod(nested) or inspect.isfunction(nested):
                 continue
 
-            getter = _search(nested)
+            getter = _search(nested, depth=depth + 1, max_depth=max_depth)
             if getter is not None:
                 return getter
 
