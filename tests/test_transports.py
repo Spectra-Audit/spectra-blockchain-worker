@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import json
 import queue
@@ -5,11 +6,12 @@ import sys
 import time
 import threading
 import types
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 
-from scout.websocket_helpers import _resolve_message_getter, iter_websocket_messages
+import scout.websocket_helpers as websocket_helpers
+from scout.websocket_helpers import async_iter_websocket_messages, iter_websocket_messages
 
 
 class FakeAttributeDict(dict):
@@ -157,81 +159,161 @@ class PersistentFakeWebsocketProvider:
         return None
 
 
-class ModernListenerConnection:
+class FakeAsyncSubscription:
     def __init__(self, messages):
-        self._inbound_messages = queue.Queue()
-        for message in messages:
-            self._inbound_messages.put(message)
+        self._messages = iter(messages)
+        self.unsubscribe_calls = 0
+        self.subscription_id = "fake-sub"
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._messages)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+    async def unsubscribe(self):
+        self.unsubscribe_calls += 1
 
 
-class ModernListener:
+class FakeAsyncEth:
     def __init__(self, messages):
-        self.connection = ModernListenerConnection(messages)
+        self._messages = messages
+        self.subscribe_calls: List[Any] = []
+        self.unsubscribe_calls: List[Any] = []
+        self.subscription: Optional[FakeAsyncSubscription] = None
+
+    async def subscribe(self, method, params):
+        self.subscribe_calls.append((method, params))
+        self.subscription = FakeAsyncSubscription(self._messages)
+        return self.subscription
+
+    async def unsubscribe(self, subscription_id):  # noqa: ANN001 - mimic Web3 signature
+        self.unsubscribe_calls.append(subscription_id)
+        return True
 
 
-class ModernPersistentProvider:
-    def __init__(self, messages):
-        self._listener = ModernListener(messages)
+class FakeAsyncWebsocketProvider:
+    instances: List["FakeAsyncWebsocketProvider"] = []
+
+    def __init__(self, endpoint_uri, websocket_kwargs=None):  # noqa: ANN001 - mimic Web3 signature
+        self.endpoint_uri = endpoint_uri
+        self.websocket_kwargs = websocket_kwargs
+        self.disconnect_calls = 0
+        type(self).instances.append(self)
+
+    async def disconnect(self):
+        self.disconnect_calls += 1
 
 
-def test_resolve_message_getter_handles_deeply_nested_graph_without_recursing_forever():
-    class Node:
-        def __init__(self, child=None):
-            self.child = child
-
-    root = Node()
-    current = root
-    for _ in range(256):
-        next_node = Node()
-        current.child = next_node
-        current = next_node
-
-    getter = _resolve_message_getter(root)
-
-    assert getter is None
-
-
-def test_resolve_message_getter_discovers_queue_within_depth_limit():
-    class Node:
-        def __init__(self, child=None):
-            self.child = child
-
-    queue_node = Node()
-    queue_node.message_queue = queue.Queue()
-    queue_node.message_queue.put("payload")
-
-    root = Node()
-    current = root
-    # Build a chain that stays within the recursion limit.
-    for _ in range(10):
-        next_node = Node()
-        current.child = next_node
-        current = next_node
-
-    current.child = queue_node
-
-    getter = _resolve_message_getter(root)
-
-    assert getter is not None
-    assert getter(0.01) == "payload"
-
-
-def test_iter_websocket_messages_discovers_nested_listener_queue():
-    messages = [{"number": 1}, {"number": 2}]
-    provider = ModernPersistentProvider(messages)
+def test_async_iter_websocket_messages_uses_async_web3(monkeypatch):
+    messages = ["payload-1", "payload-2"]
     stop_event = threading.Event()
+    FakeAsyncWebsocketProvider.instances.clear()
 
-    iterator = iter_websocket_messages(provider, stop_event, poll_interval=0)
+    class FakeAsyncWeb3:
+        instances: List["FakeAsyncWeb3"] = []
 
-    received = []
-    for _ in messages:
-        received.append(next(iterator))
+        def __init__(self, provider):
+            self.provider = provider
+            self.eth = FakeAsyncEth(messages)
+            type(self).instances.append(self)
 
-    assert received == messages
+    monkeypatch.setattr(websocket_helpers, "_AsyncWeb3", FakeAsyncWeb3)
+    monkeypatch.setattr(websocket_helpers, "_AsyncWebsocketProvider", FakeAsyncWebsocketProvider)
 
-    stop_event.set()
-    with pytest.raises(StopIteration):
-        next(iterator)
+    connected = 0
+    disconnected = 0
+
+    def on_connect():
+        nonlocal connected
+        connected += 1
+
+    def on_disconnect():
+        nonlocal disconnected
+        disconnected += 1
+
+    async def collect():
+        received = []
+        async for payload in async_iter_websocket_messages(
+            types.SimpleNamespace(endpoint_uri="wss://example", websocket_kwargs={"ping": 1}),
+            stop_event,
+            subscription_params={"topics": ["topic"]},
+            on_connect=on_connect,
+            on_disconnect=on_disconnect,
+        ):
+            received.append(payload)
+            if len(received) == len(messages):
+                stop_event.set()
+        return received
+
+    results = asyncio.run(collect())
+
+    assert results == messages
+    assert connected == 1
+    assert disconnected == 1
+
+    assert FakeAsyncWebsocketProvider.instances
+    provider_instance = FakeAsyncWebsocketProvider.instances[-1]
+    assert provider_instance.endpoint_uri == "wss://example"
+    assert provider_instance.websocket_kwargs == {"ping": 1}
+    assert provider_instance.disconnect_calls == 1
+
+    web3_instance = FakeAsyncWeb3.instances[-1]
+    assert web3_instance.eth.subscribe_calls == [("logs", {"topics": ["topic"]})]
+    assert web3_instance.eth.subscription is not None
+    assert web3_instance.eth.subscription.unsubscribe_calls == 1
+
+
+def test_iter_websocket_messages_bridges_async_iterator(monkeypatch):
+    stop_event = threading.Event()
+    messages = ["message-1", "message-2"]
+    received_params = []
+
+    async def fake_async_iter(
+        provider,
+        stop_event_param,
+        *,
+        subscription_params=None,
+        on_connect=None,
+        on_disconnect=None,
+    ):
+        received_params.append(subscription_params)
+        if on_connect is not None:
+            on_connect()
+        for payload in messages:
+            yield payload
+        if on_disconnect is not None:
+            on_disconnect()
+
+    monkeypatch.setattr(websocket_helpers, "async_iter_websocket_messages", fake_async_iter)
+
+    connected = 0
+    disconnected = 0
+
+    def on_connect():
+        nonlocal connected
+        connected += 1
+
+    def on_disconnect():
+        nonlocal disconnected
+        disconnected += 1
+
+    iterator = iter_websocket_messages(
+        provider=object(),
+        stop_event=stop_event,
+        poll_interval=0.01,
+        subscription_params={"foo": "bar"},
+        on_connect=on_connect,
+        on_disconnect=on_disconnect,
+    )
+
+    assert list(iterator) == messages
+    assert received_params == [{"foo": "bar"}]
+    assert connected == 1
+    assert disconnected == 1
 
 
 def install_web3_stub(monkeypatch):

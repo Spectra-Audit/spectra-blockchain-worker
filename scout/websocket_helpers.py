@@ -1,186 +1,193 @@
-"""Utilities for consuming websocket providers across web3 releases."""
+"""Utilities for consuming websocket providers using the async Web3 client."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import inspect
 import queue
-from typing import Any, Callable, Iterable, Iterator, Optional
+import threading
+from typing import Any, AsyncIterator, Callable, Iterable, Optional
 
 try:  # pragma: no cover - optional dependency
-    from web3.providers import persistent as _persistent_module
+    from web3 import AsyncWeb3 as _AsyncWeb3
+    from web3.providers.async_rpc import AsyncWebsocketProvider as _AsyncWebsocketProvider
 except Exception:  # pragma: no cover - gracefully handle missing web3
-    _persistent_module = None  # type: ignore[assignment]
+    _AsyncWeb3 = None  # type: ignore[assignment]
+    _AsyncWebsocketProvider = None  # type: ignore[assignment]
 
 
-MessageGetter = Callable[[float], Any]
+MessageCallback = Optional[Callable[[], None]]
 
 
-def _call_with_optional_timeout(func: Callable[..., Any], timeout: float) -> Any:
-    """Invoke *func* using ``timeout`` when supported."""
+class _CompositeEvent:
+    """Combine multiple threading events into a single facade."""
+
+    def __init__(self, *events: threading.Event) -> None:
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
+
+
+async def _await_if_awaitable(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _unsubscribe_from_subscription(web3: Any, subscription: Any) -> None:
+    """Attempt to unsubscribe from *subscription* using the available API."""
+
+    unsubscribe = getattr(subscription, "unsubscribe", None)
+    if callable(unsubscribe):
+        await _await_if_awaitable(unsubscribe())
+        return
+
+    subscription_id = getattr(subscription, "subscription_id", None) or getattr(
+        subscription, "filter_id", None
+    )
+    if subscription_id is not None:
+        unsubscribe_fn = getattr(web3.eth, "unsubscribe", None)
+        if callable(unsubscribe_fn):
+            await _await_if_awaitable(unsubscribe_fn(subscription_id))
+
+
+@contextlib.asynccontextmanager
+async def _managed_subscription(web3: Any, filter_params: Optional[dict[str, Any]]) -> AsyncIterator[Any]:
+    """Create and tear down a websocket log subscription."""
+
+    if filter_params is None:
+        filter_params = {}
+
+    subscription_resource = web3.eth.subscribe("logs", filter_params)
+    subscription = await _await_if_awaitable(subscription_resource)
+
+    if hasattr(subscription, "__aenter__") and hasattr(subscription, "__aexit__"):
+        async with subscription as iterator:
+            yield iterator
+            return
 
     try:
-        return func(timeout=timeout)
-    except TypeError:
-        try:
-            return func(timeout)
-        except TypeError:
-            return func()
+        yield subscription
+    finally:
+        await _unsubscribe_from_subscription(web3, subscription)
 
 
-def _iter_from_ws_object(ws: Any, stop_event: Any) -> Iterator[Any]:
-    while not stop_event.is_set():
-        yield ws.recv()
+async def async_iter_websocket_messages(
+    provider: Any,
+    stop_event: Any,
+    *,
+    subscription_params: Optional[dict[str, Any]] = None,
+    on_connect: MessageCallback = None,
+    on_disconnect: MessageCallback = None,
+) -> AsyncIterator[Any]:
+    """Yield websocket payloads using :class:`web3.AsyncWeb3` subscriptions."""
+
+    if stop_event.is_set():
+        return
+
+    if _AsyncWeb3 is None or _AsyncWebsocketProvider is None:
+        raise RuntimeError("web3 async websocket provider is not available")
+
+    endpoint_uri = getattr(provider, "endpoint_uri", None) or getattr(
+        provider, "url", None
+    )
+    if not endpoint_uri:
+        raise RuntimeError("Websocket provider is missing an endpoint URI")
+
+    websocket_kwargs = getattr(provider, "websocket_kwargs", None)
+    async_provider = _AsyncWebsocketProvider(endpoint_uri, websocket_kwargs=websocket_kwargs)
+    web3 = _AsyncWeb3(async_provider)
+
+    try:
+        async with _managed_subscription(web3, subscription_params) as subscription:
+            if on_connect is not None:
+                on_connect()
+            async for payload in subscription:
+                if stop_event.is_set():
+                    break
+                yield payload
+    finally:
+        if on_disconnect is not None:
+            on_disconnect()
+        disconnect = getattr(async_provider, "disconnect", None)
+        if callable(disconnect):
+            await _await_if_awaitable(disconnect())
 
 
-def _resolve_message_getter(provider: Any) -> Optional[MessageGetter]:
-    visited: set[int] = set()
-
-    def _wrap_queue(message_queue: Any) -> Optional[MessageGetter]:
-        get = getattr(message_queue, "get", None)
-        if callable(get):
-            return lambda timeout: _call_with_optional_timeout(get, timeout)
-
-        get_nowait = getattr(message_queue, "get_nowait", None)
-        if callable(get_nowait):
-            return lambda timeout: get_nowait()
-
-        return None
-
-    def _wrap_get_message(get_message: Callable[..., Any]) -> MessageGetter:
-        return lambda timeout: _call_with_optional_timeout(get_message, timeout)
-
-    def _search(
-        obj: Any,
-        allow_iterator: bool = False,
-        *,
-        depth: int = 0,
-        max_depth: int = 64,
-    ) -> Optional[MessageGetter]:
-        if obj is None:
-            return None
-
-        if depth >= max_depth:
-            return None
-
-        obj_id = id(obj)
-        if obj_id in visited:
-            return None
-        visited.add(obj_id)
-
-        if isinstance(obj, (str, bytes, bytearray)):
-            return None
-
-        get_message = getattr(obj, "get_message", None)
-        if callable(get_message):
-            return _wrap_get_message(get_message)
-
-        queue_getter = _wrap_queue(obj)
-        if queue_getter is not None:
-            return queue_getter
-
-        if isinstance(obj, dict):
-            for value in obj.values():
-                getter = _search(value, depth=depth + 1, max_depth=max_depth)
-                if getter is not None:
-                    return getter
-
-        if isinstance(obj, (list, tuple, set, frozenset)):
-            for value in obj:
-                getter = _search(value, depth=depth + 1, max_depth=max_depth)
-                if getter is not None:
-                    return getter
-
-        if allow_iterator:
-            iterator = getattr(obj, "__iter__", None)
-            if callable(iterator):
-                if depth + 1 >= max_depth:
-                    return None
-                iterator_obj = iterator()
-                return lambda timeout: next(iterator_obj)
-
-        attribute_names: set[str] = set()
-        try:
-            attribute_names.update(vars(obj).keys())
-        except TypeError:
-            pass
-
-        for attr_name in getattr(obj, "__slots__", ()):  # type: ignore[attr-defined]
-            if isinstance(attr_name, str):
-                attribute_names.add(attr_name)
-
-        if not attribute_names:
-            attribute_names.update(
-                name
-                for name in dir(obj)
-                if not name.startswith("__") and not name.endswith("__")
-            )
-
-        for attr_name in attribute_names:
-            try:
-                nested = getattr(obj, attr_name)
-            except AttributeError:
-                continue
-            except Exception:
-                continue
-
-            if inspect.ismethod(nested) or inspect.isfunction(nested):
-                continue
-
-            getter = _search(nested, depth=depth + 1, max_depth=max_depth)
-            if getter is not None:
-                return getter
-
-        return None
-
-    getter = _search(provider, allow_iterator=True)
-    if getter is not None:
-        return getter
-
-    return None
+class _AsyncErrorWrapper:
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
 
 
-def _is_persistent_provider(provider: Any) -> bool:
-    provider_cls = provider.__class__
-    if _persistent_module is None:
-        return provider_cls.__module__.startswith("web3.providers.persistent")
-
-    for name in ("WebSocketProvider", "PersistentWebSocketProvider"):
-        candidate = getattr(_persistent_module, name, None)
-        if inspect.isclass(candidate) and issubclass(provider_cls, candidate):
-            return True
-
-    return provider_cls.__module__.startswith("web3.providers.persistent")
+_SENTINEL = object()
 
 
 def iter_websocket_messages(
     provider: Any,
     stop_event: Any,
     poll_interval: float = 0.5,
+    *,
+    subscription_params: Optional[dict[str, Any]] = None,
+    on_connect: MessageCallback = None,
+    on_disconnect: MessageCallback = None,
 ) -> Iterable[Any]:
-    """Yield websocket payloads for both legacy and persistent providers."""
+    """Yield websocket payloads via a synchronous iterator."""
 
-    ws = getattr(provider, "ws", None)
-    if ws is not None and hasattr(ws, "recv"):
-        yield from _iter_from_ws_object(ws, stop_event)
-        return
+    bridge_stop = threading.Event()
+    composite_event = _CompositeEvent(stop_event, bridge_stop)
+    message_queue: "queue.Queue[Any]" = queue.Queue()
 
-    getter = _resolve_message_getter(provider)
-    if getter is None and _is_persistent_provider(provider):
-        getter = _resolve_message_getter(provider)
+    def _runner() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-    if getter is None:
-        raise RuntimeError("Websocket provider does not expose a supported message interface")
+        async def _consume() -> None:
+            try:
+                async for payload in async_iter_websocket_messages(
+                    provider,
+                    composite_event,
+                    subscription_params=subscription_params,
+                    on_connect=on_connect,
+                    on_disconnect=on_disconnect,
+                ):
+                    message_queue.put(payload)
+            except Exception as exc:  # noqa: BLE001 - propagate to caller
+                message_queue.put(_AsyncErrorWrapper(exc))
+            finally:
+                message_queue.put(_SENTINEL)
 
-    while not stop_event.is_set():
         try:
-            message = getter(poll_interval)
-        except queue.Empty:
-            continue
-        except StopIteration:
-            break
-        if not message:
-            continue
-        yield message
+            loop.run_until_complete(_consume())
+        finally:
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+
+    thread = threading.Thread(target=_runner, name="WebsocketMessageBridge", daemon=True)
+    thread.start()
+
+    try:
+        while True:
+            if stop_event.is_set() and message_queue.empty() and not thread.is_alive():
+                break
+            try:
+                item = message_queue.get(timeout=poll_interval)
+            except queue.Empty:
+                if stop_event.is_set():
+                    continue
+                if not thread.is_alive():
+                    break
+                continue
+            if item is _SENTINEL:
+                break
+            if isinstance(item, _AsyncErrorWrapper):
+                raise item.exc
+            yield item
+    finally:
+        bridge_stop.set()
+        thread.join(timeout=1)
 
 
-__all__ = ["iter_websocket_messages"]
+__all__ = ["async_iter_websocket_messages", "iter_websocket_messages"]
