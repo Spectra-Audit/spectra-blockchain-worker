@@ -282,10 +282,21 @@ def test_async_iter_websocket_messages_uses_async_web3(monkeypatch):
             self._items = list(items)
             self.process_calls: List[Any] = []
 
-        async def process_subscriptions(self, subscription):
-            self.process_calls.append(subscription)
+        async def process_subscriptions(self):
+            self.process_calls.append(())
             for item in self._items:
-                yield item
+                yield {
+                    "params": {
+                        "subscription": "fake-sub",
+                        "result": item,
+                    }
+                }
+            yield {
+                "params": {
+                    "subscription": "other-sub",
+                    "result": "ignored",
+                }
+            }
 
     monkeypatch.setattr(websocket_helpers, "_AsyncWeb3", FakeAsyncWeb3)
     monkeypatch.setattr(websocket_helpers, "_WebsocketProviderFactory", FakeWebsocketProviderV2)
@@ -333,6 +344,73 @@ def test_async_iter_websocket_messages_uses_async_web3(monkeypatch):
     assert web3_instance.eth.subscribe_calls == [("logs", {"topics": ["topic"]})]
     assert web3_instance.eth.subscription is not None
     assert web3_instance.eth.subscription.unsubscribe_calls == 1
+    assert web3_instance.ws.process_calls == [()]
+
+
+def test_async_iter_websocket_messages_supports_legacy_web3(monkeypatch):
+    messages = ["legacy-1", "legacy-2"]
+    stop_event = threading.Event()
+    FakeWebsocketProviderV2.instances.clear()
+
+    class LegacyAsyncWeb3:
+        instances: List["LegacyAsyncWeb3"] = []
+
+        def __init__(self, provider):
+            self.provider = provider
+            self.eth = FakeAsyncEth(messages)
+            self.ws = LegacyAsyncWS(messages)
+            type(self).instances.append(self)
+
+        @classmethod
+        def persistent_websocket(cls, provider):
+            class _Manager:
+                async def __aenter__(self_inner):
+                    provider.socket_connect()
+                    self_inner.instance = cls(provider)
+                    return self_inner.instance
+
+                async def __aexit__(self_inner, exc_type, exc, tb):
+                    provider.socket_disconnect()
+
+            return _Manager()
+
+    class LegacyAsyncWS:
+        def __init__(self, items):
+            self._items = list(items)
+            self.process_calls: List[Any] = []
+
+        async def process_subscriptions(self, subscription):
+            self.process_calls.append(subscription)
+            for item in self._items:
+                yield item
+
+    monkeypatch.setattr(websocket_helpers, "_AsyncWeb3", LegacyAsyncWeb3)
+    monkeypatch.setattr(websocket_helpers, "_WebsocketProviderFactory", FakeWebsocketProviderV2)
+
+    async def collect():
+        received = []
+        async for payload in async_iter_websocket_messages(
+            types.SimpleNamespace(endpoint_uri="wss://legacy"),
+            stop_event,
+            subscription_params={"address": "0xlegacy"},
+        ):
+            received.append(payload)
+            if len(received) == len(messages):
+                stop_event.set()
+        return received
+
+    results = asyncio.run(collect())
+
+    assert results == messages
+
+    assert FakeWebsocketProviderV2.instances
+    provider_instance = FakeWebsocketProviderV2.instances[-1]
+    assert provider_instance.endpoint_uri == "wss://legacy"
+    assert provider_instance.socket_connect_calls == 1
+    assert provider_instance.socket_disconnect_calls == 1
+
+    web3_instance = LegacyAsyncWeb3.instances[-1]
+    assert web3_instance.eth.subscribe_calls == [("logs", {"address": "0xlegacy"})]
     assert web3_instance.ws.process_calls == [web3_instance.eth.subscription]
 
 

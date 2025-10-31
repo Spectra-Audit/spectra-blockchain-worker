@@ -45,6 +45,78 @@ async def _await_if_awaitable(value: Any) -> Any:
     return value
 
 
+def _normalize_subscription_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return "0x" + value.hex()
+    hex_method = getattr(value, "hex", None)
+    if callable(hex_method):
+        try:
+            return hex_method()
+        except TypeError:
+            pass
+    return str(value)
+
+
+def _payload_subscription_id(payload: Any) -> Optional[str]:
+    if isinstance(payload, dict):
+        if "subscription" in payload:
+            return _normalize_subscription_id(payload["subscription"])
+        params = payload.get("params")
+        if isinstance(params, dict) and "subscription" in params:
+            return _normalize_subscription_id(params["subscription"])
+    return None
+
+
+def _payload_result(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        if "result" in payload:
+            return payload["result"]
+        params = payload.get("params")
+        if isinstance(params, dict) and "result" in params:
+            return params["result"]
+    return payload
+
+
+def _filtered_subscription_iterator(
+    iterator: Any, subscription_id: Optional[str]
+) -> AsyncIterator[Any]:
+    async def _generator() -> AsyncIterator[Any]:
+        async for payload in iterator:
+            if subscription_id is not None:
+                payload_subscription = _payload_subscription_id(payload)
+                if (
+                    payload_subscription is not None
+                    and payload_subscription != subscription_id
+                ):
+                    continue
+            yield _payload_result(payload)
+
+    return _generator()
+
+
+async def _subscription_event_iterator(web3: Any, subscription: Any) -> AsyncIterator[Any]:
+    process_subscriptions = getattr(web3.ws, "process_subscriptions", None)
+    if process_subscriptions is None:
+        raise RuntimeError("web3 websocket connection is missing process_subscriptions")
+
+    try:
+        iterator = process_subscriptions(subscription)
+    except TypeError as exc:
+        if "positional argument" not in str(exc):
+            raise
+        iterator = process_subscriptions()
+        iterator = await _await_if_awaitable(iterator)
+        subscription_id = _normalize_subscription_id(
+            getattr(subscription, "subscription_id", None)
+            or getattr(subscription, "filter_id", None)
+        )
+        return _filtered_subscription_iterator(iterator, subscription_id)
+
+    return await _await_if_awaitable(iterator)
+
+
 async def _unsubscribe_from_subscription(web3: Any, subscription: Any) -> None:
     """Attempt to unsubscribe from *subscription* using the available API."""
 
@@ -117,7 +189,8 @@ async def async_iter_websocket_messages(
             async with _managed_subscription(web3, subscription_params) as subscription:
                 if on_connect is not None:
                     on_connect()
-                async for payload in web3.ws.process_subscriptions(subscription):
+                iterator = await _subscription_event_iterator(web3, subscription)
+                async for payload in iterator:
                     if stop_event.is_set():
                         break
                     yield payload
