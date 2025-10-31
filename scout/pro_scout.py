@@ -907,9 +907,18 @@ class ProScout:
                     try:
                         self._consume_ws_url(url)
                     except Exception as exc:  # pragma: no cover - defensive logging
+                        with self._ws_state_lock:
+                            start_block = self._ws_start_block
+                            last_block = self._ws_last_block
                         self.logger.exception(
                             "WebSocket listener error",
-                            extra={"url": url, "error": str(exc), "attempt": attempt + 1},
+                            extra={
+                                "url": url,
+                                "error": str(exc),
+                                "attempt": attempt + 1,
+                                "start_block": start_block,
+                                "last_block": last_block,
+                            },
                         )
                         if attempt == 2:
                             if self._stop_event.is_set():
@@ -1010,6 +1019,12 @@ class ProScout:
             self._ws_healthy_since_time = 0.0
             self._ws_healthy_since_block = self._ws_last_block
             self._ws_start_block = None
+            start_block = self._ws_start_block
+            last_block = self._ws_last_block
+        self.logger.info(
+            "WebSocket connected",
+            extra={"start_block": start_block, "last_block": last_block},
+        )
         self._evaluate_polling_state()
 
     def _notify_ws_disconnected(self) -> None:
@@ -1020,6 +1035,12 @@ class ProScout:
             self._ws_healthy_since_time = 0.0
             self._ws_healthy_since_block = self._ws_last_block
             self._ws_start_block = None
+            start_block = self._ws_start_block
+            last_block = self._ws_last_block
+        self.logger.info(
+            "WebSocket disconnected",
+            extra={"start_block": start_block, "last_block": last_block},
+        )
         self._resume_http_polling()
 
     def _update_ws_start_block(self, block_number: int) -> None:
