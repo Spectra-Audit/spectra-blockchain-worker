@@ -144,6 +144,7 @@ class FeaturedScout:
     ) -> None:
         self._config = config
         self._once = once
+        self._effective_reorg_confirmations = max(self._config.reorg_confirmations, 1)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._ws_thread: Optional[threading.Thread] = None
@@ -382,7 +383,9 @@ class FeaturedScout:
             self._handle_provider_error(exc)
             return False
         self._mark_provider_success()
-        safe_block = max(latest_block - (self._config.reorg_confirmations - 1), 0)
+        safe_block = max(
+            latest_block - (self._effective_reorg_confirmations - 1), 0
+        )
         self._last_safe_block = safe_block
         with self._ws_state_lock:
             ws_ready = self._ws_ready.is_set()
@@ -803,7 +806,7 @@ class FeaturedScout:
         with self._ws_state_lock:
             self._ws_last_block = max(self._ws_last_block, block_number)
             self._ws_last_message = time.time()
-        confirmations_buffer = max(self._config.reorg_confirmations - 1, 0)
+        confirmations_buffer = self._effective_reorg_confirmations - 1
         confirmed_block = max(block_number - confirmations_buffer, 0)
         if confirmed_block > self._last_block:
             with self._lock:
