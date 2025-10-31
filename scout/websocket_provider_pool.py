@@ -180,6 +180,8 @@ class WebSocketProviderPool:
 
         provider_kwargs: Dict[str, Any] = {}
         signature_target = None
+        websocket_kwargs: Optional[Dict[str, Any]] = None
+        accepts_websocket_kwargs = False
 
         init = getattr(provider_class, "__init__", None)
         if init is not None and (inspect.isfunction(init) or inspect.ismethod(init)):
@@ -190,10 +192,22 @@ class WebSocketProviderPool:
         if signature_target is not None:
             with contextlib.suppress(TypeError, ValueError):
                 signature = inspect.signature(signature_target)
-                if "websocket_timeout" in signature.parameters:
+                parameters = signature.parameters
+                if "websocket_timeout" in parameters:
                     provider_kwargs["websocket_timeout"] = 30
+                if "websocket_kwargs" in parameters:
+                    accepts_websocket_kwargs = True
+                    websocket_kwargs = provider_kwargs.get("websocket_kwargs")
+                    if websocket_kwargs is None:
+                        websocket_kwargs = {
+                            "ping_interval": 20,
+                            "ping_timeout": 20,
+                        }
+                        provider_kwargs["websocket_kwargs"] = websocket_kwargs
 
         provider = provider_class(url, **provider_kwargs)
+        if accepts_websocket_kwargs:
+            setattr(provider, "websocket_kwargs", websocket_kwargs)
         cleanup_name: Optional[str] = None
         cleanup_hook: Hook = None
 
