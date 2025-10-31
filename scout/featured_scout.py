@@ -423,6 +423,12 @@ class FeaturedScout:
                 "toBlock": to_block,
                 "topics": [[topic for topic in self._event_topic_map]],
             }
+            LOGGER.info(
+                "Fetching logs from %s to %s",
+                current_from,
+                current_to,
+                extra={"from_block": current_from, "to_block": current_to},
+            )
             try:
                 logs: Sequence[LogReceipt] = web3.eth.get_logs(filter_params)
             except Exception as exc:  # noqa: BLE001
@@ -447,7 +453,9 @@ class FeaturedScout:
                 self._last_block = current_to
             total_logs += len(sorted_logs)
             LOGGER.info(
-                "Processed block chunk",
+                "Processed block chunk %s-%s",
+                current_from,
+                current_to,
                 extra={
                     "from_block": current_from,
                     "to_block": current_to,
@@ -456,8 +464,14 @@ class FeaturedScout:
             )
             current_from = current_to + 1
         LOGGER.info(
-            "Processed blocks",
-            extra={"from_block": window_start, "to_block": window_end, "log_count": total_logs},
+            "Processed blocks %s-%s",
+            window_start,
+            window_end,
+            extra={
+                "from_block": window_start,
+                "to_block": window_end,
+                "log_count": total_logs,
+            },
         )
         self._evaluate_polling_state()
         return True
