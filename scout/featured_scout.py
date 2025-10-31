@@ -766,34 +766,28 @@ class FeaturedScout:
 
     def _notify_ws_connected(self) -> None:
         with self._ws_state_lock:
+            start_block = self._ws_start_block
             self._ws_ready.set()
             self._ws_last_block = max(self._last_block, 0)
+            last_block = self._ws_last_block
             self._ws_last_message = time.time()
             self._ws_healthy_since_time = 0.0
             self._ws_healthy_since_block = self._ws_last_block
             self._ws_start_block = None
-            start_block = self._ws_start_block
-            last_block = self._ws_last_block
-        LOGGER.info(
-            "WebSocket connected",
-            extra={"start_block": start_block, "last_block": last_block},
-        )
+        LOGGER.info("WebSocket connected (start=%s, last=%s)", start_block, last_block)
         self._evaluate_polling_state()
 
     def _notify_ws_disconnected(self) -> None:
         with self._ws_state_lock:
+            start_block = self._ws_start_block
             self._ws_ready.clear()
             self._ws_last_block = max(self._last_block, 0)
+            last_block = self._ws_last_block
             self._ws_last_message = 0.0
             self._ws_healthy_since_time = 0.0
             self._ws_healthy_since_block = self._ws_last_block
             self._ws_start_block = None
-            start_block = self._ws_start_block
-            last_block = self._ws_last_block
-        LOGGER.info(
-            "WebSocket disconnected",
-            extra={"start_block": start_block, "last_block": last_block},
-        )
+        LOGGER.info("WebSocket disconnected (start=%s, last=%s)", start_block, last_block)
         self._resume_http_polling()
 
     def _update_ws_start_block(self, block_number: int) -> None:
