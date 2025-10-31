@@ -171,6 +171,7 @@ def test_pro_scout_idle_websocket_keeps_http_paused(
 
     try:
         scout._last_block = 12
+        scout._last_event_block = scout._last_block
         scout._last_safe_block = 12
         scout._notify_ws_connected()
 
@@ -233,14 +234,16 @@ def test_pro_scout_websocket_reconnect_does_not_restart_http_for_quiet_periods(
 
     try:
         scout._last_block = 25
+        scout._last_event_block = scout._last_block
         scout._last_safe_block = 30
         scout._pause_http_polling()
         scout._resume_http_polling()
-        assert scout._last_http_resume_block == 25
+        assert scout._last_http_resume_block == scout._last_event_block
 
         scout._notify_ws_connected()
 
         scout._last_block = 40
+        scout._last_event_block = scout._last_block
         scout._last_safe_block = 40
         with scout._ws_state_lock:
             scout._ws_last_block = 25
@@ -257,11 +260,76 @@ def test_pro_scout_websocket_reconnect_does_not_restart_http_for_quiet_periods(
         scout._evaluate_polling_state()
 
         assert not scout._poll_gate.is_set()
-        assert scout._last_http_resume_block == scout._last_block
+        assert scout._last_http_resume_block == scout._last_event_block
         assert any(
             "Websocket caught up to HTTP resume block; keeping HTTP paused" in message
             for message in caplog.messages
         )
+    finally:
+        scout.db_manager.close()
+
+
+def test_pro_scout_http_empty_range_does_not_force_resume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Ensure empty HTTP batches do not force websocket catch-up."""
+
+    class FakeTime:
+        def __init__(self, start: float = 3_000_000.0) -> None:
+            self._now = start
+
+        def time(self) -> float:
+            return self._now
+
+        def advance(self, seconds: float) -> None:
+            self._now += seconds
+
+    monkeypatch.setattr(pro_module, "Web3", DummyWeb3)
+
+    fake_time = FakeTime()
+    monkeypatch.setattr(pro_module, "time", fake_time)
+
+    scout = ProScout(
+        rpc_http_urls=["http://dummy"],
+        rpc_ws_urls=["ws://dummy"],
+        api_base_url="https://api",
+        admin_access_token="token",
+        admin_refresh_token="refresh",
+        contract_address="0x0123456789012345678901234567890123456789",
+        db_path=str(tmp_path / "pro_http_empty.db"),
+        backend_client=DummyBackendClient(),
+        poll_interval=2,
+        reorg_conf=0,
+    )
+
+    try:
+        scout._last_block = 80
+        scout._last_event_block = scout._last_block
+        scout._last_safe_block = 80
+
+        scout._notify_ws_connected()
+
+        fake_time.advance(scout._http_resume_grace_period + 5)
+        scout._last_http_resume_time = fake_time.time() - (scout._http_resume_grace_period + 1)
+        with scout._ws_state_lock:
+            scout._ws_healthy_since_time = fake_time.time() - (
+                scout._ws_healthy_time_requirement + 1
+            )
+            scout._ws_healthy_since_block = scout._ws_last_block
+
+        scout._pause_http_polling()
+
+        scout._last_block = 120
+        scout._last_safe_block = 120
+
+        with scout._ws_state_lock:
+            scout._ws_last_block = 80
+            scout._ws_last_progress_block = 80
+
+        scout._evaluate_polling_state()
+
+        assert not scout._poll_gate.is_set()
+        assert scout._last_http_resume_block == scout._last_event_block
     finally:
         scout.db_manager.close()
 
@@ -290,10 +358,11 @@ def test_pro_scout_websocket_lag_resumes_http_polling(
 
     try:
         scout._last_block = 50
+        scout._last_event_block = scout._last_block
         scout._last_safe_block = 50
         scout._pause_http_polling()
         scout._resume_http_polling()
-        assert scout._last_http_resume_block == 50
+        assert scout._last_http_resume_block == scout._last_event_block
 
         scout._notify_ws_connected()
         with scout._ws_state_lock:
@@ -301,6 +370,7 @@ def test_pro_scout_websocket_lag_resumes_http_polling(
             scout._ws_last_progress_block = 30
 
         scout._last_block = 60
+        scout._last_event_block = scout._last_block
         scout._last_safe_block = 60
 
         scout._poll_gate.clear()
