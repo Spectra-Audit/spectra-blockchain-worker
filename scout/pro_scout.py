@@ -130,7 +130,7 @@ class ProScout:
         log_level: str = "INFO",
         chain_id: Optional[int] = None,
         start_block: Optional[int] = None,
-        block_batch_size: int = 1000,
+        block_batch_size: int = 7200,
         ws_provider_pool: Optional[WebSocketProviderPool] = None,
     ) -> None:
         http_urls = [url.strip() for url in rpc_http_urls if url]

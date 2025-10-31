@@ -127,7 +127,7 @@ class ScoutConfig:
     reorg_confirmations: int
     start_block: Optional[int]
     start_block_latest: bool
-    block_batch_size: int = 1000
+    block_batch_size: int = 7200
 
 
 class FeaturedScout:
