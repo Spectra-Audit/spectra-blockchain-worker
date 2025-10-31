@@ -1017,7 +1017,7 @@ class ProScout:
             self._ws_ready.set()
             self._ws_last_block = max(self._last_block, 0)
             last_block = self._ws_last_block
-            self._ws_last_message = time.time()
+            self._ws_last_message = 0.0
             self._ws_healthy_since_time = 0.0
             self._ws_healthy_since_block = self._ws_last_block
             self._ws_start_block = None
@@ -1050,6 +1050,7 @@ class ProScout:
     def _update_ws_progress(self, block_number: int) -> None:
         with self._ws_state_lock:
             self._ws_last_block = max(self._ws_last_block, block_number)
+            # Timestamp retained for observability; polling state changes no longer depend on it.
             self._ws_last_message = time.time()
         confirmations_buffer = max(self.reorg_conf - 1, 0)
         confirmed_block = max(block_number - confirmations_buffer, 0)
@@ -1077,7 +1078,6 @@ class ProScout:
         with self._ws_state_lock:
             ws_ready = self._ws_ready.is_set()
             ws_last_block = self._ws_last_block
-            ws_last_message = self._ws_last_message
             ws_start_block = self._ws_start_block
         now = time.time()
         if not ws_ready:
@@ -1085,10 +1085,6 @@ class ProScout:
             self._resume_http_polling()
             return
         if self._last_safe_block <= 0:
-            self._mark_ws_unhealthy(ws_last_block)
-            self._resume_http_polling()
-            return
-        if ws_last_message == 0.0 or (now - ws_last_message) > self._ws_stale_threshold:
             self._mark_ws_unhealthy(ws_last_block)
             self._resume_http_polling()
             return
