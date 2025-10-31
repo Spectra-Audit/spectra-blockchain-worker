@@ -210,6 +210,7 @@ class ProScout:
         self._ws_last_block = -1
         self._ws_last_message = 0.0
         self._ws_start_block: Optional[int] = None
+        self._ws_last_progress_block = -1
         self._ws_pause_logged = False
         self._ws_stale_threshold = max(self.poll_interval * 3, self.poll_interval + 2)
         now = time.time()
@@ -1021,6 +1022,7 @@ class ProScout:
             self._ws_healthy_since_time = 0.0
             self._ws_healthy_since_block = self._ws_last_block
             self._ws_start_block = None
+            self._ws_last_progress_block = self._ws_last_block
         self.logger.info(
             "WebSocket connected (start=%s, last=%s)", start_block, last_block
         )
@@ -1052,6 +1054,7 @@ class ProScout:
             self._ws_last_block = max(self._ws_last_block, block_number)
             # Timestamp retained for observability; polling state changes no longer depend on it.
             self._ws_last_message = time.time()
+            self._ws_last_progress_block = max(self._ws_last_progress_block, self._ws_last_block)
         confirmations_buffer = max(self.reorg_conf - 1, 0)
         confirmed_block = max(block_number - confirmations_buffer, 0)
         if confirmed_block > self._last_block:
@@ -1079,6 +1082,7 @@ class ProScout:
             ws_ready = self._ws_ready.is_set()
             ws_last_block = self._ws_last_block
             ws_start_block = self._ws_start_block
+            ws_progress_block = self._ws_last_progress_block
         now = time.time()
         if not ws_ready:
             self._mark_ws_unhealthy(ws_last_block)
@@ -1089,9 +1093,29 @@ class ProScout:
             self._resume_http_polling()
             return
         if ws_last_block < self._last_block:
-            self._mark_ws_unhealthy(ws_last_block)
-            self._resume_http_polling()
-            return
+            http_resume_block = self._last_http_resume_block
+            if ws_progress_block < http_resume_block:
+                self.logger.debug(
+                    "Websocket behind HTTP progress; resuming HTTP polling",
+                    extra={
+                        "ws_last_block": ws_last_block,
+                        "ws_progress_block": ws_progress_block,
+                        "http_resume_block": http_resume_block,
+                        "last_block": self._last_block,
+                    },
+                )
+                self._mark_ws_unhealthy(ws_last_block)
+                self._resume_http_polling()
+                return
+            self.logger.debug(
+                "Websocket caught up to HTTP resume block; keeping HTTP paused",
+                extra={
+                    "ws_last_block": ws_last_block,
+                    "ws_progress_block": ws_progress_block,
+                    "http_resume_block": http_resume_block,
+                    "last_block": self._last_block,
+                },
+            )
         healthy_since_time, healthy_since_block = self._ensure_ws_health_marker(
             ws_last_block, now
         )
@@ -1117,6 +1141,7 @@ class ProScout:
             self._poll_gate.clear()
             self._last_http_pause_time = time.time()
             self._last_http_pause_block = self._last_block
+            self._last_http_resume_block = self._last_block
 
     def _resume_http_polling(self) -> None:
         if not self._poll_gate.is_set():

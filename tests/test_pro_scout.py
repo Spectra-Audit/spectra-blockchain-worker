@@ -196,6 +196,125 @@ def test_pro_scout_idle_websocket_keeps_http_paused(
         scout.db_manager.close()
 
 
+def test_pro_scout_websocket_reconnect_does_not_restart_http_for_quiet_periods(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verify HTTP polling stays paused when the websocket is healthy but logless."""
+
+    class FakeTime:
+        def __init__(self, start: float = 2_000_000.0) -> None:
+            self._now = start
+
+        def time(self) -> float:
+            return self._now
+
+        def advance(self, seconds: float) -> None:
+            self._now += seconds
+
+    monkeypatch.setattr(pro_module, "Web3", DummyWeb3)
+
+    fake_time = FakeTime()
+    monkeypatch.setattr(pro_module, "time", fake_time)
+
+    scout = ProScout(
+        rpc_http_urls=["http://dummy"],
+        rpc_ws_urls=["ws://dummy"],
+        api_base_url="https://api",
+        admin_access_token="token",
+        admin_refresh_token="refresh",
+        contract_address="0x0123456789012345678901234567890123456789",
+        db_path=str(tmp_path / "pro_ws_resume.db"),
+        backend_client=DummyBackendClient(),
+        poll_interval=2,
+        reorg_conf=0,
+    )
+
+    caplog.set_level("DEBUG")
+
+    try:
+        scout._last_block = 25
+        scout._last_safe_block = 30
+        scout._pause_http_polling()
+        scout._resume_http_polling()
+        assert scout._last_http_resume_block == 25
+
+        scout._notify_ws_connected()
+
+        scout._last_block = 40
+        scout._last_safe_block = 40
+        with scout._ws_state_lock:
+            scout._ws_last_block = 25
+            scout._ws_last_progress_block = 25
+
+        fake_time.advance(scout._http_resume_grace_period + 5)
+        scout._last_http_resume_time = fake_time.time() - (scout._http_resume_grace_period + 1)
+        with scout._ws_state_lock:
+            scout._ws_healthy_since_time = fake_time.time() - (
+                scout._ws_healthy_time_requirement + 1
+            )
+            scout._ws_healthy_since_block = scout._ws_last_block
+
+        scout._evaluate_polling_state()
+
+        assert not scout._poll_gate.is_set()
+        assert scout._last_http_resume_block == scout._last_block
+        assert any(
+            "Websocket caught up to HTTP resume block; keeping HTTP paused" in message
+            for message in caplog.messages
+        )
+    finally:
+        scout.db_manager.close()
+
+
+def test_pro_scout_websocket_lag_resumes_http_polling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ensure HTTP polling resumes when websocket progress predates HTTP catch-up."""
+
+    monkeypatch.setattr(pro_module, "Web3", DummyWeb3)
+
+    scout = ProScout(
+        rpc_http_urls=["http://dummy"],
+        rpc_ws_urls=["ws://dummy"],
+        api_base_url="https://api",
+        admin_access_token="token",
+        admin_refresh_token="refresh",
+        contract_address="0x0123456789012345678901234567890123456789",
+        db_path=str(tmp_path / "pro_ws_lag.db"),
+        backend_client=DummyBackendClient(),
+        poll_interval=2,
+        reorg_conf=0,
+    )
+
+    caplog.set_level("DEBUG")
+
+    try:
+        scout._last_block = 50
+        scout._last_safe_block = 50
+        scout._pause_http_polling()
+        scout._resume_http_polling()
+        assert scout._last_http_resume_block == 50
+
+        scout._notify_ws_connected()
+        with scout._ws_state_lock:
+            scout._ws_last_block = 30
+            scout._ws_last_progress_block = 30
+
+        scout._last_block = 60
+        scout._last_safe_block = 60
+
+        scout._poll_gate.clear()
+        scout._evaluate_polling_state()
+
+        assert scout._poll_gate.is_set()
+        assert any(
+            "Websocket behind HTTP progress; resuming HTTP polling" in message
+            for message in caplog.messages
+        )
+    finally:
+        scout.db_manager.close()
+
+
 def test_pro_scout_handles_async_websocket_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
