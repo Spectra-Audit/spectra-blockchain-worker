@@ -12,6 +12,7 @@ import pytest
 
 import scout.websocket_helpers as websocket_helpers
 from scout.websocket_helpers import async_iter_websocket_messages, iter_websocket_messages
+from scout.websocket_provider_pool import WebSocketProviderPool
 
 
 class FakeAttributeDict(dict):
@@ -126,6 +127,39 @@ class FakeWebsocketProvider:
 
     def disconnect(self):
         return None
+
+
+class FakeKeepaliveWebsocketProvider:
+    def __init__(self, endpoint_uri, websocket_kwargs=None, **_kwargs):
+        self.endpoint_uri = endpoint_uri
+        self._received_websocket_kwargs = websocket_kwargs
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+
+    def connect(self):
+        self.connect_calls += 1
+
+    def disconnect(self):
+        self.disconnect_calls += 1
+
+
+def test_websocket_provider_pool_injects_keepalive_kwargs():
+    pool = WebSocketProviderPool(provider_class=FakeKeepaliveWebsocketProvider)
+    handle = pool.attach("wss://example")
+    provider = None
+    expected = {"ping_interval": 20, "ping_timeout": 20}
+
+    try:
+        with handle.checkout() as session:
+            provider = session.provider
+            assert provider._received_websocket_kwargs == expected
+            assert getattr(provider, "websocket_kwargs") == expected
+            assert provider.connect_calls == 1
+    finally:
+        handle.close()
+
+    assert provider is not None
+    assert provider.disconnect_calls == 1
 
 
 class PersistentFakeWebsocketProvider:
