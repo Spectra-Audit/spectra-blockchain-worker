@@ -133,6 +133,69 @@ def test_pro_scout_event_topics_are_prefixed(monkeypatch: pytest.MonkeyPatch, tm
         scout.db_manager.close()
 
 
+def test_pro_scout_idle_websocket_keeps_http_paused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Ensure idle websocket connections do not trigger HTTP polling resumptions."""
+
+    class FakeTime:
+        def __init__(self, start: float = 1_000_000.0) -> None:
+            self._now = start
+
+        def time(self) -> float:
+            return self._now
+
+        def sleep(self, seconds: float) -> None:  # pragma: no cover - convenience for code paths
+            self._now += seconds
+
+        def advance(self, seconds: float) -> None:
+            self._now += seconds
+
+    monkeypatch.setattr(pro_module, "Web3", DummyWeb3)
+
+    fake_time = FakeTime()
+    monkeypatch.setattr(pro_module, "time", fake_time)
+
+    scout = ProScout(
+        rpc_http_urls=["http://dummy"],
+        rpc_ws_urls=["ws://dummy"],
+        api_base_url="https://api",
+        admin_access_token="token",
+        admin_refresh_token="refresh",
+        contract_address="0x0123456789012345678901234567890123456789",
+        db_path=str(tmp_path / "pro_idle.db"),
+        backend_client=DummyBackendClient(),
+        poll_interval=2,
+        reorg_conf=0,
+    )
+
+    try:
+        scout._last_block = 12
+        scout._last_safe_block = 12
+        scout._notify_ws_connected()
+
+        fake_time.advance(scout._http_resume_grace_period + 5)
+        scout._last_http_resume_time = fake_time.time() - (scout._http_resume_grace_period + 1)
+        with scout._ws_state_lock:
+            scout._ws_healthy_since_time = fake_time.time() - (
+                scout._ws_healthy_time_requirement + 1
+            )
+            scout._ws_healthy_since_block = scout._ws_last_block
+
+        scout._evaluate_polling_state()
+        assert not scout._poll_gate.is_set()
+
+        for _ in range(3):
+            fake_time.advance(scout.poll_interval)
+            scout._evaluate_polling_state()
+            assert not scout._poll_gate.is_set()
+
+        scout._notify_ws_disconnected()
+        assert scout._poll_gate.is_set()
+    finally:
+        scout.db_manager.close()
+
+
 def test_pro_scout_handles_async_websocket_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -1022,10 +1022,14 @@ def test_pro_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modules):
     with service._ws_state_lock:
         service._ws_last_message = time.time() - (service._ws_stale_threshold + 1)
     service._evaluate_polling_state()
+    # Idle websocket should not trigger HTTP polling to resume.
+    assert not service._poll_gate.is_set()
+
+    service._notify_ws_disconnected()
     assert service._poll_gate.is_set()
 
     service._notify_ws_connected()
-    # Grace period after resuming keeps HTTP polling active.
+    # Grace period after reconnect keeps HTTP polling active.
     assert service._poll_gate.is_set()
 
     service._last_http_resume_time -= service._http_resume_grace_period + 1
