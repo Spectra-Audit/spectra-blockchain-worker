@@ -759,6 +759,7 @@ class ProScout:
         database: Optional[DatabaseManager] = None,
         backend_client: Optional[BackendClient] = None,
         admin_wallet: Optional[AdminWallet] = None,
+        ws_provider_pool: Optional[WebSocketProviderPool] = None,
     ) -> "ProScout":
         load_env_file()
         rpc_http_env = os.environ.get("RPC_HTTP_URLS")
@@ -826,6 +827,7 @@ class ProScout:
             chain_id=chain_id,
             start_block=start_block,
             rpc_ws_urls=rpc_ws_urls,
+            ws_provider_pool=ws_provider_pool,
         )
 
     def _start_ws_listener(self) -> None:

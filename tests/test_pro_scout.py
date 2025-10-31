@@ -207,6 +207,33 @@ def test_pro_scout_handles_async_websocket_provider(
 
     monkeypatch.setattr(pro_module, "resolve_ws_provider_class", lambda: AsyncProvider)
 
+    from scout import websocket_helpers
+    from scout.websocket_helpers import _await_if_awaitable
+
+    async def fake_async_iter(
+        provider: Any,
+        stop_event: Any,
+        *,
+        subscription_params: Optional[dict[str, Any]] = None,
+        on_connect=None,
+        on_disconnect=None,
+    ):
+        if stop_event.is_set():
+            return
+        if on_connect is not None:
+            on_connect()
+        await _await_if_awaitable(
+            provider.make_request("eth_subscribe", ["logs", subscription_params or {}])
+        )
+        if stop_event.is_set():
+            return
+        yield "{\"method\": \"eth_subscription\", \"params\": {}}"
+        await _await_if_awaitable(provider.make_request("eth_unsubscribe", ["sub-id"]))
+        if on_disconnect is not None:
+            on_disconnect()
+
+    monkeypatch.setattr(websocket_helpers, "async_iter_websocket_messages", fake_async_iter)
+
     scout._stop_event.clear()
     AsyncProvider.instances.clear()
     AsyncProvider.stop_event = scout._stop_event

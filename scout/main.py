@@ -16,9 +16,10 @@ from .auth_wallet import load_or_create_admin_wallet
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
-from .featured_scout import FeaturedScout, _load_config_from_env
+from .featured_scout import FeaturedScout, _load_config_from_env, resolve_ws_provider_class
 from .pro_scout import DEFAULT_DB_PATH, ProScout
 from .siwe_authenticator import SiweAuthenticator
+from .websocket_provider_pool import WebSocketProviderPool
 
 LOGGER = logging.getLogger(__name__)
 
@@ -57,14 +58,21 @@ class ScoutApp:
             token_provider=authenticator.get_tokens,
             token_persistor=authenticator.persist_tokens,
         )
+        shared_pool = WebSocketProviderPool(provider_resolver=resolve_ws_provider_class)
         pro_scout = ProScout.from_env(
             database=database,
             backend_client=backend_client,
             admin_wallet=admin_wallet,
+            ws_provider_pool=shared_pool,
         )
         if featured_config.db_path != db_path:
             featured_config = replace(featured_config, db_path=db_path)
-        featured_scout = FeaturedScout(featured_config, database=database, backend_client=backend_client)
+        featured_scout = FeaturedScout(
+            featured_config,
+            database=database,
+            backend_client=backend_client,
+            ws_provider_pool=shared_pool,
+        )
         return cls(
             database=database,
             pro_scout=pro_scout,

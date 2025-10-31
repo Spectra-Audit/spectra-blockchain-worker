@@ -61,12 +61,17 @@ def stub_auth(monkeypatch: pytest.MonkeyPatch) -> Iterator[_StubAuthenticator]:
     monkeypatch.setattr(main_module, "SiweAuthenticator", _StubAuthenticator)
 
     class _ProScoutStub:
-        def __init__(self, backend_client=None):
-            self.backend_client = backend_client
+        instances: List["_ProScoutStub"] = []
+
+        def __init__(self, **kwargs):
+            self.backend_client = kwargs.get("backend_client")
+            self.ws_provider_pool = kwargs.get("ws_provider_pool")
+            self.kwargs = kwargs
+            _ProScoutStub.instances.append(self)
 
         @classmethod
         def from_env(cls, **kwargs):
-            return cls(backend_client=kwargs.get("backend_client"))
+            return cls(**kwargs)
 
         def start(self) -> None:  # pragma: no cover - simple stub
             pass
@@ -75,8 +80,14 @@ def stub_auth(monkeypatch: pytest.MonkeyPatch) -> Iterator[_StubAuthenticator]:
             pass
 
     class _FeaturedScoutStub:
+        instances: List["_FeaturedScoutStub"] = []
+
         def __init__(self, *_args, **kwargs):
             self.backend_client = kwargs.get("backend_client")
+            self.ws_provider_pool = kwargs.get("ws_provider_pool")
+            self.args = _args
+            self.kwargs = kwargs
+            _FeaturedScoutStub.instances.append(self)
 
         def start(self) -> None:  # pragma: no cover - simple stub
             pass
@@ -89,6 +100,8 @@ def stub_auth(monkeypatch: pytest.MonkeyPatch) -> Iterator[_StubAuthenticator]:
     yield _StubAuthenticator
     _StubAuthenticator.token_batches = []
     _StubAuthenticator.instances = []
+    _ProScoutStub.instances = []
+    _FeaturedScoutStub.instances = []
 
 
 def test_scout_app_from_env_bootstraps_tokens(
@@ -135,3 +148,16 @@ def test_scout_app_refresh_fallback_persists_tokens(
     assert app.database.get_meta(REFRESH_TOKEN_META_KEY) == "handshake-refresh"
     assert getattr(app.backend_client, "_refresh_token") == "handshake-refresh"
     app.shutdown()
+
+
+def test_scout_app_shares_websocket_pool(env_setup: Path, stub_auth: _StubAuthenticator) -> None:
+    stub_auth.token_batches = [[("access", "refresh")]]
+
+    app = ScoutApp.from_env()
+    try:
+        pro_instance = main_module.ProScout.instances[-1]
+        featured_instance = main_module.FeaturedScout.instances[-1]
+        assert pro_instance.ws_provider_pool is not None
+        assert featured_instance.ws_provider_pool is pro_instance.ws_provider_pool
+    finally:
+        app.shutdown()
