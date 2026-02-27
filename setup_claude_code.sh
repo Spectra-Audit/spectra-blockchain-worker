@@ -9,7 +9,7 @@ echo "Setting up claude-code CLI with GLM API..."
 # Get configuration from environment variables
 GLM_API_KEY="${GLM_API_KEY:-${ANTHROPIC_AUTH_TOKEN}}"
 GLM_API_URL="${GLM_API_URL:-https://open.bigmodel.cn/api/paas/v4/chat/completions}"
-GLM_MODEL="${GLM_MODEL:-glm-4-plus}"
+GLM_MODEL="${GLM_MODEL:-glm-4.7}"
 
 # Create config directory
 CONFIG_DIR="/home/scout/.config/claude"

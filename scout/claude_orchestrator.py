@@ -284,7 +284,7 @@ Only return the JSON array, no other text."""
             "--agents", json.dumps({agent_name: agent_config}),
             "--output-format", "json",
             "--permission-mode", "bypassPermissions",
-            "--model", os.getenv("GLM_MODEL", "glm-4-plus"),
+            "--model", os.getenv("GLM_MODEL", "glm-4.7"),
             prompt
         ]
 

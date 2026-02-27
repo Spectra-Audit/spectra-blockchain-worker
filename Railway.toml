@@ -16,8 +16,8 @@ startCommand = "python -m scout run"
 [deploy.env]
 # GLM API Configuration (Chinese LLM provider)
 GLM_API_KEY = ""  # Set in Railway dashboard or via secret
-GLM_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-GLM_MODEL = "glm-4-plus"
+GLM_API_URL = "https://api.z.ai/api/anthropic"
+GLM_MODEL = "glm-4.7"
 
 # Alternative: Set as ANTHROPIC_* for claude-code CLI compatibility
 ANTHROPIC_AUTH_TOKEN = "${GLM_API_KEY}"
@@ -47,6 +47,6 @@ CELERY_BROKER_URL = "redis://localhost:6379/0"
 CELERY_RESULT_BACKEND = "redis://localhost:6379/0"
 
 # Claude Code CLI Configuration
-CLAUDE_MODEL = "glm-4-plus"
+CLAUDE_MODEL = "glm-4.7"
 CLAUDE_MAX_TOKENS = "4096"
 CLAUDE_TEMPERATURE = "0.1"
