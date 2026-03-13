@@ -55,5 +55,5 @@ USER scout
 # Run setup script (will configure claude-code CLI with GLM API)
 RUN /app/setup_claude_code.sh || echo "Setup script skipped"
 
-# Run the blockchain worker
-CMD ["python", "-m", "scout", "run"]
+# Run the unified API server with audit orchestrator
+CMD ["python", "server.py"]

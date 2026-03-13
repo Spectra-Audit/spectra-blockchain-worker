@@ -9,8 +9,8 @@ buildCommand = "docker build -t spectra-blockchain-worker ."
 [deploy]
 healthcheckPath = "/health"
 healthcheckTimeout = 30
-# Start command override (if needed)
-startCommand = "python -m scout run"
+# Start command - use unified API server with audit orchestrator
+startCommand = "python server.py"
 
 # Environment detection (Railway sets this automatically)
 [deploy.env]
@@ -30,7 +30,7 @@ CONTRACT_ADDRESS = "0x..."  # Your featured contract address
 CHAIN_ID = "1"
 
 # Backend API Configuration
-API_BASE_URL = ""  # Set to your Railway backend URL
+API_BASE_URL = "https://spectra-api.up.railway.app"  # Railway backend URL
 ADMIN_ACCESS_TOKEN = ""  # Set in Railway dashboard or via secret
 
 # Database & Caching
