@@ -64,27 +64,37 @@ def main() -> int:
         # Create backend client (optional - for sending results)
         backend_client = None
         api_base_url = os.environ.get("API_BASE_URL")
-        if api_base_url:
-            from scout.backend_client import BackendClient
-            from scout.siwe_authenticator import SiweAuthenticator
-            from scout.auth_wallet import load_or_create_admin_wallet
+        # Skip Railway service references - they must be hardcoded
+        if api_base_url and not api_base_url.startswith("{{"):
+            try:
+                from scout.backend_client import BackendClient
+                from scout.siwe_authenticator import SiweAuthenticator
+                from scout.auth_wallet import load_or_create_admin_wallet
 
-            # Set skip prompt for Railway (non-interactive)
-            os.environ["SCOUT_SKIP_WALLET_PROMPT"] = "1"
+                # Set skip prompt for Railway (non-interactive)
+                os.environ["SCOUT_SKIP_WALLET_PROMPT"] = "1"
 
-            admin_wallet = load_or_create_admin_wallet(database)
-            authenticator = SiweAuthenticator(api_base_url, admin_wallet, database)
+                admin_wallet = load_or_create_admin_wallet(database)
+                authenticator = SiweAuthenticator(api_base_url, admin_wallet, database)
 
-            # Create token provider function for BackendClient
-            def token_provider(force_refresh: bool = False) -> tuple[str, str]:
-                """Get access and refresh tokens from authenticator."""
-                return authenticator.get_tokens()
+                # Create token provider function for BackendClient
+                def token_provider(force_refresh: bool = False) -> tuple[str, str]:
+                    """Get access and refresh tokens from authenticator."""
+                    return authenticator.get_tokens()
 
-            backend_client = BackendClient(
-                api_base_url,
-                token_provider=token_provider
-            )
-            logger.info(f"Backend client configured: {api_base_url}")
+                backend_client = BackendClient(
+                    api_base_url,
+                    token_provider=token_provider
+                )
+                logger.info(f"Backend client configured: {api_base_url}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize backend client: {e}")
+                logger.info("Continuing without backend client - audits will run but won't send results")
+                backend_client = None
+        else:
+            if api_base_url:
+                logger.warning(f"API_BASE_URL contains Railway service reference (must be hardcoded): {api_base_url}")
+            logger.info("No valid API_BASE_URL configured - running without backend client")
 
         # Import after Web3 check
         from scout.audit_orchestrator import create_audit_orchestrator

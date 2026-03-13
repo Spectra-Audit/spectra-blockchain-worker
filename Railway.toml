@@ -30,7 +30,12 @@ CONTRACT_ADDRESS = "0x..."  # Your featured contract address
 CHAIN_ID = "1"
 
 # Backend API Configuration
-API_BASE_URL = "https://spectra-api.up.railway.app"  # Railway backend URL
+# NOTE: Use hardcoded URL for Railway. Service references like {{service.RAILWAY_PUBLIC_URL}}
+# will NOT work because they aren't expanded at build time.
+# The blockchain worker calls the backend to send audit results.
+# For local testing, use http://localhost:8000
+# For Railway, use the actual backend URL or leave empty to run without backend integration
+API_BASE_URL = ""  # Set to actual backend URL or leave empty for standalone mode
 ADMIN_ACCESS_TOKEN = ""  # Set in Railway dashboard or via secret
 
 # Database & Caching
