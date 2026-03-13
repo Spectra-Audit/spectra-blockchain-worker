@@ -31,6 +31,7 @@ from .auth_wallet import load_or_create_admin_wallet
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
+from .rpc_manager import create_rpc_manager
 from .websocket_helpers import iter_websocket_messages
 from .websocket_provider_pool import WebSocketProviderHandle, WebSocketProviderPool
 
@@ -150,7 +151,27 @@ class FeaturedScout:
         self._ws_thread: Optional[threading.Thread] = None
         self._provider_lock = threading.Lock()
         self._web3: Optional[Web3] = None
-        self._rpc_urls = [url for url in config.rpc_http_urls if url]
+
+        # Feature flag for unified RPC manager with per-block failure tracking
+        self._use_unified_rpc = os.environ.get("USE_UNIFIED_RPC", "false").lower() == "true"
+
+        if self._use_unified_rpc:
+            # Use unified RPC manager with block-aware provider selection
+            self._rpc_manager = create_rpc_manager(
+                chain_id=config.chain_id or 1,
+                db_manager=database or DatabaseManager(config.db_path)
+            )
+            # Extract URLs from unified manager for backward compatibility
+            self._rpc_urls = [p.url for p in self._rpc_manager.providers.values()]
+            LOGGER.info(
+                f"Using unified RPC manager with {len(self._rpc_urls)} providers "
+                f"for chain {config.chain_id or 1}"
+            )
+        else:
+            # Legacy behavior: use configured RPC URLs
+            self._rpc_urls = [url for url in config.rpc_http_urls if url]
+            self._rpc_manager = None
+
         if not self._rpc_urls:
             raise ValueError("At least one RPC HTTP URL must be configured")
         if config.block_batch_size <= 0:
@@ -303,6 +324,38 @@ class FeaturedScout:
     def _ensure_provider(self) -> Optional[Web3]:
         with self._provider_lock:
             now = time.time()
+
+            # If using unified RPC manager, try block-aware selection first
+            if self._use_unified_rpc and self._rpc_manager:
+                try:
+                    # Get current block for intelligent selection
+                    current_block = 0
+                    if self._web3:
+                        try:
+                            current_block = self._web3.eth.block_number
+                        except Exception:
+                            pass
+
+                    # Get best provider for this block
+                    provider = self._rpc_manager.get_provider_for_block(
+                        block_number=current_block,
+                        method='eth_getLogs'
+                    )
+
+                    if provider and provider.url in self._rpc_urls:
+                        # Switch to better provider if needed
+                        new_index = self._rpc_urls.index(provider.url)
+                        if new_index != self._active_rpc_index:
+                            LOGGER.info(
+                                f"Switching RPC provider based on block {current_block}: "
+                                f"{self._rpc_urls[self._active_rpc_index]} -> {provider.url}"
+                            )
+                            self._activate_provider(new_index)
+
+                except Exception as e:
+                    LOGGER.debug(f"Block-aware provider selection failed: {e}, using legacy logic")
+
+            # Legacy provider selection logic
             if (
                 self._active_rpc_index is not None
                 and not self._needs_provider_reset

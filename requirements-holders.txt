@@ -1,0 +1,5 @@
+# Token holder API provider dependencies
+# Install with: pip install -r requirements-holders.txt
+aiohttp>=3.9.0
+httpx>=0.27.0
+apscheduler>=3.10.0

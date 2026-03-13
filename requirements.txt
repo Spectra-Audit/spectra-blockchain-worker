@@ -1,0 +1,20 @@
+# Core dependencies
+web3
+requests
+pytest
+
+# Optional dependencies for audit webhook server
+# Install with: pip install -r requirements-audit.txt
+fastapi
+uvicorn[standard]
+pydantic
+apscheduler
+
+# Token holder API providers (optional)
+# Install with: pip pip install -r requirements-holders.txt
+aiohttp
+httpx
+
+# Liquidity Analyzer (optional)
+# Uses aiohttp (already listed above) for DexScreener API
+# Enable with: ENABLE_LIQUIDITY_ANALYZER=true

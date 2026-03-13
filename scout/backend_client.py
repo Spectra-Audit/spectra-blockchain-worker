@@ -94,6 +94,79 @@ class BackendClient:
             should_retry=should_retry,
         )
 
+    def post(
+        self,
+        path: str,
+        *,
+        json: Optional[Dict[str, Any]] = None,
+        data: Optional[Any] = None,
+        timeout: Optional[float] = None,
+        headers: Optional[Dict[str, str]] = None,
+        raise_for_status: bool = True,
+        should_retry: Optional[Callable[[], bool]] = None,
+    ) -> Optional[Response]:
+        return self._request_with_retries(
+            "post",
+            path,
+            json=json,
+            data=data,
+            timeout=timeout,
+            headers=headers,
+            raise_for_status=raise_for_status,
+            should_retry=should_retry,
+        )
+
+    # ------------------------------------------------------------- audit helpers
+    def store_audit_results(
+        self,
+        project_id: str,
+        audit_data: Dict[str, Any],
+    ) -> bool:
+        """Store audit results for a project.
+
+        Args:
+            project_id: Project UUID
+            audit_data: Audit results dictionary
+
+        Returns:
+            True if successful, False otherwise
+        """
+        from datetime import datetime
+
+        endpoint = f"projects/{project_id}/audit-results"
+        payload = {
+            "audit_data": audit_data,
+            "completed_at": datetime.utcnow().isoformat(),
+        }
+
+        try:
+            response = self.patch(endpoint, json=payload)
+            if response and response.status_code == 200:
+                LOGGER.info(f"Stored audit results for project {project_id[:8]}...")
+                return True
+
+        except Exception as e:
+            LOGGER.error(f"Failed to store audit results for {project_id[:8]}...: {e}")
+
+        return False
+
+    def get_projects_for_update(self) -> list[Dict[str, Any]]:
+        """Get projects that need dynamic data updates.
+
+        Returns:
+            List of projects with token addresses
+        """
+        try:
+            response = self.get("/projects?needs_update=true")
+            if response and response.status_code == 200:
+                data = response.json()
+                return data.get("projects", [])
+
+        except Exception as e:
+            LOGGER.error(f"Failed to get projects for update: {e}")
+
+        return []
+
     def close(self) -> None:
         with self._lock:
             self._session.close()

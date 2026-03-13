@@ -35,6 +35,7 @@ from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
 from .featured_scout import resolve_ws_provider_class
+from .rpc_manager import create_rpc_manager
 from .websocket_helpers import iter_websocket_messages
 from .websocket_provider_pool import WebSocketProviderHandle, WebSocketProviderPool
 
@@ -164,6 +165,26 @@ class ProScout:
         self._rpc_fail_counts = [0 for _ in self.rpc_http_urls]
         self._rpc_backoff_until = [0.0 for _ in self.rpc_http_urls]
         self._needs_provider_reset = False
+
+        # Feature flag for unified RPC manager with per-block failure tracking
+        self._use_unified_rpc = os.environ.get("USE_UNIFIED_RPC", "false").lower() == "true"
+
+        if self._use_unified_rpc:
+            # Use unified RPC manager with block-aware provider selection
+            self._rpc_manager = create_rpc_manager(
+                chain_id=chain_id or 1,
+                db_manager=database or DatabaseManager(db_path)
+            )
+            # Extract URLs from unified manager for backward compatibility
+            self.rpc_http_urls = [p.url for p in self._rpc_manager.providers.values()]
+            self._rpc_fail_counts = [0 for _ in self.rpc_http_urls]
+            self._rpc_backoff_until = [0.0 for _ in self.rpc_http_urls]
+            self.logger.info(
+                f"Using unified RPC manager with {len(self.rpc_http_urls)} providers "
+                f"for chain {chain_id or 1}"
+            )
+        else:
+            self._rpc_manager = None
 
         self.event_handlers = {
             "StakeStarted": self._handle_stake_started,
@@ -736,6 +757,38 @@ class ProScout:
     def _ensure_provider(self) -> Optional[Web3]:
         with self._provider_lock:
             now = time.time()
+
+            # If using unified RPC manager, try block-aware selection first
+            if self._use_unified_rpc and self._rpc_manager:
+                try:
+                    # Get current block for intelligent selection
+                    current_block = 0
+                    if hasattr(self, 'web3') and self.web3:
+                        try:
+                            current_block = self.web3.eth.block_number
+                        except Exception:
+                            pass
+
+                    # Get best provider for this block
+                    provider = self._rpc_manager.get_provider_for_block(
+                        block_number=current_block,
+                        method='eth_getLogs'
+                    )
+
+                    if provider and provider.url in self.rpc_http_urls:
+                        # Switch to better provider if needed
+                        new_index = self.rpc_http_urls.index(provider.url)
+                        if new_index != self._active_rpc_index:
+                            self.logger.info(
+                                f"Switching RPC provider based on block {current_block}: "
+                                f"{self.rpc_http_urls[self._active_rpc_index]} -> {provider.url}"
+                            )
+                            self._activate_provider(new_index)
+
+                except Exception as e:
+                    self.logger.debug(f"Block-aware provider selection failed: {e}, using legacy logic")
+
+            # Legacy provider selection logic
             if (
                 self._active_rpc_index is not None
                 and not self._needs_provider_reset

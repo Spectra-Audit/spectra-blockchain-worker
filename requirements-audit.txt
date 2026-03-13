@@ -1,0 +1,6 @@
+# Audit webhook server dependencies
+# Install with: pip install -r requirements-audit.txt
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+apscheduler>=3.10.0
