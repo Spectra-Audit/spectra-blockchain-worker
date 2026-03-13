@@ -69,12 +69,20 @@ def main() -> int:
             from scout.siwe_authenticator import SiweAuthenticator
             from scout.auth_wallet import load_or_create_admin_wallet
 
+            # Set skip prompt for Railway (non-interactive)
+            os.environ["SCOUT_SKIP_WALLET_PROMPT"] = "1"
+
             admin_wallet = load_or_create_admin_wallet(database)
             authenticator = SiweAuthenticator(api_base_url, admin_wallet, database)
+
+            # Create token provider function for BackendClient
+            def token_provider(force_refresh: bool = False) -> tuple[str, str]:
+                """Get access and refresh tokens from authenticator."""
+                return authenticator.get_tokens()
+
             backend_client = BackendClient(
                 api_base_url,
-                authenticator,
-                database=database
+                token_provider=token_provider
             )
             logger.info(f"Backend client configured: {api_base_url}")
 

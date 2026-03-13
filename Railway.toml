@@ -42,6 +42,9 @@ REORG_CONF = "5"
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "json"
 
+# Non-interactive mode for Railway deployment
+SCOUT_SKIP_WALLET_PROMPT = "1"
+
 # Celery/Task Configuration (if using)
 CELERY_BROKER_URL = "redis://localhost:6379/0"
 CELERY_RESULT_BACKEND = "redis://localhost:6379/0"
