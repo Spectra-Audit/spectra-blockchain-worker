@@ -84,7 +84,7 @@ if HAS_FASTAPI:
         class Config:
             """Pydantic config."""
 
-            schema_extra = {
+            json_schema_extra = {
                 "example": {
                     "project_id": "550e8400-e29b-41d4-a716-446655440000",
                     "token_address": "0xdac17f958d2ee523a2206206994597c13d831ec7",

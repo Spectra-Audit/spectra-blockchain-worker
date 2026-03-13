@@ -93,8 +93,8 @@ def main() -> int:
                 backend_client = None
         else:
             if api_base_url:
-                logger.warning(f"API_BASE_URL contains Railway service reference (must be hardcoded): {api_base_url}")
-            logger.info("No valid API_BASE_URL configured - running without backend client")
+                logger.debug(f"API_BASE_URL contains Railway service reference, skipping: {api_base_url[:50]}...")
+            logger.info("Running without backend client - audits will respond via API only")
 
         # Import after Web3 check
         from scout.audit_orchestrator import create_audit_orchestrator
