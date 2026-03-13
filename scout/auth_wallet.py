@@ -66,6 +66,9 @@ def load_or_create_admin_wallet(database: DatabaseManager) -> AdminWallet:
         print("Ensure backend admin privileges are granted to this address.")
         input("Press Enter once backend access has been configured...")
     else:
+        # Log the wallet address prominently for Railway deployments
+        LOGGER.info(f"New admin wallet created: {checksum_address}")
+        LOGGER.info(f"Add this address to backend ADMIN_WALLETS: {checksum_address}")
         LOGGER.info(
             "Skipping admin wallet acknowledgement prompt", extra={"env": SKIP_PROMPT_ENV_VAR}
         )

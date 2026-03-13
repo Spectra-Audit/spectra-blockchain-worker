@@ -170,6 +170,41 @@ if HAS_FASTAPI:
             "version": "2.0.0",
         }
 
+    @app.get("/admin/wallet")
+    async def get_admin_wallet():
+        """Get the admin wallet address for this worker.
+
+        Returns the admin wallet address that should be added to the backend's
+        ADMIN_WALLETS environment variable for authentication.
+
+        Returns:
+            Admin wallet address or 404 if not configured
+        """
+        if not orchestrator:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Orchestrator not ready",
+            )
+
+        try:
+            from .auth_wallet import ADMIN_WALLET_ADDRESS_META
+            wallet_address = orchestrator.database.get_meta(ADMIN_WALLET_ADDRESS_META)
+            if not wallet_address:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Admin wallet not found in database",
+                )
+            return {
+                "address": wallet_address,
+                "message": f"Add this address to backend ADMIN_WALLETS: {wallet_address}"
+            }
+        except Exception as e:
+            LOGGER.error(f"Failed to get admin wallet: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to retrieve admin wallet: {str(e)}",
+            )
+
     @app.post(
         "/audit/trigger",
         response_model=Dict[str, str],
