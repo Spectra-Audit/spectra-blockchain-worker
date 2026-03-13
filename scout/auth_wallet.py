@@ -15,6 +15,8 @@ LOGGER = logging.getLogger(__name__)
 ADMIN_WALLET_PRIVATE_KEY_META = "admin_wallet_private_key"
 ADMIN_WALLET_ADDRESS_META = "admin_wallet_address"
 SKIP_PROMPT_ENV_VAR = "SCOUT_SKIP_WALLET_PROMPT"
+ADMIN_WALLET_ADDRESS_ENV = "ADMIN_WALLET_ADDRESS"
+ADMIN_WALLET_PRIVATE_KEY_ENV = "ADMIN_WALLET_PRIVATE_KEY"
 
 
 @dataclass(frozen=True)
@@ -45,15 +47,38 @@ def _load_wallet_from_meta(database: DatabaseManager) -> AdminWallet | None:
 def load_or_create_admin_wallet(database: DatabaseManager) -> AdminWallet:
     """Load the persisted admin wallet or create a new one.
 
+    Priority order:
+    1. Environment variables (ADMIN_WALLET_ADDRESS, ADMIN_WALLET_PRIVATE_KEY)
+    2. Database metadata (for persistence across restarts)
+    3. Generate new wallet (will log address for configuration)
+
     When creating a new wallet the operator is prompted to confirm that the
     backend has been configured with the generated address. Automated
     environments can skip the prompt by setting ``SCOUT_SKIP_WALLET_PROMPT``.
     """
 
+    # 1. Check environment variables first (for Railway deployments)
+    env_address = os.environ.get(ADMIN_WALLET_ADDRESS_ENV)
+    env_private_key = os.environ.get(ADMIN_WALLET_PRIVATE_KEY_ENV)
+
+    if env_address and env_private_key:
+        LOGGER.info(f"Using admin wallet from environment variables: {env_address}")
+        # Verify the private key matches the address
+        account = Account.from_key(env_private_key)
+        if account.address.lower() != env_address.lower():
+            raise ValueError(
+                f"Environment variable mismatch: ADMIN_WALLET_ADDRESS ({env_address}) "
+                f"does not match private key ({account.address})"
+            )
+        return AdminWallet(address=env_address, private_key=env_private_key)
+
+    # 2. Check database metadata
     wallet = _load_wallet_from_meta(database)
     if wallet is not None:
+        LOGGER.info(f"Using admin wallet from database: {wallet.address}")
         return wallet
 
+    # 3. Generate new wallet
     account = Account.create()
     private_key = account.key.hex()
     checksum_address = account.address

@@ -38,6 +38,13 @@ CHAIN_ID = "1"
 API_BASE_URL = ""  # Set to actual backend URL or leave empty for standalone mode
 ADMIN_ACCESS_TOKEN = ""  # Set in Railway dashboard or via secret
 
+# Admin Wallet Configuration
+# IMPORTANT: For Railway, generate a wallet once locally using:
+#   python generate_admin_wallet.py
+# Then add BOTH variables to Railway (mark private_key as SECRET):
+ADMIN_WALLET_ADDRESS = ""  # Add to backend ADMIN_WALLETS once generated
+ADMIN_WALLET_PRIVATE_KEY = ""  # Keep secret! Only needed in blockchain worker
+
 # Database & Caching
 DB_PATH = "/app/data/scout.db"
 POLL_INTERVAL_SEC = "12"
