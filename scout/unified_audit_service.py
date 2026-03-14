@@ -141,22 +141,23 @@ class UnifiedAuditService:
         self.w3 = w3
         self.backend_client = backend_client
 
-        # Initialize claude-code orchestrator (replaces GLM orchestrator)
+        # Initialize claude-code orchestrator (primary method for AI-powered audits)
         self.claude_orchestrator = claude_orchestrator or ClaudeCodeOrchestrator()
 
-        # Initialize scanners (without GLM orchestrator to avoid CLI argument issues)
-        # The BytecodeAbiScanner will use pattern matching only
+        # Initialize scanners (pattern matching for unverified contracts)
+        # The BytecodeAbiScanner uses bytecode fingerprints and ABI analysis
         self.bytecode_scanner = BytecodeAbiScanner(
             w3=w3,
-            glm_orchestrator=None,  # Disabled - using GLM API via contract_audit_scout instead
+            glm_orchestrator=None,  # Using ClaudeCodeOrchestrator instead
         )
 
         # Use existing ContractAuditScout for verified contracts
-        # This uses GLM API directly for code analysis
+        # Now uses ClaudeCodeOrchestrator for AI-powered audits via claude-code CLI
         self.contract_audit_scout = ContractAuditScout(
             database=database,
             w3=w3,
-            glm_orchestrator=None,  # Uses GLM API internally
+            glm_orchestrator=None,  # Deprecated - using claude_orchestrator instead
+            claude_orchestrator=self.claude_orchestrator,
             explorer_client=BlockExplorerClient(),
         )
 
@@ -272,64 +273,22 @@ class UnifiedAuditService:
         chain_id: int,
         force: bool,
     ) -> Dict[str, Any]:
-        """Audit a verified contract using source code."""
+        """Audit a verified contract using source code.
+
+        Uses ContractAuditScout which internally uses ClaudeCodeOrchestrator
+        for AI-powered security analysis via claude-code CLI.
+        """
         LOGGER.info(f"Auditing verified contract {token_address}")
 
-        # Use ContractAuditScout with unified GLM orchestrator
+        # Use ContractAuditScout with ClaudeCodeOrchestrator
+        # The claude-code CLI analysis is performed within ContractAuditScout
         contract_result = await self.contract_audit_scout.audit_contract(
             token_address=token_address,
             chain_id=chain_id,
             force=force,
         )
 
-        # If we need to run claude-code analysis, use claude orchestrator
-        if contract_result.is_verified and contract_result.ai_audit_enabled:
-            try:
-                # Get source code from cached result
-                source_info = await self.contract_audit_scout.explorer_client.get_source_code(
-                    token_address, chain_id
-                )
-                if source_info and source_info.get("source_code"):
-                    # Run claude-code CLI analysis with custom agents
-                    claude_findings = await self.claude_orchestrator.analyze_contract(
-                        contract_address=token_address,
-                        input_type="SOURCE_CODE",
-                        data=source_info["source_code"],
-                    )
-
-                    # Convert ClaudeAgentFinding to dict format
-                    for finding in claude_findings:
-                        contract_result.ai_audit_findings.append(finding.to_dict())
-
-                    # Recalculate score
-                    contract_result.overall_score = (
-                        self.contract_audit_scout._calculate_score(
-                            [self._dict_to_finding(f) for f in contract_result.ai_audit_findings],
-                            is_verified=True,
-                        )
-                    )
-                    contract_result.risk_level = (
-                        self.contract_audit_scout._determine_risk_level(
-                            contract_result.overall_score
-                        )
-                    )
-
-            except Exception as e:
-                LOGGER.error(f"Unified GLM analysis failed: {e}")
-
         return contract_result.to_dict()
-
-    def _dict_to_finding(self, d: Dict) -> Any:
-        """Convert dict back to AgentFinding for score calculation."""
-        from scout.contract_audit_scout import AgentFinding
-        return AgentFinding(
-            agent_name=d.get("agent_name", ""),
-            severity=d.get("severity", "info"),
-            category=d.get("category", ""),
-            description=d.get("description", ""),
-            location=d.get("location"),
-            recommendation=d.get("recommendation", ""),
-        )
 
     async def _audit_unverified_contract(
         self,

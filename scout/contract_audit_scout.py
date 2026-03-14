@@ -516,6 +516,9 @@ class ContractAuditScout:
     - First audit
     - Contract code change detected
     - Manual trigger
+
+    Uses ClaudeCodeOrchestrator for AI-powered audits via claude-code CLI.
+    Falls back to GLMAuditOrchestrator for direct API calls if needed.
     """
 
     def __init__(
@@ -523,6 +526,7 @@ class ContractAuditScout:
         database: Any,
         w3: Web3,
         glm_orchestrator: GLMAuditOrchestrator = None,
+        claude_orchestrator: "ClaudeCodeOrchestrator" = None,
         explorer_client: BlockExplorerClient = None,
     ):
         """Initialize the contract audit scout.
@@ -530,13 +534,23 @@ class ContractAuditScout:
         Args:
             database: Database manager instance
             w3: Web3 instance
-            glm_orchestrator: Optional GLM audit orchestrator
+            glm_orchestrator: Optional GLM audit orchestrator (deprecated, use claude_orchestrator)
+            claude_orchestrator: Optional Claude Code orchestrator for CLI-based audits
             explorer_client: Optional block explorer client
         """
         self.database = database
         self.w3 = w3
-        self.glm_orchestrator = glm_orchestrator or GLMAuditOrchestrator()
+        self.glm_orchestrator = glm_orchestrator  # Deprecated - kept for backward compatibility
+        self.claude_orchestrator = claude_orchestrator  # Preferred: use claude-code CLI
         self.explorer_client = explorer_client or BlockExplorerClient()
+
+        # Log which orchestrator is being used
+        if self.claude_orchestrator:
+            LOGGER.info("ContractAuditScout initialized with ClaudeCodeOrchestrator")
+        elif self.glm_orchestrator:
+            LOGGER.info("ContractAuditScout initialized with GLMAuditOrchestrator (deprecated)")
+        else:
+            LOGGER.warning("ContractAuditScout initialized without AI orchestrator")
 
     async def audit_contract(
         self,
@@ -672,11 +686,41 @@ class ContractAuditScout:
 
         # Run AI audit if source code is available
         if source_info and source_info.get("source_code"):
-            LOGGER.info(f"Running GLM-powered audit for {token_address}")
-            ai_findings = await self.glm_orchestrator.run_audit(
-                source_code=source_info["source_code"],
-                contract_address=token_address,
-            )
+            LOGGER.info(f"Running AI-powered audit for {token_address}")
+
+            # Use ClaudeCodeOrchestrator if available, otherwise fallback to GLMAuditOrchestrator
+            if self.claude_orchestrator:
+                # Use claude-code CLI for analysis
+                from scout.claude_orchestrator import ClaudeAgentFinding
+
+                claude_findings = await self.claude_orchestrator.analyze_contract(
+                    contract_address=token_address,
+                    input_type="SOURCE_CODE",
+                    data=source_info["source_code"],
+                )
+
+                # Convert ClaudeAgentFinding to AgentFinding format
+                ai_findings = [
+                    AgentFinding(
+                        agent_name=f.agent_name,
+                        severity=f.severity,
+                        category=f.category,
+                        description=f.description,
+                        location=f.location,
+                        recommendation=f.recommendation,
+                    )
+                    for f in claude_findings
+                ]
+            elif self.glm_orchestrator:
+                # Fallback to direct GLM API calls
+                LOGGER.warning("Using deprecated GLMAuditOrchestrator - consider using ClaudeCodeOrchestrator")
+                ai_findings = await self.glm_orchestrator.run_audit(
+                    source_code=source_info["source_code"],
+                    contract_address=token_address,
+                )
+            else:
+                LOGGER.warning("No AI orchestrator available - skipping AI audit")
+                ai_findings = []
 
             # Calculate score based on findings
             overall_score = self._calculate_score(ai_findings, is_verified=True)
