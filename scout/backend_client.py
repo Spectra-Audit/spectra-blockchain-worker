@@ -132,15 +132,22 @@ class BackendClient:
             True if successful, False otherwise
         """
         from datetime import datetime
+        import os
 
-        endpoint = f"projects/{project_id}/audit-results"
+        endpoint = f"admin/projects/{project_id}/audit-results"
         payload = {
             "audit_data": audit_data,
             "completed_at": datetime.utcnow().isoformat(),
         }
 
+        # Add internal API secret header for authentication
+        internal_secret = os.environ.get("INTERNAL_API_SECRET")
+        headers = {}
+        if internal_secret:
+            headers["X-Internal-Api-Secret"] = internal_secret
+
         try:
-            response = self.patch(endpoint, json=payload)
+            response = self.patch(endpoint, json=payload, headers=headers)
             if response and response.status_code == 200:
                 LOGGER.info(f"Stored audit results for project {project_id[:8]}...")
                 return True
