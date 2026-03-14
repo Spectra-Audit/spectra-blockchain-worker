@@ -599,9 +599,29 @@ class UnifiedAuditService:
         try:
             endpoint = f"/admin/projects/{result.project_id}/audit-results"
 
+            # Transform code_audit to match backend expectations
+            # Backend expects: "contract_audit" with "findings" array
+            contract_audit = result.code_audit.copy() if result.code_audit else {}
+
+            # Transform ai_audit_findings to findings format expected by backend
+            if "ai_audit_findings" in contract_audit:
+                findings = []
+                for finding in contract_audit["ai_audit_findings"]:
+                    findings.append({
+                        "severity": finding.get("severity", "info"),
+                        "type": finding.get("category", "Code Issue"),
+                        "category": finding.get("category", "Code Issue"),
+                        "code_location": finding.get("location", ""),
+                        "location": finding.get("location", ""),  # Also include for compatibility
+                        "description": finding.get("description", ""),
+                        "recommendation": finding.get("recommendation", ""),
+                        "agent_name": finding.get("agent_name", ""),
+                    })
+                contract_audit["findings"] = findings
+
             payload = {
                 "audit_data": {
-                    "code_audit": result.code_audit,
+                    "contract_audit": contract_audit,  # Backend expects "contract_audit" not "code_audit"
                     "distribution_metrics": result.distribution_metrics,
                     "liquidity_metrics": result.liquidity_metrics,
                     "tokenomics_metrics": result.tokenomics_metrics,
