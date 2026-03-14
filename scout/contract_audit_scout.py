@@ -28,6 +28,7 @@ Closed Source Penalty:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -625,8 +626,29 @@ class ContractAuditScout:
         Returns:
             SHA256 hash of contract bytecode
         """
-        code = self.w3.eth.get_code(Web3.to_checksum_address(token_address))
-        return hashlib.sha256(code).hexdigest()
+        checksum_address = Web3.to_checksum_address(token_address)
+
+        # Retry logic for RPC calls
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                code = self.w3.eth.get_code(checksum_address)
+                if code:
+                    return hashlib.sha256(code).hexdigest()
+                else:
+                    LOGGER.warning(f"No code found for {checksum_address}, attempt {attempt + 1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)  # Wait before retry
+            except Exception as e:
+                LOGGER.warning(f"RPC error getting code for {checksum_address}, attempt {attempt + 1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    # Final retry failed, return empty hash
+                    LOGGER.error(f"Failed to get code for {checksum_address} after {max_retries} attempts")
+                    return hashlib.sha256(b"").hexdigest()
+
+        return hashlib.sha256(b"").hexdigest()
 
     async def _analyze_contract(
         self,

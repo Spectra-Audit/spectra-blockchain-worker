@@ -261,9 +261,18 @@ class AuditOrchestrator:
 
             for (key, _), result in zip(tasks, completed):
                 if isinstance(result, Exception):
-                    LOGGER.error(f"Failed to collect {key}: {result}")
+                    # Check if it's a Web3 RPC error
+                    if hasattr(result, 'args') and result.args:
+                        error_dict = result.args[0] if isinstance(result.args[0], dict) else {}
+                        if 'code' in error_dict and error_dict['code'] == -32603:
+                            LOGGER.error(f"RPC error collecting {key}: {error_dict.get('message', 'Unknown error')}. This may be due to rate limiting or network issues.")
+                        else:
+                            LOGGER.error(f"Failed to collect {key}: {result}")
+                    else:
+                        LOGGER.error(f"Failed to collect {key}: {result}")
                     results[key] = {
                         "error": str(result),
+                        "error_type": type(result).__name__,
                         "collected_at": datetime.utcnow().isoformat(),
                     }
                 elif result:
@@ -557,9 +566,18 @@ class AuditOrchestrator:
 
             for (key, _), result in zip(tasks, completed):
                 if isinstance(result, Exception):
-                    LOGGER.error(f"Failed to collect {key}: {result}")
+                    # Check if it's a Web3 RPC error
+                    if hasattr(result, 'args') and result.args:
+                        error_dict = result.args[0] if isinstance(result.args[0], dict) else {}
+                        if 'code' in error_dict and error_dict['code'] == -32603:
+                            LOGGER.error(f"RPC error collecting {key}: {error_dict.get('message', 'Unknown error')}. This may be due to rate limiting or network issues.")
+                        else:
+                            LOGGER.error(f"Failed to collect {key}: {result}")
+                    else:
+                        LOGGER.error(f"Failed to collect {key}: {result}")
                     results[key] = {
                         "error": str(result),
+                        "error_type": type(result).__name__,
                         "collected_at": datetime.utcnow().isoformat(),
                     }
                 elif result:
