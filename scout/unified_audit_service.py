@@ -327,14 +327,18 @@ class UnifiedAuditService:
 
                     LOGGER.info(
                         f"Claude-code CLI analysis complete: {len(claude_findings)} findings, "
-                        f"new score: {contract_result.overall_score:.1f}"
+                        f"new score: {contract_result.overall_score:.1f}, "
+                        f"risk level: {contract_result.risk_level}"
                     )
 
             except Exception as e:
                 LOGGER.error(f"Claude-code CLI analysis failed: {e}")
                 # Continue with basic audit results
 
-        return contract_result.to_dict()
+        result_dict = contract_result.to_dict()
+        LOGGER.info(f"Audit result keys: {list(result_dict.keys())}")
+        LOGGER.info(f"Audit result overall_score: {result_dict.get('overall_score')}")
+        return result_dict
 
     def _dict_to_finding(self, d: Dict) -> Any:
         """Convert dict back to AgentFinding for score calculation.
@@ -590,6 +594,7 @@ class UnifiedAuditService:
     async def _store_result(self, result: UnifiedAuditResult) -> None:
         """Store unified audit result to backend."""
         import os
+        import json
 
         try:
             endpoint = f"/admin/projects/{result.project_id}/audit-results"
@@ -608,14 +613,18 @@ class UnifiedAuditService:
                 "completed_at": result.completed_at,
             }
 
+            # Debug logging to see what's being sent
+            LOGGER.debug(f"Sending audit results to backend: {json.dumps(payload, indent=2, default=str)[:1000]}")
+            LOGGER.info(f"Code audit score: {result.code_audit.get('overall_score') if result.code_audit else 'N/A'}")
+
             # Add internal API secret header for authentication
             internal_secret = os.environ.get("INTERNAL_API_SECRET")
             headers = {}
             if internal_secret:
                 headers["X-Internal-Api-Secret"] = internal_secret
 
-            self.backend_client.patch(endpoint, json=payload, headers=headers)
-            LOGGER.info(f"Stored unified audit result for {result.project_id}")
+            response = self.backend_client.patch(endpoint, json=payload, headers=headers)
+            LOGGER.info(f"Stored unified audit result for {result.project_id}, response: {response}")
 
         except Exception as e:
             LOGGER.error(f"Failed to store unified audit result: {e}")
