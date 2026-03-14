@@ -65,3 +65,7 @@ CELERY_RESULT_BACKEND = "redis://localhost:6379/0"
 CLAUDE_MODEL = "glm-4.7"
 CLAUDE_MAX_TOKENS = "4096"
 CLAUDE_TEMPERATURE = "0.1"
+
+# Etherscan API for fetching verified contract source code
+# Get your free API key from https://etherscan.io/myapikey
+ETHERSCAN_API_KEY = ""  # Set in Railway dashboard or via secret
