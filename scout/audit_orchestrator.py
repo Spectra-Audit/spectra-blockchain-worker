@@ -294,7 +294,7 @@ class AuditOrchestrator:
         Returns:
             True if successful, False otherwise
         """
-        endpoint = f"/projects/{project_id}/audit-results"
+        endpoint = f"/admin/projects/{project_id}/audit-results"
 
         payload = {
             "audit_data": results,

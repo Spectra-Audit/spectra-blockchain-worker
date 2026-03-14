@@ -568,7 +568,7 @@ class UnifiedAuditService:
     async def _store_result(self, result: UnifiedAuditResult) -> None:
         """Store unified audit result to backend."""
         try:
-            endpoint = f"/projects/{result.project_id}/audit-results"
+            endpoint = f"/admin/projects/{result.project_id}/audit-results"
 
             payload = {
                 "audit_data": {
