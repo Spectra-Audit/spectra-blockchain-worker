@@ -517,8 +517,9 @@ class ContractAuditScout:
     - Contract code change detected
     - Manual trigger
 
-    Uses ClaudeCodeOrchestrator for AI-powered audits via claude-code CLI.
-    Falls back to GLMAuditOrchestrator for direct API calls if needed.
+    This scout performs initial contract analysis and retrieves verified source code.
+    Comprehensive AI-powered analysis via claude-code CLI is handled by
+    UnifiedAuditService after the initial audit.
     """
 
     def __init__(
@@ -534,23 +535,17 @@ class ContractAuditScout:
         Args:
             database: Database manager instance
             w3: Web3 instance
-            glm_orchestrator: Optional GLM audit orchestrator (deprecated, use claude_orchestrator)
-            claude_orchestrator: Optional Claude Code orchestrator for CLI-based audits
+            glm_orchestrator: Optional GLM audit orchestrator (deprecated)
+            claude_orchestrator: Optional Claude Code orchestrator (NOT used internally,
+                handled by UnifiedAuditService for comprehensive analysis)
             explorer_client: Optional block explorer client
         """
         self.database = database
         self.w3 = w3
-        self.glm_orchestrator = glm_orchestrator  # Deprecated - kept for backward compatibility
-        self.claude_orchestrator = claude_orchestrator  # Preferred: use claude-code CLI
+        self.glm_orchestrator = glm_orchestrator
+        # Note: claude_orchestrator is NOT used internally in ContractAuditScout
+        # It's passed through for UnifiedAuditService to use after initial audit
         self.explorer_client = explorer_client or BlockExplorerClient()
-
-        # Log which orchestrator is being used
-        if self.claude_orchestrator:
-            LOGGER.info("ContractAuditScout initialized with ClaudeCodeOrchestrator")
-        elif self.glm_orchestrator:
-            LOGGER.info("ContractAuditScout initialized with GLMAuditOrchestrator (deprecated)")
-        else:
-            LOGGER.warning("ContractAuditScout initialized without AI orchestrator")
 
     async def audit_contract(
         self,
@@ -681,56 +676,28 @@ class ContractAuditScout:
         is_verified = source_info is not None
 
         ai_findings = []
+        ai_audit_enabled = False  # Will be set to True if source code is available
         overall_score = 50.0  # Base score
         risk_level = "medium"
 
         # Run AI audit if source code is available
+        # Note: Comprehensive AI analysis via claude-code CLI is handled by
+        # UnifiedAuditService after this initial audit completes.
         if source_info and source_info.get("source_code"):
-            LOGGER.info(f"Running AI-powered audit for {token_address}")
+            LOGGER.info(f"Source code available for {token_address} - AI audit will be run by UnifiedAuditService")
 
-            # Use ClaudeCodeOrchestrator if available, otherwise fallback to GLMAuditOrchestrator
-            if self.claude_orchestrator:
-                # Use claude-code CLI for analysis
-                from scout.claude_orchestrator import ClaudeAgentFinding
+            # Set AI audit as enabled so UnifiedAuditService knows to run claude-code CLI
+            ai_audit_enabled = True
 
-                claude_findings = await self.claude_orchestrator.analyze_contract(
-                    contract_address=token_address,
-                    input_type="SOURCE_CODE",
-                    data=source_info["source_code"],
-                )
-
-                # Convert ClaudeAgentFinding to AgentFinding format
-                ai_findings = [
-                    AgentFinding(
-                        agent_name=f.agent_name,
-                        severity=f.severity,
-                        category=f.category,
-                        description=f.description,
-                        location=f.location,
-                        recommendation=f.recommendation,
-                    )
-                    for f in claude_findings
-                ]
-            elif self.glm_orchestrator:
-                # Fallback to direct GLM API calls
-                LOGGER.warning("Using deprecated GLMAuditOrchestrator - consider using ClaudeCodeOrchestrator")
-                ai_findings = await self.glm_orchestrator.run_audit(
-                    source_code=source_info["source_code"],
-                    contract_address=token_address,
-                )
-            else:
-                LOGGER.warning("No AI orchestrator available - skipping AI audit")
-                ai_findings = []
-
-            # Calculate score based on findings
-            overall_score = self._calculate_score(ai_findings, is_verified=True)
-            risk_level = self._determine_risk_level(overall_score)
-
-            flags.extend([f"ai_findings_count:{len(ai_findings)}"])
+            # No findings here - UnifiedAuditService will populate them
+            ai_findings = []
+            overall_score = 50.0  # Base score, will be recalculated after claude-code analysis
+            risk_level = "medium"
 
         else:
             # CLOSED SOURCE PENALTY: -30 points for contracts without verified source code
             # This is a significant security risk as code cannot be independently audited
+            ai_audit_enabled = False
             flags.append("source_not_verified")
             flags.append("closed_source_penalty:-30")
             overall_score = 20.0  # Low base score for closed-source contracts
@@ -747,7 +714,7 @@ class ContractAuditScout:
             optimization_runs=source_info.get("optimization_runs") if source_info else None,
             contract_size=contract_size,
             libraries_used=source_info.get("library", "").split(",") if source_info and source_info.get("library") else [],
-            ai_audit_enabled=is_verified and source_info is not None,
+            ai_audit_enabled=ai_audit_enabled,  # Set by the if/else block above
             ai_audit_findings=[f.to_dict() for f in ai_findings],
             overall_score=overall_score,
             risk_level=risk_level,

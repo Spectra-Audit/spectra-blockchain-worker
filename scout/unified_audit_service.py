@@ -275,20 +275,82 @@ class UnifiedAuditService:
     ) -> Dict[str, Any]:
         """Audit a verified contract using source code.
 
-        Uses ContractAuditScout which internally uses ClaudeCodeOrchestrator
-        for AI-powered security analysis via claude-code CLI.
+        Process:
+        1. Run ContractAuditScout for basic audit (may include some AI analysis)
+        2. If verified, run ClaudeCodeOrchestrator for comprehensive claude-code CLI analysis
+        3. Combine findings and recalculate score
+        4. Return legible, structured results for frontend
         """
         LOGGER.info(f"Auditing verified contract {token_address}")
 
-        # Use ContractAuditScout with ClaudeCodeOrchestrator
-        # The claude-code CLI analysis is performed within ContractAuditScout
+        # Step 1: Run ContractAuditScout for initial audit
         contract_result = await self.contract_audit_scout.audit_contract(
             token_address=token_address,
             chain_id=chain_id,
             force=force,
         )
 
+        # Step 2: If verified, run comprehensive claude-code CLI analysis
+        if contract_result.is_verified and contract_result.ai_audit_enabled:
+            try:
+                # Get source code for claude-code analysis
+                source_info = await self.contract_audit_scout.explorer_client.get_source_code(
+                    token_address, chain_id
+                )
+                if source_info and source_info.get("source_code"):
+                    LOGGER.info(f"Running claude-code CLI analysis for {token_address}")
+
+                    # Run claude-code CLI with custom security agents
+                    claude_findings = await self.claude_orchestrator.analyze_contract(
+                        contract_address=token_address,
+                        input_type="SOURCE_CODE",
+                        data=source_info["source_code"],
+                    )
+
+                    # Step 3: Convert and merge claude findings with existing findings
+                    # Convert ClaudeAgentFinding to dict format for frontend
+                    for finding in claude_findings:
+                        contract_result.ai_audit_findings.append(finding.to_dict())
+
+                    # Recalculate score with combined findings
+                    contract_result.overall_score = (
+                        self.contract_audit_scout._calculate_score(
+                            [self._dict_to_finding(f) for f in contract_result.ai_audit_findings],
+                            is_verified=True,
+                        )
+                    )
+                    contract_result.risk_level = (
+                        self.contract_audit_scout._determine_risk_level(
+                            contract_result.overall_score
+                        )
+                    )
+
+                    LOGGER.info(
+                        f"Claude-code CLI analysis complete: {len(claude_findings)} findings, "
+                        f"new score: {contract_result.overall_score:.1f}"
+                    )
+
+            except Exception as e:
+                LOGGER.error(f"Claude-code CLI analysis failed: {e}")
+                # Continue with basic audit results
+
         return contract_result.to_dict()
+
+    def _dict_to_finding(self, d: Dict) -> Any:
+        """Convert dict back to AgentFinding for score calculation.
+
+        The frontend expects findings in dict format, but score calculation
+        requires AgentFinding objects. This method converts between formats.
+        """
+        from scout.contract_audit_scout import AgentFinding
+        return AgentFinding(
+            agent_name=d.get("agent_name", ""),
+            severity=d.get("severity", "info"),
+            category=d.get("category", ""),
+            description=d.get("description", ""),
+            location=d.get("location"),
+            recommendation=d.get("recommendation", ""),
+        )
 
     async def _audit_unverified_contract(
         self,
