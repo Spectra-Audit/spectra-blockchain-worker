@@ -313,7 +313,7 @@ Only return the JSON array, no other text."""
                 input=prompt,
                 capture_output=True,
                 text=True,
-                timeout=120,  # 2 minute timeout
+                timeout=180,  # 3 minute timeout for large contracts
                 env=os.environ | {
                     "ANTHROPIC_AUTH_TOKEN": os.getenv("GLM_API_KEY", os.getenv("ANTHROPIC_AUTH_TOKEN", "")),
                     "ANTHROPIC_BASE_URL": os.getenv("GLM_API_URL", os.getenv("ANTHROPIC_BASE_URL", "")),
