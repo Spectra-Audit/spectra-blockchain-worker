@@ -385,13 +385,13 @@ Only return the JSON array, no other text."""
 class BlockExplorerClient:
     """Fetches verified source code from Etherscan API.
 
-    Uses the unified Etherscan API endpoint that supports multiple chains.
-    Documentation: https://docs.etherscan.io/llms.txt
+    Uses the Etherscan API V2 endpoint that supports multiple chains.
+    Documentation: https://docs.etherscan.io/v2-migration
 
     Note: Only calls the API once per contract to avoid rate limits.
     """
 
-    ETHERSCAN_API_URL = "https://api.etherscan.io/api"
+    ETHERSCAN_API_URL = "https://api.etherscan.io/v2/api"
 
     def __init__(self, api_key: str = None):
         self.api_key = api_key or os.environ.get("ETHERSCAN_API_KEY")
