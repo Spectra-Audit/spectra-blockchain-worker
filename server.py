@@ -99,6 +99,18 @@ def main() -> int:
         # Import after Web3 check
         from scout.audit_orchestrator import create_audit_orchestrator
         from scout.unified_api import set_orchestrator, run_unified_api
+        from scout.unified_audit_service import create_unified_audit_service
+
+        # Create unified audit service for code audits
+        logger.info("Creating unified audit service...")
+        unified_audit_service = create_unified_audit_service(
+            database=database,
+            w3=w3,
+            backend_client=backend_client,
+            token_holder_scout=None,
+            liquidity_analyzer_scout=None,
+            tokenomics_analyzer_scout=None,
+        )
 
         # Create audit orchestrator with unified audit service
         # We only need the contract audit capability for Railway
@@ -107,11 +119,10 @@ def main() -> int:
             database=database,
             backend_client=backend_client,
             w3=w3,
-            # We only need unified_audit for code audits
             token_holder_scout=None,  # Not needed for triggered audits
             tokenomics_analyzer_scout=None,
             liquidity_analyzer_scout=None,
-            unified_audit_service="auto",  # Auto-create with ClaudeCodeOrchestrator
+            unified_audit_service=unified_audit_service,
         )
 
         # Register with unified API
