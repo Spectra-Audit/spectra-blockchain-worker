@@ -256,44 +256,61 @@ Only return the JSON array, no other text."""
                 continue
 
             try:
-                findings = await self._run_agent(agent_name, code)
+                findings = await self._run_agent(agent_name, code, input_type)
                 all_findings.extend(findings)
             except Exception as e:
                 LOGGER.error(f"Error running agent '{agent_name}': {e}")
 
         return all_findings
 
-    async def _run_agent(self, agent_name: str, code: str) -> List[ClaudeAgentFinding]:
-        """Run a single agent using claude-code CLI.
+    async def _run_agent(self, agent_name: str, code: str, input_type: str = "SOURCE_CODE") -> List[ClaudeAgentFinding]:
+        """Run a single agent using claude-code CLI with file-based input.
+
+        The source code is written to a temporary file to avoid "Argument list too long"
+        errors when analyzing large contracts.
 
         Args:
             agent_name: Name of the agent to run
-            code: Solidity code to analyze
+            code: Solidity code or bytecode context to analyze
+            input_type: "SOURCE_CODE" or "BYTECODE_ABI"
 
         Returns:
             List of findings from this agent
         """
+        import tempfile
+
         agent_config = self.agents_config[agent_name]
-        prompt = agent_config["prompt"].format(code=code)
 
-        # Build claude-code CLI command
-        cmd = [
-            self.claude_path,
-            "--print",  # Non-interactive mode
-            "--agent", agent_name,
-            "--agents", json.dumps({agent_name: agent_config}),
-            "--output-format", "json",
-            "--permission-mode", "bypassPermissions",
-            "--model", os.getenv("GLM_MODEL", "glm-4.7"),
-            prompt
-        ]
-
-        LOGGER.debug(f"Running claude-code CLI for agent: {agent_name}")
+        # Create temporary file for the code
+        # Use .sol extension for source code, .txt for bytecode/ABI
+        suffix = '.sol' if input_type == "SOURCE_CODE" else '.txt'
+        with tempfile.NamedTemporaryFile(mode='w', suffix=suffix, delete=False) as f:
+            f.write(code)
+            temp_file_path = f.name
 
         try:
-            # Run claude-code CLI
+            # Format prompt with file path reference instead of full code
+            # This keeps the prompt short while providing code via file
+            prompt = agent_config["prompt"].format(
+                code=f"See file: {temp_file_path}",
+                file=temp_file_path
+            )
+
+            # Build claude-code CLI command
+            # Pass the file path as an argument, prompt via stdin
+            cmd = [
+                self.claude_path,
+                "--print",  # Non-interactive mode
+                "--model", os.getenv("GLM_MODEL", "glm-4.7"),
+                temp_file_path,  # Pass file path as argument
+            ]
+
+            LOGGER.debug(f"Running claude-code CLI for agent: {agent_name} with file: {temp_file_path}")
+
+            # Run claude-code CLI with prompt via stdin
             result = subprocess.run(
                 cmd,
+                input=prompt,
                 capture_output=True,
                 text=True,
                 timeout=120,  # 2 minute timeout
@@ -312,6 +329,12 @@ Only return the JSON array, no other text."""
         except Exception as e:
             LOGGER.error(f"Error running agent '{agent_name}': {e}")
             return []
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                LOGGER.debug(f"Failed to delete temp file {temp_file_path}: {e}")
 
     def _parse_claude_output(self, output: str, agent_name: str) -> List[ClaudeAgentFinding]:
         """Parse claude-code CLI output into findings.

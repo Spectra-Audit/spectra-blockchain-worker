@@ -28,9 +28,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 LOGGER = logging.getLogger(__name__)
 
 # GLM API Configuration
+# Note: Use the OpenAI-compatible endpoint for chat completions format
 GLM_API_KEY = os.environ.get("GLM_API_KEY")
 GLM_API_URL = os.environ.get(
-    "GLM_API_URL", "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    "GLM_API_URL", "https://api.z.ai/v1/chat/completions"
 )
 
 
