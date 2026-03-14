@@ -307,10 +307,44 @@ class AuditOrchestrator:
 
         endpoint = f"/admin/projects/{project_id}/audit-results"
 
+        # Transform results to match backend expectations
+        # Backend expects "contract_audit" not "code_audit"
+        # Backend expects "findings" array in a specific format
+        formatted_results = {}
+
+        for key, value in results.items():
+            if key == "code_audit" and isinstance(value, dict):
+                # Rename code_audit to contract_audit for backend compatibility
+                formatted_results["contract_audit"] = value
+
+                # Also transform ai_audit_findings to findings format if present
+                if "ai_audit_findings" in value:
+                    findings = []
+                    for finding in value["ai_audit_findings"]:
+                        if isinstance(finding, dict):
+                            findings.append({
+                                "severity": finding.get("severity", "info"),
+                                "type": finding.get("category", "Code Issue"),
+                                "category": finding.get("category", "Code Issue"),
+                                "code_location": finding.get("location", ""),
+                                "location": finding.get("location", ""),
+                                "description": finding.get("description", ""),
+                                "recommendation": finding.get("recommendation", ""),
+                                "agent_name": finding.get("agent_name", ""),
+                            })
+                    formatted_results["contract_audit"]["findings"] = findings
+            else:
+                formatted_results[key] = value
+
         payload = {
-            "audit_data": results,
+            "audit_data": formatted_results,
             "completed_at": datetime.utcnow().isoformat(),
         }
+
+        # Debug logging
+        LOGGER.info(f"Sending audit results to backend: project_id={project_id[:8]}..., "
+                    f"keys={list(formatted_results.keys())}, "
+                    f"contract_audit_score={formatted_results.get('contract_audit', {}).get('overall_score', 'N/A')}")
 
         # Add internal API secret header for authentication
         internal_secret = os.environ.get("INTERNAL_API_SECRET")
@@ -329,6 +363,7 @@ class AuditOrchestrator:
 
                 # Check response status
                 if hasattr(response, "status_code"):
+                    LOGGER.info(f"Backend response status: {response.status_code}")
                     return response.status_code == 200
                 return True
 
@@ -341,6 +376,7 @@ class AuditOrchestrator:
                 )
 
                 if hasattr(response, "status_code"):
+                    LOGGER.info(f"Backend response status: {response.status_code}")
                     return response.status_code == 200
                 return True
 
