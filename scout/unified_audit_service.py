@@ -147,7 +147,7 @@ class UnifiedAuditService:
         # Initialize scanners
         self.bytecode_scanner = BytecodeAbiScanner(
             w3=w3,
-            claude_orchestrator=self.claude_orchestrator,
+            glm_orchestrator=self.claude_orchestrator,
         )
 
         # Use existing ContractAuditScout for verified contracts
