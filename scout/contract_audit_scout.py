@@ -320,6 +320,10 @@ Only return the JSON array, no other text."""
                 # OpenAI format: {"choices": [{"message": {"content": "..."}}]}
                 # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
 
+                # Debug logging
+                if "code" in data and data.get("code") != 0:
+                    LOGGER.error(f"GLM API error response: URL={GLM_API_URL}, response={data}")
+
                 if "code" in data:
                     # Zhipu GLM format
                     if data.get("code") == 0 and "data" in data:
