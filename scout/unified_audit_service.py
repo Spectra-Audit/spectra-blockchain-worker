@@ -593,7 +593,7 @@ class UnifiedAuditService:
             if internal_secret:
                 headers["X-Internal-Api-Secret"] = internal_secret
 
-            await self.backend_client.patch(endpoint, json=payload, headers=headers)
+            self.backend_client.patch(endpoint, json=payload, headers=headers)
             LOGGER.info(f"Stored unified audit result for {result.project_id}")
 
         except Exception as e:

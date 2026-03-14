@@ -308,14 +308,28 @@ Only return the JSON array, no other text."""
                 )
 
                 if response.status_code != 200:
+                    # Log the actual response for debugging
+                    LOGGER.warning(f"GLM API returned status {response.status_code}: {response.text[:200]}")
                     raise Exception(f"GLM API error: {response.status_code}")
 
                 data = response.json()
 
                 # Handle different API response formats
-                # OpenAI format: data["choices"][0]["message"]["content"]
-                # Anthropic format: data["content"][0]["text"]
-                if "choices" in data:
+                # Zhipu GLM format: {"code": 0, "data": {"choices": [...]}}
+                # OpenAI format: {"choices": [{"message": {"content": "..."}}]}
+                # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
+
+                if "code" in data:
+                    # Zhipu GLM format
+                    if data.get("code") == 0 and "data" in data:
+                        inner_data = data["data"]
+                        if "choices" in inner_data:
+                            content = inner_data["choices"][0]["message"]["content"]
+                        else:
+                            raise Exception(f"Unexpected Zhipu API response: {list(inner_data.keys())}")
+                    else:
+                        raise Exception(f"GLM API error: {data.get('msg', 'Unknown error')}")
+                elif "choices" in data:
                     # OpenAI-compatible format
                     content = data["choices"][0]["message"]["content"]
                 elif "content" in data and isinstance(data["content"], list):

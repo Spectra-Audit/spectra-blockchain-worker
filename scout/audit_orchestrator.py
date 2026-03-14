@@ -312,7 +312,7 @@ class AuditOrchestrator:
         try:
             # Use the backend client's PATCH method
             if hasattr(self.backend_client, "patch"):
-                response = await self.backend_client.patch(
+                response = self.backend_client.patch(
                     endpoint,
                     json=payload,
                     headers=headers,
@@ -325,7 +325,7 @@ class AuditOrchestrator:
 
             # Fallback: try POST method
             elif hasattr(self.backend_client, "post"):
-                response = await self.backend_client.post(
+                response = self.backend_client.post(
                     endpoint,
                     json=payload,
                     headers=headers,
