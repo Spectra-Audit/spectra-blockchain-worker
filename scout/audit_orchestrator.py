@@ -294,6 +294,8 @@ class AuditOrchestrator:
         Returns:
             True if successful, False otherwise
         """
+        import os
+
         endpoint = f"/admin/projects/{project_id}/audit-results"
 
         payload = {
@@ -301,12 +303,19 @@ class AuditOrchestrator:
             "completed_at": datetime.utcnow().isoformat(),
         }
 
+        # Add internal API secret header for authentication
+        internal_secret = os.environ.get("INTERNAL_API_SECRET")
+        headers = {}
+        if internal_secret:
+            headers["X-Internal-Api-Secret"] = internal_secret
+
         try:
             # Use the backend client's PATCH method
             if hasattr(self.backend_client, "patch"):
                 response = await self.backend_client.patch(
                     endpoint,
                     json=payload,
+                    headers=headers,
                 )
 
                 # Check response status
@@ -319,6 +328,7 @@ class AuditOrchestrator:
                 response = await self.backend_client.post(
                     endpoint,
                     json=payload,
+                    headers=headers,
                 )
 
                 if hasattr(response, "status_code"):

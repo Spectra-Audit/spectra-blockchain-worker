@@ -144,18 +144,19 @@ class UnifiedAuditService:
         # Initialize claude-code orchestrator (replaces GLM orchestrator)
         self.claude_orchestrator = claude_orchestrator or ClaudeCodeOrchestrator()
 
-        # Initialize scanners
+        # Initialize scanners (without GLM orchestrator to avoid CLI argument issues)
+        # The BytecodeAbiScanner will use pattern matching only
         self.bytecode_scanner = BytecodeAbiScanner(
             w3=w3,
-            glm_orchestrator=self.claude_orchestrator,
+            glm_orchestrator=None,  # Disabled - using GLM API via contract_audit_scout instead
         )
 
         # Use existing ContractAuditScout for verified contracts
-        # But with our claude-code orchestrator
+        # This uses GLM API directly for code analysis
         self.contract_audit_scout = ContractAuditScout(
             database=database,
             w3=w3,
-            glm_orchestrator=None,  # We'll use claude orchestrator instead
+            glm_orchestrator=None,  # Uses GLM API internally
             explorer_client=BlockExplorerClient(),
         )
 
@@ -567,6 +568,8 @@ class UnifiedAuditService:
 
     async def _store_result(self, result: UnifiedAuditResult) -> None:
         """Store unified audit result to backend."""
+        import os
+
         try:
             endpoint = f"/admin/projects/{result.project_id}/audit-results"
 
@@ -584,7 +587,13 @@ class UnifiedAuditService:
                 "completed_at": result.completed_at,
             }
 
-            await self.backend_client.patch(endpoint, json=payload)
+            # Add internal API secret header for authentication
+            internal_secret = os.environ.get("INTERNAL_API_SECRET")
+            headers = {}
+            if internal_secret:
+                headers["X-Internal-Api-Secret"] = internal_secret
+
+            await self.backend_client.patch(endpoint, json=payload, headers=headers)
             LOGGER.info(f"Stored unified audit result for {result.project_id}")
 
         except Exception as e:

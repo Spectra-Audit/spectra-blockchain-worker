@@ -311,7 +311,19 @@ Only return the JSON array, no other text."""
                     raise Exception(f"GLM API error: {response.status_code}")
 
                 data = response.json()
-                content = data["choices"][0]["message"]["content"]
+
+                # Handle different API response formats
+                # OpenAI format: data["choices"][0]["message"]["content"]
+                # Anthropic format: data["content"][0]["text"]
+                if "choices" in data:
+                    # OpenAI-compatible format
+                    content = data["choices"][0]["message"]["content"]
+                elif "content" in data and isinstance(data["content"], list):
+                    # Anthropic format
+                    text_blocks = [block.get("text", "") for block in data["content"] if block.get("type") == "text"]
+                    content = "\n".join(text_blocks)
+                else:
+                    raise Exception(f"Unexpected API response format: {list(data.keys())}")
 
                 # Try to parse JSON response
                 try:
