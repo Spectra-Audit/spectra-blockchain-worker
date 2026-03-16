@@ -123,21 +123,44 @@ class ClaudeCodeOrchestrator:
                 "description": "Detects reentrancy vulnerabilities in smart contracts",
                 "prompt": """You are a smart contract security expert specializing in reentrancy attacks.
 
-Analyze the following Solidity code for reentrancy vulnerabilities:
+Analyze the following Solidity code for reentrancy vulnerabilities.
+
+IMPORTANT: Focus on ACTUAL EXPLOITABILITY. Check the logic flow to determine if there's a real path to fund loss.
 
 {code}
 
 SEVERITY GUIDELINES - Use these criteria when assigning severity:
-- CRITICAL: Direct external call to user-supplied address before state changes, with clear exploit path
-- HIGH: External call pattern exists but checks-effects-interactions pattern is broken or missing
-- MEDIUM: Potential reentrancy in complex logic or indirect external calls
-- LOW: Minor reentrancy concerns in non-critical functions or with mitigating factors
-- INFO: Best practice suggestions or theoretical concerns
+
+CRITICAL - Direct fund loss requiring immediate fix before deployment:
+- External call to user-controlled address BEFORE state update (e.g., balance deduction)
+- State update happens AFTER external call returns
+- Attacker can recursively call to drain funds/tokens
+- Clear exploit path: attacker can call back before state changes complete
+
+HIGH - Potential for significant financial loss, must fix before deployment:
+- External call pattern that could be exploited with specific conditions
+- Missing or broken checks-effects-interactions pattern in fund-transfer functions
+- Low-level calls (call, delegatecall) without proper reentrancy guards
+
+MEDIUM - Limited fund exposure or minor logical flaws, strongly recommended to fix:
+- Potential reentrancy in non-critical functions with limited impact
+- External calls in complex logic where exploit path is unclear
+- Missing reentrancy guards in functions that don't directly handle funds
+
+LOW - Minor issues with minimal risk, consider fixing:
+- Theoretical reentrancy concerns with mitigating factors
+- Non-external calls that could be made safer
+- Best practice improvements for reentrancy prevention
+
+INFORMATIONAL - Best practices or code quality improvements, optional:
+- Using OpenZeppelin's ReentrancyGuard (recommendation, not a finding)
+- Comments explaining reentrancy safety
+- General code quality improvements
 
 CONFIDENCE GUIDELINES:
-- high: Certain this is a vulnerability with clear exploit scenario
-- medium: Likely a vulnerability but exploit path may be complex
-- low: Possible concern but might not be exploitable
+- high: Certain this is exploitable with clear fund loss scenario
+- medium: Likely exploitable but specific conditions may be required
+- low: Theoretical concern but exploit path may not exist in practice
 
 Return a JSON array of findings with this structure:
 [
@@ -151,28 +174,53 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
-IMPORTANT: Be conservative with severity. Only mark as CRITICAL if you're certain there's an exploitable vulnerability.
+CRITICAL: Only mark as CRITICAL if you can trace the exact exploit path that leads to fund loss.
+Do NOT flag patterns that are protected by checks-effects-interactions or mutex locks.
 Only return the JSON array, no other text."""
             },
             "access-control": {
                 "description": "Analyzes access control and permission issues",
                 "prompt": """You are a smart contract security expert specializing in access control.
 
-Analyze the following Solidity code for access control vulnerabilities:
+Analyze the following Solidity code for access control vulnerabilities.
+
+IMPORTANT: Focus on ACTUAL EXPLOITABILITY. Check if missing access control leads to fund loss or critical function abuse.
 
 {code}
 
 SEVERITY GUIDELINES - Use these criteria when assigning severity:
-- CRITICAL: Anyone can call critical functions (mint, burn, pause, withdraw) with no access control
-- HIGH: Only owner/admin can access but missing proper events or upgradeability mechanism; centralization risks in critical functions
-- MEDIUM: Missing role-based access control where it would be appropriate; function visibility issues
-- LOW: Minor access control improvements or overly restrictive permissions
-- INFO: Best practice suggestions for access control design
+
+CRITICAL - Direct fund loss requiring immediate fix before deployment:
+- Anyone can call critical functions: withdraw, mint, burn, pause, transferOwnership
+- Missing onlyOwner/onlyRole modifier on fund-handling functions
+- Public functions that should be private/protected (e.g., emergencyWithdraw with no auth)
+- Clear path for attacker to steal funds or tokens
+
+HIGH - Potential for significant financial loss, must fix before deployment:
+- Critical functions (affecting funds/ownership) accessible to unintended users
+- Missing role-based access control where needed for fund operations
+- Centralization risk: single point of failure in critical functions
+- Functions that can be called to break protocol invariants
+
+MEDIUM - Limited fund exposure or minor logical flaws, strongly recommended to fix:
+- Inappropriate function visibility (public instead of internal/external)
+- Missing access control on non-critical but important functions
+- Weak access control patterns that could be improved
+
+LOW - Minor issues with minimal risk, consider fixing:
+- Missing events for sensitive state changes
+- Overly restrictive permissions that limit functionality
+- Minor access control improvements
+
+INFORMATIONAL - Best practices or code quality improvements, optional:
+- Suggesting use of AccessControl for role management
+- Recommendations for multisig or DAO governance
+- General access control design improvements
 
 CONFIDENCE GUIDELINES:
-- high: Certain this is a vulnerability with clear exploit scenario
-- medium: Likely a vulnerability but impact may be limited
-- low: Possible concern or design consideration
+- high: Certain this is exploitable to cause fund loss or protocol takeover
+- medium: Likely exploitable but specific conditions or privileged user required
+- low: Possible concern but impact may be limited or theoretical
 
 Return a JSON array of findings with this structure:
 [
@@ -186,30 +234,56 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
-IMPORTANT: Be conservative with severity. Only mark as CRITICAL for clearly exploitable missing access control.
+CRITICAL: Only mark as CRITICAL if missing access control directly enables fund theft.
+Do NOT flag missing events or design suggestions as CRITICAL.
 Only return the JSON array, no other text."""
             },
             "arithmetic-safety": {
                 "description": "Detects arithmetic overflow/underflow issues",
                 "prompt": """You are a smart contract security expert specializing in arithmetic safety.
 
-Analyze the following Solidity code for arithmetic issues:
+Analyze the following Solidity code for arithmetic issues.
+
+IMPORTANT: Focus on ACTUAL EXPLOITABILITY. Check if arithmetic errors can lead to fund loss or state manipulation.
 
 {code}
 
 SEVERITY GUIDELINES - Use these criteria when assigning severity:
-- CRITICAL: Unprotected arithmetic operation on user input that could overflow/underflow and affect critical state (balances, totals, etc.)
-- HIGH: Arithmetic on user input without SafeMath or built-in overflow protection in Solidity <0.8
-- MEDIUM: Arithmetic operations that could theoretically overflow but have practical constraints
-- LOW: Minor arithmetic concerns or missing explicit checks where impact is limited
-- INFO: Best practice suggestions for arithmetic safety
 
-NOTE: Solidity 0.8+ has built-in overflow protection for arithmetic operations. Only flag as HIGH/CRITICAL if custom arithmetic or pre-0.8 patterns are used.
+CRITICAL - Direct fund loss requiring immediate fix before deployment:
+- Unchecked arithmetic on user input that affects balances/totals (Solidity <0.8 or unchecked blocks)
+- Overflow/underflow that can be exploited to mint unlimited tokens or steal funds
+- Wrap-around that allows bypassing critical checks (e.g., balance checks)
+
+HIGH - Potential for significant financial loss, must fix before deployment:
+- Arithmetic operations on user input without overflow protection in critical paths
+- Custom math functions with potential overflow in fund-handling logic
+- Unchecked blocks in Solidity 0.8+ that bypass built-in protection
+
+MEDIUM - Limited fund exposure or minor logical flaws, strongly recommended to fix:
+- Overflow/underflow in non-critical state variables
+- Arithmetic operations with practical constraints that make exploitation difficult
+- Missing bounds checks in edge cases
+
+LOW - Minor issues with minimal risk, consider fixing:
+- Theoretical overflow concerns with minimal impact
+- Minor arithmetic improvements
+- Missing explicit checks where built-in protection exists
+
+INFORMATIONAL - Best practices or code quality improvements, optional:
+- Using SafeMath recommendations (Solidity <0.8)
+- Suggesting explicit checks for clarity
+- General arithmetic safety improvements
+
+IMPORTANT VERSION CHECK:
+- Solidity 0.8+ has built-in overflow protection for +, -, *, /, %
+- Only flag CRITICAL/HIGH if: unchecked blocks used, pre-0.8 code, or custom math
+- Array indexing and storage operations can still overflow even in 0.8+
 
 CONFIDENCE GUIDELINES:
-- high: Certain this is a vulnerability with clear exploit scenario
-- medium: Likely a vulnerability but exploit path may be complex
-- low: Possible concern but practical constraints may prevent exploitation
+- high: Certain this is exploitable to cause fund loss or state manipulation
+- medium: Likely exploitable but specific conditions or inputs required
+- low: Theoretical concern but practical constraints may prevent exploitation
 
 Return a JSON array of findings with this structure:
 [
@@ -223,7 +297,8 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
-IMPORTANT: Be conservative with severity. Check Solidity version and built-in protections.
+CRITICAL: Only flag as CRITICAL if overflow/underflow directly enables fund theft.
+Check the Solidity version - 0.8+ has built-in protection for standard arithmetic.
 Only return the JSON array, no other text."""
             },
             "gas-optimization": {
@@ -265,21 +340,49 @@ Only return the JSON array, no other text."""
                 "description": "Analyzes business logic and design patterns",
                 "prompt": """You are a smart contract security expert specializing in business logic analysis.
 
-Analyze the following Solidity code for logic issues:
+Analyze the following Solidity code for logic issues.
+
+IMPORTANT: Focus on ACTUAL EXPLOITABILITY. Check if logic flaws can be exploited to cause fund loss or protocol damage.
 
 {code}
 
 SEVERITY GUIDELINES - Use these criteria when assigning severity:
-- CRITICAL: Logic error that allows stealing funds, bypassing critical restrictions, or breaking core functionality
-- HIGH: Logic error that could cause loss of funds with specific conditions; broken invariant in critical logic
-- MEDIUM: Logic error that could cause unexpected behavior with limited impact; unclear or confusing logic
-- LOW: Minor logic improvements or unclear code that doesn't affect functionality
-- INFO: Best practice suggestions for logic design or code clarity
+
+CRITICAL - Direct fund loss requiring immediate fix before deployment:
+- Logic error allowing direct fund theft or drain
+- Bypassing critical restrictions (e.g., withdrawal limits, lock periods)
+- Broken invariant that enables minting unlimited tokens or draining pools
+- Flaw in core protocol logic that attacker can exploit
+- Clear exploit path with specific steps to cause fund loss
+
+HIGH - Potential for significant financial loss, must fix before deployment:
+- Logic error that could cause fund loss with specific conditions
+- Broken invariant in critical business logic with exploitable edge cases
+- Incorrect fee/tax calculation that could be exploited
+- Flaw in reward/claim mechanism that allows excessive claims
+- Validation bypass that affects fund operations
+
+MEDIUM - Limited fund exposure or minor logical flaws, strongly recommended to fix:
+- Logic error causing unexpected behavior with limited impact
+- Incorrect but not exploitable calculations
+- Edge cases in non-critical functions
+- Missing validation in non-fund operations
+- Confusing or unclear logic that could lead to bugs
+
+LOW - Minor issues with minimal risk, consider fixing:
+- Minor logic improvements or code clarity issues
+- Non-critical edge cases with minimal impact
+- Suboptimal but not incorrect logic
+
+INFORMATIONAL - Best practices or code quality improvements, optional:
+- Suggestions for code organization or readability
+- Recommendations for design patterns
+- General logic improvements not related to security
 
 CONFIDENCE GUIDELINES:
-- high: Certain this is a logic error with clear impact scenario
-- medium: Likely a logic error but edge cases may prevent exploitation
-- low: Possible concern or design consideration
+- high: Certain this is a logic error with clear exploit path to fund loss
+- medium: Likely a logic error but specific conditions or timing required
+- low: Possible concern but exploit may not be practical
 
 Return a JSON array of findings with this structure:
 [
@@ -293,7 +396,9 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
-IMPORTANT: Be conservative with severity. Focus on actual bugs, not just unconventional patterns.
+CRITICAL: Only flag as CRITICAL if you can trace the exact logic flaw that leads to fund loss.
+Do NOT flag unconventional patterns or minor code quality issues as HIGH or CRITICAL.
+Distinguish between "this code is unusual" (INFO) and "this code is exploitable" (CRITICAL/HIGH).
 Only return the JSON array, no other text."""
             }
         }
