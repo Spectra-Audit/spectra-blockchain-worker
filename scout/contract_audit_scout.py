@@ -749,11 +749,17 @@ class ContractAuditScout:
 
         Scoring:
         - Base score: 100.0 for verified, 20.0 for unverified (closed source)
-        - Critical findings: -25 each
-        - High findings: -15 each
-        - Medium findings: -8 each
-        - Low findings: -3 each
+        - Critical findings: -25 each (or -12.5 with low confidence)
+        - High findings: -15 each (or -7.5 with low confidence)
+        - Medium findings: -8 each (or -4 with low confidence)
+        - Low findings: -3 each (or -1.5 with low confidence)
+        - Info findings: -1 each (or -0.5 with low confidence)
         - Closed source penalty: -30 (applied via base score)
+
+        Confidence multipliers:
+        - high confidence: 100% penalty (1.0x)
+        - medium confidence: 75% penalty (0.75x)
+        - low confidence: 50% penalty (0.5x)
 
         Args:
             findings: List of agent findings
@@ -765,18 +771,34 @@ class ContractAuditScout:
         # Base score depends on whether source is verified
         score = 100.0 if is_verified else 20.0
 
-        # Apply penalties for findings
+        # Confidence multipliers
+        confidence_multipliers = {
+            "high": 1.0,
+            "medium": 0.75,
+            "low": 0.5,
+            None: 1.0  # Default if not specified
+        }
+
+        # Severity penalties (before confidence adjustment)
+        severity_penalties = {
+            "critical": 25,
+            "high": 15,
+            "medium": 8,
+            "low": 3,
+            "info": 1
+        }
+
+        # Apply penalties for findings with confidence adjustment
         for finding in findings:
-            if finding.severity == "critical":
-                score -= 25
-            elif finding.severity == "high":
-                score -= 15
-            elif finding.severity == "medium":
-                score -= 8
-            elif finding.severity == "low":
-                score -= 3
-            elif finding.severity == "info":
-                score -= 1
+            severity = finding.severity.lower()
+            confidence = finding.confidence.lower() if finding.confidence else None
+
+            # Get penalty and confidence multiplier
+            penalty = severity_penalties.get(severity, 0)
+            multiplier = confidence_multipliers.get(confidence, 1.0)
+
+            # Apply adjusted penalty
+            score -= penalty * multiplier
 
         return max(0, score)
 

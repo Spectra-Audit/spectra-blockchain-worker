@@ -80,6 +80,14 @@ requests_stub.HTTPError = HTTPError
 sys.modules.setdefault("requests", requests_stub)
 
 
+class _KeccakResult:
+    """Result of keccak hash with hex() method."""
+    def __init__(self, value: bytes = b"\x00" * 32):
+        self._value = value
+    def hex(self) -> str:  # pragma: no cover - simple stub
+        return "0x" + self._value.hex()
+
+
 class _Web3:
     HTTPProvider = staticmethod(lambda *args, **kwargs: object())
     to_checksum_address = staticmethod(lambda value: value)
@@ -96,12 +104,20 @@ class _Web3:
     def is_connected(self) -> bool:  # pragma: no cover - simple stub
         return True
 
-    def keccak(self, text: str) -> bytes:  # pragma: no cover - simple stub
-        return b"\x00" * 32
+    @staticmethod
+    def keccak(text: str = None, **kwargs) -> _KeccakResult:  # pragma: no cover - simple stub
+        # Handle both keccak(text="...") and keccak("...") call patterns
+        return _KeccakResult()
 
 
 web3_stub = types.ModuleType("web3")
 web3_stub.Web3 = _Web3
+
+# Add web3.exceptions module for imports in rpc_pool.py
+exceptions_module = types.ModuleType("web3.exceptions")
+exceptions_module.Web3Exception = Exception
+sys.modules.setdefault("web3.exceptions", exceptions_module)
+
 sys.modules.setdefault("web3", web3_stub)
 
 contract_module = types.ModuleType("web3.contract")

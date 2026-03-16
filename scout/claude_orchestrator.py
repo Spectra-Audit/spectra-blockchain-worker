@@ -127,10 +127,23 @@ Analyze the following Solidity code for reentrancy vulnerabilities:
 
 {code}
 
+SEVERITY GUIDELINES - Use these criteria when assigning severity:
+- CRITICAL: Direct external call to user-supplied address before state changes, with clear exploit path
+- HIGH: External call pattern exists but checks-effects-interactions pattern is broken or missing
+- MEDIUM: Potential reentrancy in complex logic or indirect external calls
+- LOW: Minor reentrancy concerns in non-critical functions or with mitigating factors
+- INFO: Best practice suggestions or theoretical concerns
+
+CONFIDENCE GUIDELINES:
+- high: Certain this is a vulnerability with clear exploit scenario
+- medium: Likely a vulnerability but exploit path may be complex
+- low: Possible concern but might not be exploitable
+
 Return a JSON array of findings with this structure:
 [
   {{
-    "severity": "high|medium|low|info",
+    "severity": "critical|high|medium|low|info",
+    "confidence": "high|medium|low",
     "category": "reentrancy",
     "description": "Description of the potential vulnerability",
     "location": "ContractName.functionName() or line reference",
@@ -138,6 +151,7 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
+IMPORTANT: Be conservative with severity. Only mark as CRITICAL if you're certain there's an exploitable vulnerability.
 Only return the JSON array, no other text."""
             },
             "access-control": {
@@ -148,10 +162,23 @@ Analyze the following Solidity code for access control vulnerabilities:
 
 {code}
 
+SEVERITY GUIDELINES - Use these criteria when assigning severity:
+- CRITICAL: Anyone can call critical functions (mint, burn, pause, withdraw) with no access control
+- HIGH: Only owner/admin can access but missing proper events or upgradeability mechanism; centralization risks in critical functions
+- MEDIUM: Missing role-based access control where it would be appropriate; function visibility issues
+- LOW: Minor access control improvements or overly restrictive permissions
+- INFO: Best practice suggestions for access control design
+
+CONFIDENCE GUIDELINES:
+- high: Certain this is a vulnerability with clear exploit scenario
+- medium: Likely a vulnerability but impact may be limited
+- low: Possible concern or design consideration
+
 Return a JSON array of findings with this structure:
 [
   {{
-    "severity": "high|medium|low|info",
+    "severity": "critical|high|medium|low|info",
+    "confidence": "high|medium|low",
     "category": "access_control",
     "description": "Description of the potential vulnerability",
     "location": "ContractName.functionName() or line reference",
@@ -159,6 +186,7 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
+IMPORTANT: Be conservative with severity. Only mark as CRITICAL for clearly exploitable missing access control.
 Only return the JSON array, no other text."""
             },
             "arithmetic-safety": {
@@ -169,10 +197,25 @@ Analyze the following Solidity code for arithmetic issues:
 
 {code}
 
+SEVERITY GUIDELINES - Use these criteria when assigning severity:
+- CRITICAL: Unprotected arithmetic operation on user input that could overflow/underflow and affect critical state (balances, totals, etc.)
+- HIGH: Arithmetic on user input without SafeMath or built-in overflow protection in Solidity <0.8
+- MEDIUM: Arithmetic operations that could theoretically overflow but have practical constraints
+- LOW: Minor arithmetic concerns or missing explicit checks where impact is limited
+- INFO: Best practice suggestions for arithmetic safety
+
+NOTE: Solidity 0.8+ has built-in overflow protection for arithmetic operations. Only flag as HIGH/CRITICAL if custom arithmetic or pre-0.8 patterns are used.
+
+CONFIDENCE GUIDELINES:
+- high: Certain this is a vulnerability with clear exploit scenario
+- medium: Likely a vulnerability but exploit path may be complex
+- low: Possible concern but practical constraints may prevent exploitation
+
 Return a JSON array of findings with this structure:
 [
   {{
-    "severity": "high|medium|low|info",
+    "severity": "critical|high|medium|low|info",
+    "confidence": "high|medium|low",
     "category": "arithmetic",
     "description": "Description of the potential vulnerability",
     "location": "ContractName.functionName() or line reference",
@@ -180,6 +223,7 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
+IMPORTANT: Be conservative with severity. Check Solidity version and built-in protections.
 Only return the JSON array, no other text."""
             },
             "gas-optimization": {
@@ -190,17 +234,31 @@ Analyze the following Solidity code for gas optimization opportunities:
 
 {code}
 
+SEVERITY GUIDELINES - Use these criteria when assigning severity:
+- LOW: Significant gas savings (>10% per operation) in frequently called functions
+- INFO: Minor gas savings or best practice improvements
+
+NOTE: Gas findings should never be CRITICAL or HIGH severity since they don't affect security.
+
+CONFIDENCE GUIDELINES:
+- high: Certain this optimization will save significant gas
+- medium: Likely to save gas but magnitude may vary
+- low: Possible gas savings
+
 Return a JSON array of findings with this structure:
 [
   {{
-    "severity": "info|low",
+    "severity": "low|info",
+    "confidence": "high|medium|low",
     "category": "gas",
     "description": "Description of the optimization opportunity",
     "location": "ContractName.functionName() or line reference",
-    "recommendation": "How to optimize"
+    "recommendation": "How to optimize",
+    "gas_savings": "Estimate gas savings (e.g., 'saves ~5000 gas per call')"
   }}
 ]
 
+IMPORTANT: Only report optimizations that save at least 2000 gas per operation. Focus on frequently called functions.
 Only return the JSON array, no other text."""
             },
             "logic-analysis": {
@@ -211,10 +269,23 @@ Analyze the following Solidity code for logic issues:
 
 {code}
 
+SEVERITY GUIDELINES - Use these criteria when assigning severity:
+- CRITICAL: Logic error that allows stealing funds, bypassing critical restrictions, or breaking core functionality
+- HIGH: Logic error that could cause loss of funds with specific conditions; broken invariant in critical logic
+- MEDIUM: Logic error that could cause unexpected behavior with limited impact; unclear or confusing logic
+- LOW: Minor logic improvements or unclear code that doesn't affect functionality
+- INFO: Best practice suggestions for logic design or code clarity
+
+CONFIDENCE GUIDELINES:
+- high: Certain this is a logic error with clear impact scenario
+- medium: Likely a logic error but edge cases may prevent exploitation
+- low: Possible concern or design consideration
+
 Return a JSON array of findings with this structure:
 [
   {{
-    "severity": "high|medium|low|info",
+    "severity": "critical|high|medium|low|info",
+    "confidence": "high|medium|low",
     "category": "logic",
     "description": "Description of the potential issue",
     "location": "ContractName.functionName() or line reference",
@@ -222,6 +293,7 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
+IMPORTANT: Be conservative with severity. Focus on actual bugs, not just unconventional patterns.
 Only return the JSON array, no other text."""
             }
         }
@@ -458,7 +530,101 @@ Only return the JSON array, no other text."""
             except Exception as e:
                 LOGGER.debug(f"Failed to parse output from {agent_name}: {e}")
 
-        return findings
+        return self._normalize_findings(findings, agent_name)
+
+    def _normalize_findings(self, findings: List[ClaudeAgentFinding], agent_name: str) -> List[ClaudeAgentFinding]:
+        """Normalize findings to prevent overly harsh severity classifications.
+
+        Applies the following normalization rules:
+        1. Limit the number of critical/high findings per agent
+        2. Downgrade severity when confidence is low
+        3. Ensure severity distribution is reasonable
+        4. Apply category-specific severity caps
+
+        Args:
+            findings: List of parsed findings from an agent
+            agent_name: Name of the agent that produced the findings
+
+        Returns:
+            Normalized list of findings
+        """
+        if not findings:
+            return findings
+
+        normalized = []
+
+        # Count findings by severity for this agent
+        severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+
+        # Severity order (higher to lower)
+        severity_order = ["critical", "high", "medium", "low", "info"]
+
+        for finding in findings:
+            original_severity = finding.severity
+            severity_counts[original_severity] = severity_counts.get(original_severity, 0) + 1
+
+            # Rule 1: Downgrade low confidence findings
+            if finding.confidence == "low" and original_severity in ["critical", "high"]:
+                finding.severity = "medium"
+                finding.confidence = "medium"
+                LOGGER.debug(f"[{agent_name}] Downgraded low-confidence {original_severity} to medium")
+                severity_counts["medium"] += 1
+                severity_counts[original_severity] -= 1
+            elif finding.confidence == "medium" and original_severity == "critical":
+                finding.severity = "high"
+                finding.confidence = "medium"
+                LOGGER.debug(f"[{agent_name}] Downgraded medium-confidence critical to high")
+                severity_counts["high"] += 1
+                severity_counts["critical"] -= 1
+
+            # Rule 2: Apply agent-specific severity caps
+            # Gas optimization should never have critical/high
+            if agent_name == "gas-optimization" and finding.severity in ["critical", "high"]:
+                finding.severity = "low"
+                LOGGER.debug(f"[{agent_name}] Gas finding severity capped at low")
+                severity_counts["low"] += 1
+                if original_severity in severity_counts:
+                    severity_counts[original_severity] -= 1
+
+            # Rule 3: Limit critical findings per agent
+            max_critical_per_agent = 2  # Maximum 2 critical findings per agent
+            if original_severity == "critical" and severity_counts["critical"] > max_critical_per_agent:
+                # Downgrade excess critical findings to high
+                finding.severity = "high"
+                finding.confidence = "medium"
+                LOGGER.debug(f"[{agent_name}] Capped critical findings at {max_critical_per_agent}, downgraded to high")
+                severity_counts["high"] += 1
+                severity_counts["critical"] -= 1
+
+            # Rule 4: Limit high findings per agent
+            max_high_per_agent = 4  # Maximum 4 high findings per agent
+            if original_severity == "high" and severity_counts["high"] > max_high_per_agent:
+                # Downgrade excess high findings to medium
+                finding.severity = "medium"
+                LOGGER.debug(f"[{agent_name}] Capped high findings at {max_high_per_agent}, downgraded to medium")
+                severity_counts["medium"] += 1
+                severity_counts["high"] -= 1
+
+            # Rule 5: For non-security agents, further limit severity
+            if agent_name == "gas-optimization" or agent_name == "logic-analysis":
+                # These agents should produce mostly low/info findings
+                if original_severity == "critical":
+                    finding.severity = "medium"
+                    LOGGER.debug(f"[{agent_name}] Non-security agent critical downgraded to medium")
+                elif original_severity == "high":
+                    finding.severity = "low"
+                    LOGGER.debug(f"[{agent_name}] Non-security agent high downgraded to low")
+
+            normalized.append(finding)
+
+        # Log normalization summary
+        if len(normalized) > 0:
+            final_counts = {}
+            for f in normalized:
+                final_counts[f.severity] = final_counts.get(f.severity, 0) + 1
+            LOGGER.debug(f"[{agent_name}] Normalized findings: {final_counts}")
+
+        return normalized
 
 
 def create_claude_orchestrator() -> ClaudeCodeOrchestrator:
