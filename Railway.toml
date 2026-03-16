@@ -9,18 +9,36 @@ buildCommand = "docker build -t spectra-blockchain-worker ."
 [deploy]
 healthcheckPath = "/health"
 healthcheckTimeout = 30
-# Start command - use unified API server with audit orchestrator
-startCommand = "python server.py"
+# Start command - use entrypoint script that configures claude-code at startup
+# The entrypoint script runs setup_claude_code.sh with Railway env vars, then starts server.py
+startCommand = "/app/entrypoint.sh"
 
 # Environment detection (Railway sets this automatically)
 [deploy.env]
+# ==============================================================================
 # GLM API Configuration (via api.z.ai proxy)
-# OpenAI-compatible endpoint for direct API calls (contract_audit_scout, unified_glm_orchestrator)
+# ==============================================================================
+#
+# Two endpoints are provided by api.z.ai:
+# 1. OpenAI-compatible endpoint: https://api.z.ai/v1/chat/completions
+#    - Used by: contract_audit_scout, unified_glm_orchestrator
+#    - Format: OpenAI chat completions API
+#
+# 2. Anthropic-compatible endpoint: https://api.z.ai/api/anthropic
+#    - Used by: claude-code CLI (ClaudeCodeOrchestrator)
+#    - Format: Anthropic messages API
+#
+# IMPORTANT: Set both GLM_API_KEY and ANTHROPIC_AUTH_TOKEN to the same value
+# for both direct API calls and claude-code CLI to work.
+# ==============================================================================
+
+# OpenAI-compatible endpoint for direct GLM API calls
 GLM_API_KEY = "27f74769564f4f4a88bf22e812d0bb50.tKidddXu225ZMNdJ"
 GLM_API_URL = "https://api.z.ai/v1/chat/completions"
 GLM_MODEL = "glm-4.7"
 
 # Anthropic-compatible endpoint for claude-code CLI
+# Note: setup_claude_code.sh prefers ANTHROPIC_* variables for CLI compatibility
 ANTHROPIC_AUTH_TOKEN = "27f74769564f4f4a88bf22e812d0bb50.tKidddXu225ZMNdJ"
 ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
 
@@ -63,6 +81,7 @@ CELERY_BROKER_URL = "redis://localhost:6379/0"
 CELERY_RESULT_BACKEND = "redis://localhost:6379/0"
 
 # Claude Code CLI Configuration
+# Note: These are fallback values. The actual model is set by GLM_MODEL
 CLAUDE_MODEL = "glm-4.7"
 CLAUDE_MAX_TOKENS = "4096"
 CLAUDE_TEMPERATURE = "0.1"
@@ -70,3 +89,7 @@ CLAUDE_TEMPERATURE = "0.1"
 # Etherscan API for fetching verified contract source code
 # Get your free API key from https://etherscan.io/myapikey
 ETHERSCAN_API_KEY = ""  # Set in Railway dashboard or via secret
+
+# Internal API secret for backend communication
+# Set this to a secure random string if using backend integration
+INTERNAL_API_SECRET = ""

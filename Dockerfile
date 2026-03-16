@@ -38,9 +38,10 @@ RUN groupadd -r scout && useradd -r -g scout -s /bin/bash scout
 # Create directory for database and claude config
 RUN mkdir -p /app/data /home/scout/.config/claude
 
-# Copy claude-code setup script
+# Copy setup and entrypoint scripts
 COPY setup_claude_code.sh /app/setup_claude_code.sh
-RUN chmod +x /app/setup_claude_code.sh
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/setup_claude_code.sh /app/entrypoint.sh
 
 # Copy custom agents for claude-code
 RUN mkdir -p /home/scout/.config/claude/agents && \
@@ -52,8 +53,6 @@ RUN chown -R scout:scout /app /home/scout
 
 USER scout
 
-# Run setup script (will configure claude-code CLI with GLM API)
-RUN /app/setup_claude_code.sh || echo "Setup script skipped"
-
-# Run the unified API server with audit orchestrator
-CMD ["python", "server.py"]
+# Use entrypoint script that runs at startup when Railway env vars are available
+# Note: setup_claude_code.sh runs at container startup, not build time
+CMD ["/app/entrypoint.sh"]

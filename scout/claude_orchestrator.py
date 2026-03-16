@@ -50,10 +50,48 @@ class ClaudeCodeOrchestrator:
 
     def __init__(self):
         """Initialize the orchestrator."""
+        LOGGER.info("=" * 80)
+        LOGGER.info("INITIALIZING CLAUDE-CODE ORCHESTRATOR")
+        LOGGER.info("=" * 80)
+
+        # Step 1: Find claude-code CLI
         self.claude_path = self._find_claude_cli()
+        LOGGER.info(f"[CLI] Using claude-code CLI at: {self.claude_path}")
+
+        # Verify CLI is accessible
+        try:
+            import subprocess
+            result = subprocess.run([self.claude_path, "--version"], capture_output=True, timeout=10)
+            if result.returncode == 0:
+                version_output = result.stdout.decode().strip()
+                LOGGER.info(f"[CLI] claude-code CLI version: {version_output}")
+            else:
+                LOGGER.warning(f"[CLI] claude-code CLI exists but --version failed: {result.stderr.decode()[:100]}")
+        except Exception as e:
+            LOGGER.error(f"[CLI] Failed to verify claude-code CLI: {e}")
+
+        # Step 2: Load agent configurations
         self.agents_config = self._load_agents_config()
-        LOGGER.info(f"ClaudeCodeOrchestrator initialized with CLI: {self.claude_path}")
-        LOGGER.info(f"Loaded {len(self.agents_config)} custom agents")
+        LOGGER.info(f"[AGENTS] Loaded {len(self.agents_config)} custom agents:")
+        for agent_name, config in self.agents_config.items():
+            LOGGER.info(f"  - {agent_name}: {config.get('description', 'No description')}")
+
+        # Step 3: Check GLM API configuration
+        glm_api_key = os.getenv("GLM_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")
+        glm_api_url = os.getenv("GLM_API_URL") or os.getenv("ANTHROPIC_BASE_URL")
+        glm_model = os.getenv("GLM_MODEL", "glm-4.7")
+
+        if glm_api_key:
+            masked_key = f"{glm_api_key[:8]}...{glm_api_key[-4:]}" if len(glm_api_key) > 12 else "***"
+            LOGGER.info(f"[API] GLM API Key configured: {masked_key}")
+            LOGGER.info(f"[API] GLM API URL: {glm_api_url}")
+            LOGGER.info(f"[API] GLM Model: {glm_model}")
+        else:
+            LOGGER.warning("[API] GLM API Key not configured - analyses may fail")
+
+        LOGGER.info("=" * 80)
+        LOGGER.info("CLAUDE-CODE ORCHESTRATOR INITIALIZATION COMPLETE")
+        LOGGER.info("=" * 80)
 
     def _find_claude_cli(self) -> str:
         """Find the claude-code CLI executable."""
@@ -269,6 +307,9 @@ Only return the JSON array, no other text."""
         The source code is written to a temporary file to avoid "Argument list too long"
         errors when analyzing large contracts.
 
+        The code content is read from the temp file and combined with the agent prompt,
+        then passed to claude-code CLI via stdin.
+
         Args:
             agent_name: Name of the agent to run
             code: Solidity code or bytecode context to analyze
@@ -289,25 +330,28 @@ Only return the JSON array, no other text."""
             temp_file_path = f.name
 
         try:
-            # Format prompt with file path reference instead of full code
-            # This keeps the prompt short while providing code via file
+            # Read the code back from the temp file
+            with open(temp_file_path, 'r') as f:
+                code_content = f.read()
+
+            # Format prompt with the actual code content
+            # The agent prompts use {code} placeholder which we replace with actual code
             prompt = agent_config["prompt"].format(
-                code=f"See file: {temp_file_path}",
+                code=code_content,
                 file=temp_file_path
             )
 
             # Build claude-code CLI command
-            # Pass the file path as an argument, prompt via stdin
+            # The file path is passed as context but the prompt contains actual code via stdin
             cmd = [
                 self.claude_path,
                 "--print",  # Non-interactive mode
                 "--model", os.getenv("GLM_MODEL", "glm-4.7"),
-                temp_file_path,  # Pass file path as argument
             ]
 
-            LOGGER.debug(f"Running claude-code CLI for agent: {agent_name} with file: {temp_file_path}")
+            LOGGER.info(f"Running claude-code CLI for agent: {agent_name} ({len(code_content)} chars from {temp_file_path})")
 
-            # Run claude-code CLI with prompt via stdin
+            # Run claude-code CLI with the complete prompt (including code) via stdin
             result = subprocess.run(
                 cmd,
                 input=prompt,
@@ -320,11 +364,15 @@ Only return the JSON array, no other text."""
                 }
             )
 
+            # Log stderr for debugging (contains API errors if any)
+            if result.stderr:
+                LOGGER.debug(f"Claude-code CLI stderr: {result.stderr[:500]}")
+
             # Parse the output
             return self._parse_claude_output(result.stdout, agent_name)
 
         except subprocess.TimeoutExpired:
-            LOGGER.error(f"Agent '{agent_name}' timed out after 120 seconds")
+            LOGGER.error(f"Agent '{agent_name}' timed out after 180 seconds")
             return []
         except Exception as e:
             LOGGER.error(f"Error running agent '{agent_name}': {e}")
