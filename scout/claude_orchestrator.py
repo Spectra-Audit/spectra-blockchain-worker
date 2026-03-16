@@ -123,9 +123,25 @@ class ClaudeCodeOrchestrator:
                 "description": "Detects reentrancy vulnerabilities in smart contracts",
                 "prompt": """You are a smart contract security expert specializing in reentrancy attacks.
 
-Analyze the following Solidity code for reentrancy vulnerabilities.
+ABSOLUTE CERTAINTY REQUIREMENT:
+================================
+You MUST be ABSOLUTELY CERTAIN that a vulnerability exists before flagging it.
+- If you are uncertain, DO NOT flag it.
+- If there's any doubt about exploitability, DO NOT flag it.
+- If the code might be safe depending on context, DO NOT flag it.
+- False positives are WORSE than missing issues.
+- When in doubt, return an empty array [] rather than a questionable finding.
 
-IMPORTANT: Focus on ACTUAL EXPLOITABILITY. Check the logic flow to determine if there's a real path to fund loss.
+DO NOT FLAG:
+- External calls AFTER state updates (safe pattern)
+- Calls to contracts that don't call back (e.g., ERC20 transfer, pure view calls)
+- Code with ReentrancyGuard modifiers or mutex locks
+- Calls with gas limits (e.g., .call{gas: ...})
+- Functions that don't modify user balances or critical state
+- Theoretical concerns without clear exploit paths
+- "Could be problematic" - must be "IS exploitable"
+
+Analyze the following Solidity code for reentrancy vulnerabilities.
 
 {code}
 
@@ -136,11 +152,13 @@ CRITICAL - Direct fund loss requiring immediate fix before deployment:
 - State update happens AFTER external call returns
 - Attacker can recursively call to drain funds/tokens
 - Clear exploit path: attacker can call back before state changes complete
+- MUST be absolutely certain this is exploitable
 
 HIGH - Potential for significant financial loss, must fix before deployment:
 - External call pattern that could be exploited with specific conditions
 - Missing or broken checks-effects-interactions pattern in fund-transfer functions
 - Low-level calls (call, delegatecall) without proper reentrancy guards
+- MUST be able to trace the exact exploit scenario
 
 MEDIUM - Limited fund exposure or minor logical flaws, strongly recommended to fix:
 - Potential reentrancy in non-critical functions with limited impact
@@ -158,15 +176,15 @@ INFORMATIONAL - Best practices or code quality improvements, optional:
 - General code quality improvements
 
 CONFIDENCE GUIDELINES:
-- high: Certain this is exploitable with clear fund loss scenario
-- medium: Likely exploitable but specific conditions may be required
-- low: Theoretical concern but exploit path may not exist in practice
+- high: ABSOLUTELY certain this is exploitable with clear fund loss scenario
+- medium: Very confident but minor ambiguity remains
+- low: NOT USED - if uncertain, do not flag
 
 Return a JSON array of findings with this structure:
 [
   {{
     "severity": "critical|high|medium|low|info",
-    "confidence": "high|medium|low",
+    "confidence": "high|medium",
     "category": "reentrancy",
     "description": "Description of the potential vulnerability",
     "location": "ContractName.functionName() or line reference",
@@ -174,17 +192,33 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
-CRITICAL: Only mark as CRITICAL if you can trace the exact exploit path that leads to fund loss.
-Do NOT flag patterns that are protected by checks-effects-interactions or mutex locks.
+REMEMBER: If you're not ABSOLUTELY CERTAIN, don't flag it.
 Only return the JSON array, no other text."""
             },
             "access-control": {
                 "description": "Analyzes access control and permission issues",
                 "prompt": """You are a smart contract security expert specializing in access control.
 
-Analyze the following Solidity code for access control vulnerabilities.
+ABSOLUTE CERTAINTY REQUIREMENT:
+================================
+You MUST be ABSOLUTELY CERTAIN that a vulnerability exists before flagging it.
+- If you are uncertain, DO NOT flag it.
+- If access control might exist in a parent contract or modifier, DO NOT flag it.
+- If the function might be intended to be public, DO NOT flag it.
+- False positives are WORSE than missing issues.
+- When in doubt, return an empty array [] rather than a questionable finding.
 
-IMPORTANT: Focus on ACTUAL EXPLOITABILITY. Check if missing access control leads to fund loss or critical function abuse.
+DO NOT FLAG:
+- Functions with onlyOwner, onlyRole, or any access control modifier
+- Internal or external functions (not accessible from outside)
+- Functions inherited from contracts that have access control
+- Functions that are legitimately public (e.g., deposit, public getters)
+- Constructor functions
+- Missing events (that's a code quality issue, not a security issue)
+- Design suggestions about centralization (not a vulnerability)
+- "Should have role-based access" - only flag if it's clearly exploitable without it
+
+Analyze the following Solidity code for access control vulnerabilities.
 
 {code}
 
@@ -195,6 +229,7 @@ CRITICAL - Direct fund loss requiring immediate fix before deployment:
 - Missing onlyOwner/onlyRole modifier on fund-handling functions
 - Public functions that should be private/protected (e.g., emergencyWithdraw with no auth)
 - Clear path for attacker to steal funds or tokens
+- MUST be absolutely certain there's no access control anywhere
 
 HIGH - Potential for significant financial loss, must fix before deployment:
 - Critical functions (affecting funds/ownership) accessible to unintended users
@@ -218,15 +253,15 @@ INFORMATIONAL - Best practices or code quality improvements, optional:
 - General access control design improvements
 
 CONFIDENCE GUIDELINES:
-- high: Certain this is exploitable to cause fund loss or protocol takeover
-- medium: Likely exploitable but specific conditions or privileged user required
-- low: Possible concern but impact may be limited or theoretical
+- high: ABSOLUTELY certain this is exploitable to cause fund loss or protocol takeover
+- medium: Very confident but minor ambiguity remains
+- low: NOT USED - if uncertain, do not flag
 
 Return a JSON array of findings with this structure:
 [
   {{
     "severity": "critical|high|medium|low|info",
-    "confidence": "high|medium|low",
+    "confidence": "high|medium",
     "category": "access_control",
     "description": "Description of the potential vulnerability",
     "location": "ContractName.functionName() or line reference",
@@ -234,17 +269,33 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
-CRITICAL: Only mark as CRITICAL if missing access control directly enables fund theft.
-Do NOT flag missing events or design suggestions as CRITICAL.
+REMEMBER: If you're not ABSOLUTELY CERTAIN, don't flag it.
+Check parent contracts, inherited modifiers, and contract-wide access control.
 Only return the JSON array, no other text."""
             },
             "arithmetic-safety": {
                 "description": "Detects arithmetic overflow/underflow issues",
                 "prompt": """You are a smart contract security expert specializing in arithmetic safety.
 
-Analyze the following Solidity code for arithmetic issues.
+ABSOLUTE CERTAINTY REQUIREMENT:
+================================
+You MUST be ABSOLUTELY CERTAIN that a vulnerability exists before flagging it.
+- If you are uncertain whether overflow/underflow is possible, DO NOT flag it.
+- If Solidity 0.8+ is used (no unchecked blocks), DO NOT flag standard arithmetic.
+- If there are practical constraints preventing overflow, DO NOT flag it.
+- False positives are WORSE than missing issues.
+- When in doubt, return an empty array [] rather than a questionable finding.
 
-IMPORTANT: Focus on ACTUAL EXPLOITABILITY. Check if arithmetic errors can lead to fund loss or state manipulation.
+DO NOT FLAG:
+- Standard arithmetic (+, -, *, /, %) in Solidity 0.8+ without unchecked blocks
+- Increment/decrement operations (++, --) in 0.8+
+- Arithmetic operations with built-in bounds (e.g., for loops with array.length)
+- Operations on values that have practical upper limits (e.g., timestamps, block numbers)
+- Theoretical overflow scenarios that require impossible inputs
+- Array accesses that are bounded by array.length
+- "Could overflow with extremely large numbers" - must be realistically exploitable
+
+Analyze the following Solidity code for arithmetic issues.
 
 {code}
 
@@ -254,6 +305,7 @@ CRITICAL - Direct fund loss requiring immediate fix before deployment:
 - Unchecked arithmetic on user input that affects balances/totals (Solidity <0.8 or unchecked blocks)
 - Overflow/underflow that can be exploited to mint unlimited tokens or steal funds
 - Wrap-around that allows bypassing critical checks (e.g., balance checks)
+- MUST be absolutely certain this is exploitable
 
 HIGH - Potential for significant financial loss, must fix before deployment:
 - Arithmetic operations on user input without overflow protection in critical paths
@@ -281,15 +333,15 @@ IMPORTANT VERSION CHECK:
 - Array indexing and storage operations can still overflow even in 0.8+
 
 CONFIDENCE GUIDELINES:
-- high: Certain this is exploitable to cause fund loss or state manipulation
-- medium: Likely exploitable but specific conditions or inputs required
-- low: Theoretical concern but practical constraints may prevent exploitation
+- high: ABSOLUTELY certain this is exploitable to cause fund loss or state manipulation
+- medium: Very confident but minor ambiguity remains
+- low: NOT USED - if uncertain, do not flag
 
 Return a JSON array of findings with this structure:
 [
   {{
     "severity": "critical|high|medium|low|info",
-    "confidence": "high|medium|low",
+    "confidence": "high|medium",
     "category": "arithmetic",
     "description": "Description of the potential vulnerability",
     "location": "ContractName.functionName() or line reference",
@@ -297,15 +349,31 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
-CRITICAL: Only flag as CRITICAL if overflow/underflow directly enables fund theft.
-Check the Solidity version - 0.8+ has built-in protection for standard arithmetic.
+REMEMBER: If you're not ABSOLUTELY CERTAIN, don't flag it.
+Check the Solidity version first - 0.8+ has built-in protection.
 Only return the JSON array, no other text."""
             },
             "gas-optimization": {
                 "description": "Identifies gas optimization opportunities",
                 "prompt": """You are a smart contract expert specializing in gas optimization.
 
-Analyze the following Solidity code for gas optimization opportunities:
+ABSOLUTE CERTAINTY REQUIREMENT:
+================================
+You MUST be CERTAIN that the optimization will save gas before flagging it.
+- If you're uncertain about the gas savings, DO NOT flag it.
+- If the optimization might break existing functionality, DO NOT flag it.
+- Only flag optimizations that are clearly beneficial and safe.
+- When in doubt, return an empty array [] rather than a questionable finding.
+
+DO NOT FLAG:
+- Optimizations that might break functionality
+- Savings less than 2000 gas per operation
+- Theoretical savings without concrete measurement
+- Optimizations in rarely-called functions
+- Style changes that don't save meaningful gas
+- "Could save gas if..." - must be "DOES save gas because..."
+
+Analyze the following Solidity code for gas optimization opportunities.
 
 {code}
 
@@ -318,13 +386,13 @@ NOTE: Gas findings should never be CRITICAL or HIGH severity since they don't af
 CONFIDENCE GUIDELINES:
 - high: Certain this optimization will save significant gas
 - medium: Likely to save gas but magnitude may vary
-- low: Possible gas savings
+- low: NOT USED - if uncertain, do not flag
 
 Return a JSON array of findings with this structure:
 [
   {{
     "severity": "low|info",
-    "confidence": "high|medium|low",
+    "confidence": "high|medium",
     "category": "gas",
     "description": "Description of the optimization opportunity",
     "location": "ContractName.functionName() or line reference",
@@ -340,9 +408,27 @@ Only return the JSON array, no other text."""
                 "description": "Analyzes business logic and design patterns",
                 "prompt": """You are a smart contract security expert specializing in business logic analysis.
 
-Analyze the following Solidity code for logic issues.
+ABSOLUTE CERTAINTY REQUIREMENT:
+================================
+You MUST be ABSOLUTELY CERTAIN that a vulnerability exists before flagging it.
+- If you are uncertain whether the logic is flawed, DO NOT flag it.
+- If the "flaw" might be intentional design, DO NOT flag it.
+- If you don't fully understand the business logic, DO NOT flag it.
+- False positives are WORSE than missing issues.
+- When in doubt, return an empty array [] rather than a questionable finding.
 
-IMPORTANT: Focus on ACTUAL EXPLOITABILITY. Check if logic flaws can be exploited to cause fund loss or protocol damage.
+DO NOT FLAG:
+- Unconventional but correct implementations
+- Code you don't fully understand
+- Business decisions you disagree with (that's not a vulnerability)
+- Missing validation for values that are constrained by other means
+- Edge cases that would require impossible conditions to exploit
+- "Could be problematic if..." - must be "IS exploitable because..."
+- Missing comments or documentation (code quality issue)
+- Non-standard patterns that are functionally correct
+- Theoretical issues without concrete exploit paths
+
+Analyze the following Solidity code for logic issues.
 
 {code}
 
@@ -354,6 +440,7 @@ CRITICAL - Direct fund loss requiring immediate fix before deployment:
 - Broken invariant that enables minting unlimited tokens or draining pools
 - Flaw in core protocol logic that attacker can exploit
 - Clear exploit path with specific steps to cause fund loss
+- MUST be able to trace the exact exploit scenario step-by-step
 
 HIGH - Potential for significant financial loss, must fix before deployment:
 - Logic error that could cause fund loss with specific conditions
@@ -380,15 +467,15 @@ INFORMATIONAL - Best practices or code quality improvements, optional:
 - General logic improvements not related to security
 
 CONFIDENCE GUIDELINES:
-- high: Certain this is a logic error with clear exploit path to fund loss
-- medium: Likely a logic error but specific conditions or timing required
-- low: Possible concern but exploit may not be practical
+- high: ABSOLUTELY certain this is a logic error with clear exploit path to fund loss
+- medium: Very confident but minor ambiguity remains
+- low: NOT USED - if uncertain, do not flag
 
 Return a JSON array of findings with this structure:
 [
   {{
     "severity": "critical|high|medium|low|info",
-    "confidence": "high|medium|low",
+    "confidence": "high|medium",
     "category": "logic",
     "description": "Description of the potential issue",
     "location": "ContractName.functionName() or line reference",
@@ -396,8 +483,7 @@ Return a JSON array of findings with this structure:
   }}
 ]
 
-CRITICAL: Only flag as CRITICAL if you can trace the exact logic flaw that leads to fund loss.
-Do NOT flag unconventional patterns or minor code quality issues as HIGH or CRITICAL.
+REMEMBER: If you're not ABSOLUTELY CERTAIN, don't flag it.
 Distinguish between "this code is unusual" (INFO) and "this code is exploitable" (CRITICAL/HIGH).
 Only return the JSON array, no other text."""
             }
