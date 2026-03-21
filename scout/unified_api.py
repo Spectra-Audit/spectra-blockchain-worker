@@ -469,6 +469,225 @@ if HAS_FASTAPI:
 
         return orchestrator.get_stats()
 
+    # Staking verification endpoints
+    class StakingVerificationRequest(BaseModel):
+        """Request to verify staking status for a wallet."""
+        wallet_address: str = Field(..., description="Wallet address to verify")
+        chain_id: int = Field(default=1, description="Chain ID (default: Ethereum)")
+
+        @validator("wallet_address")
+        def validate_wallet_address(cls, v: str) -> str:
+            """Validate wallet address format."""
+            if not v.startswith("0x") or len(v) != 42:
+                raise ValueError("Invalid wallet address format")
+            return v.lower()
+
+        class Config:
+            """Pydantic config."""
+            json_schema_extra = {
+                "example": {
+                    "wallet_address": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb",
+                    "chain_id": 1,
+                }
+            }
+
+    class StakingVerificationResponse(BaseModel):
+        """Response with staking verification results."""
+        wallet_address: str
+        staked_amount: int
+        staked_amount_formatted: str
+        staking_tier: str
+        staking_contract_address: Optional[str] = None
+        is_verified: bool
+        last_updated: str
+
+    @app.post(
+        "/staking/verify",
+        response_model=StakingVerificationResponse,
+        status_code=status.HTTP_200_OK,
+        responses={
+            200: {"description": "Staking verified successfully"},
+            400: {"description": "Invalid wallet address"},
+            503: {"description": "Service not ready"},
+        },
+    )
+    async def verify_staking(request: StakingVerificationRequest):
+        """Verify staking status for a wallet address.
+
+        Queries the blockchain to check:
+        - How many VERITAS LP tokens are staked
+        - Current staking tier based on amount staked
+        - Staking contract information
+
+        Args:
+            request: Staking verification request
+
+        Returns:
+            Staking verification results
+
+        Raises:
+            HTTPException: If service is not ready or verification fails
+        """
+        if not orchestrator or not orchestrator.w3:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Blockchain service not ready",
+            )
+
+        try:
+            from eth_utils import to_checksum_address, from_wei
+            from datetime import datetime
+
+            checksum_address = to_checksum_address(request.wallet_address)
+            w3 = orchestrator.w3
+
+            # Get staking contract address from environment
+            staking_contract_address = os.environ.get("VERITAS_STAKING_ADDRESS")
+            veritas_lp_address = os.environ.get("VERITAS_LP_ADDRESS")
+
+            # Query staked balance
+            staked_amount = 0
+
+            if staking_contract_address:
+                try:
+                    # Build call data for stakedBalance(address) function
+                    function_selector = w3.keccak(text="stakedBalance(address)")[:4]
+                    call_data = function_selector + bytes.fromhex(checksum_address[2:]).rjust(32, b"\x00")
+
+                    result = w3.eth.call({
+                        "to": to_checksum_address(staking_contract_address),
+                        "data": "0x" + call_data.hex(),
+                    })
+
+                    staked_amount = int(result.hex(), 16)
+                except Exception as e:
+                    LOGGER.warning(f"Failed to query staking contract: {e}")
+                    staked_amount = 0
+
+            elif veritas_lp_address:
+                # Fallback: check LP token balance directly
+                try:
+                    # ERC20 balanceOf(address) function signature
+                    balance_of_signature = "0x70a08231"
+                    call_data = balance_of_signature + bytes.fromhex(checksum_address[2:]).rjust(32, b"\x00")
+
+                    result = w3.eth.call({
+                        "to": to_checksum_address(veritas_lp_address),
+                        "data": "0x" + call_data.hex(),
+                    })
+
+                    staked_amount = int(result.hex(), 16)
+                except Exception as e:
+                    LOGGER.warning(f"Failed to query LP token balance: {e}")
+                    staked_amount = 0
+            else:
+                LOGGER.warning("No staking contract or LP token configured")
+
+            # Determine staking tier based on amount staked
+            # Using same thresholds as backend StakingTierLimits
+            LP_AMOUNTS = {
+                "free": 0,
+                "basic": 100,
+                "basic_plus": 1000,
+                "premium": 5000,
+                "premium_plus": 10000,
+                "pro": 100000,
+            }
+
+            staking_tier = "free"
+            for tier, amount in sorted(LP_AMOUNTS.items(), key=lambda x: x[1], reverse=True):
+                if staked_amount >= amount * (10 ** 18):
+                    staking_tier = tier
+                    break
+
+            return StakingVerificationResponse(
+                wallet_address=checksum_address,
+                staked_amount=staked_amount,
+                staked_amount_formatted=f"{from_wei(staked_amount, 'ether')} VERITAS LP",
+                staking_tier=staking_tier,
+                staking_contract_address=staking_contract_address,
+                is_verified=True,
+                last_updated=datetime.utcnow().isoformat(),
+            )
+
+        except Exception as e:
+            LOGGER.error(f"Failed to verify staking for {request.wallet_address[:10]}...: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to verify staking: {str(e)}",
+            )
+
+    @app.get(
+        "/staking/tiers",
+        status_code=status.HTTP_200_OK,
+    )
+    async def get_staking_tiers():
+        """Get staking tier information.
+
+        Returns the tier thresholds and benefits.
+
+        Returns:
+            Dictionary with tier information
+        """
+        return {
+            "tiers": [
+                {
+                    "name": "free",
+                    "min_lp": 0,
+                    "benefits": {
+                        "max_audits_per_month": 0,
+                        "detailed_analysis": False,
+                        "project_reports": False,
+                    },
+                },
+                {
+                    "name": "basic",
+                    "min_lp": 100,
+                    "benefits": {
+                        "max_audits_per_month": 0,
+                        "detailed_analysis": False,
+                        "project_reports": False,
+                    },
+                },
+                {
+                    "name": "basic_plus",
+                    "min_lp": 1000,
+                    "benefits": {
+                        "max_audits_per_month": 1,
+                        "detailed_analysis": True,
+                        "project_reports": False,
+                    },
+                },
+                {
+                    "name": "premium",
+                    "min_lp": 5000,
+                    "benefits": {
+                        "max_audits_per_month": 6,
+                        "detailed_analysis": True,
+                        "project_reports": False,
+                    },
+                },
+                {
+                    "name": "premium_plus",
+                    "min_lp": 10000,
+                    "benefits": {
+                        "max_audits_per_month": 11,
+                        "detailed_analysis": True,
+                        "project_reports": False,
+                    },
+                },
+                {
+                    "name": "pro",
+                    "min_lp": 100000,
+                    "benefits": {
+                        "max_audits_per_month": -1,  # Unlimited
+                        "detailed_analysis": True,
+                        "project_reports": True,
+                    },
+                },
+            ]
+        }
+
     async def _run_audit_task(
         project_id: str,
         token_address: str,
