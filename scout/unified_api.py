@@ -550,8 +550,9 @@ if HAS_FASTAPI:
 
             if staking_contract_address:
                 try:
-                    # Build call data for stakedBalance(address) function
-                    function_selector = w3.keccak(text="stakedBalance(address)")[:4]
+                    # Build call data for stakeOf(address) function
+                    # stakeOf returns a StakeInfo struct with amount at offset 0
+                    function_selector = w3.keccak(text="stakeOf(address)")[:4]
                     call_data = function_selector + bytes.fromhex(checksum_address[2:]).rjust(32, b"\x00")
 
                     result = w3.eth.call({
@@ -559,7 +560,14 @@ if HAS_FASTAPI:
                         "data": "0x" + call_data.hex(),
                     })
 
-                    staked_amount = int(result.hex(), 16)
+                    # Decode StakeInfo struct: (amount, stakedAt, activatesAt, earliestUnstakeAt, unstakeRequestedAt, tier, feeBpsApplied)
+                    # Each field is in its own 32-byte slot
+                    # amount (uint96) is in the first slot (bytes 64-96 of response: 32 for offset + 32 for value)
+                    result_bytes = bytes.fromhex(result.hex()[2:])
+                    # The struct encoding: first 32 bytes is offset, next 32 bytes is the data length, then values follow
+                    # Actually for view functions returning structs, the values are encoded consecutively
+                    # amount is uint96 (12 bytes) stored in first 32-byte slot
+                    staked_amount = int(result_bytes[32:64].hex(), 16)  # First value slot
                 except Exception as e:
                     LOGGER.warning(f"Failed to query staking contract: {e}")
                     staked_amount = 0
