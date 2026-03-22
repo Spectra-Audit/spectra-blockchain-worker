@@ -550,6 +550,8 @@ if HAS_FASTAPI:
 
             if staking_contract_address:
                 try:
+                    LOGGER.info(f"Querying staking contract {staking_contract_address} for wallet {checksum_address[:10]}...")
+
                     # Use web3 contract interface for proper ABI encoding/decoding
                     stake_of_abi = [{
                         "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
@@ -577,7 +579,7 @@ if HAS_FASTAPI:
 
                     # stake_info is a tuple: (amount, stakedAt, activatesAt, earliestUnstakeAt, unstakeRequestedAt, tier, feeBpsApplied)
                     staked_amount = stake_info[0] if stake_info else 0
-                    LOGGER.debug(f"Stake info for {checksum_address[:10]}...: amount={staked_amount}, tier={stake_info[5] if stake_info else 'N/A'}")
+                    LOGGER.info(f"Stake info for {checksum_address[:10]}...: amount={staked_amount}, tier={stake_info[5] if stake_info else 'N/A'}, raw={stake_info}")
                 except Exception as e:
                     LOGGER.warning(f"Failed to query staking contract: {e}")
                     staked_amount = 0
