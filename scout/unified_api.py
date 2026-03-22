@@ -550,24 +550,34 @@ if HAS_FASTAPI:
 
             if staking_contract_address:
                 try:
-                    # Build call data for stakeOf(address) function
-                    # stakeOf returns a StakeInfo struct with amount at offset 0
-                    function_selector = w3.keccak(text="stakeOf(address)")[:4]
-                    call_data = function_selector + bytes.fromhex(checksum_address[2:]).rjust(32, b"\x00")
+                    # Use web3 contract interface for proper ABI encoding/decoding
+                    stake_of_abi = [{
+                        "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
+                        "name": "stakeOf",
+                        "outputs": [
+                            {"components": [
+                                {"internalType": "uint96", "name": "amount", "type": "uint96"},
+                                {"internalType": "uint40", "name": "stakedAt", "type": "uint40"},
+                                {"internalType": "uint40", "name": "activatesAt", "type": "uint40"},
+                                {"internalType": "uint40", "name": "earliestUnstakeAt", "type": "uint40"},
+                                {"internalType": "uint40", "name": "unstakeRequestedAt", "type": "uint40"},
+                                {"internalType": "uint8", "name": "tier", "type": "uint8"},
+                                {"internalType": "uint16", "name": "feeBpsApplied", "type": "uint16"}
+                            ],
+                            "internalType": "struct VeritaStaking.StakeInfo",
+                            "name": "",
+                            "type": "tuple"}
+                        ],
+                        "stateMutability": "view",
+                        "type": "function"
+                    }]
 
-                    result = w3.eth.call({
-                        "to": to_checksum_address(staking_contract_address),
-                        "data": "0x" + call_data.hex(),
-                    })
+                    contract = w3.eth.contract(address=to_checksum_address(staking_contract_address), abi=stake_of_abi)
+                    stake_info = contract.functions.stakeOf(checksum_address).call()
 
-                    # Decode StakeInfo struct: (amount, stakedAt, activatesAt, earliestUnstakeAt, unstakeRequestedAt, tier, feeBpsApplied)
-                    # Each field is in its own 32-byte slot
-                    # amount (uint96) is in the first slot (bytes 64-96 of response: 32 for offset + 32 for value)
-                    result_bytes = bytes.fromhex(result.hex()[2:])
-                    # The struct encoding: first 32 bytes is offset, next 32 bytes is the data length, then values follow
-                    # Actually for view functions returning structs, the values are encoded consecutively
-                    # amount is uint96 (12 bytes) stored in first 32-byte slot
-                    staked_amount = int(result_bytes[32:64].hex(), 16)  # First value slot
+                    # stake_info is a tuple: (amount, stakedAt, activatesAt, earliestUnstakeAt, unstakeRequestedAt, tier, feeBpsApplied)
+                    staked_amount = stake_info[0] if stake_info else 0
+                    LOGGER.debug(f"Stake info for {checksum_address[:10]}...: amount={staked_amount}, tier={stake_info[5] if stake_info else 'N/A'}")
                 except Exception as e:
                     LOGGER.warning(f"Failed to query staking contract: {e}")
                     staked_amount = 0
