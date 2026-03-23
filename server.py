@@ -109,6 +109,37 @@ def main() -> int:
         scout_app = ScoutApp.from_env()
         logger.info("ScoutApp created successfully")
 
+        # Fix: Update database last_block if it's too far behind current block
+        # This prevents the worker from spending hours processing historical blocks
+        try:
+            current_block = w3.eth.block_number
+
+            # Check and update FeaturedScout's last block
+            featured_last_block_str = scout_app.database.get_meta("featured_last_block")
+            if featured_last_block_str:
+                featured_last_block = int(featured_last_block_str)
+                blocks_behind = current_block - featured_last_block
+                if blocks_behind > 10000:  # If more than 10000 blocks behind, skip to current
+                    logger.warning(
+                        f"FeaturedScout is {blocks_behind} blocks behind. "
+                        f"Updating to current block {current_block} to skip historical processing."
+                    )
+                    scout_app.database.set_meta("featured_last_block", str(current_block))
+
+            # Check and update ProScout's last block
+            pro_last_block_str = scout_app.database.get_meta("pro_last_block")
+            if pro_last_block_str:
+                pro_last_block = int(pro_last_block_str)
+                blocks_behind = current_block - pro_last_block
+                if blocks_behind > 10000:  # If more than 10000 blocks behind, skip to current
+                    logger.warning(
+                        f"ProScout is {blocks_behind} blocks behind. "
+                        f"Updating to current block {current_block} to skip historical processing."
+                    )
+                    scout_app.database.set_meta("pro_last_block", str(current_block))
+        except Exception as e:
+            logger.warning(f"Failed to check/update scout last_block values: {e}")
+
         # Start the scouts in background (FeaturedScout monitors payments, ProScout monitors staking)
         logger.info("Starting blockchain monitoring scouts...")
         scout_app.start()
