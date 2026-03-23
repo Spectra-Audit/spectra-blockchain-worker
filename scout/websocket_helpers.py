@@ -100,8 +100,17 @@ def _filtered_subscription_iterator(
 
 
 async def _subscription_event_iterator(web3: Any, subscription: Any) -> AsyncIterator[Any]:
+    # web3.py v7+: subscription objects are async iterators themselves
+    # Check if subscription is directly iterable (v7+ behavior)
+    if hasattr(subscription, "__aiter__"):
+        # The subscription object is itself an async iterator (web3.py v7)
+        # Just iterate over it directly
+        async for item in subscription:
+            yield item
+        return
+
+    # web3.py v6: Try to find process_subscriptions on provider
     # web3.py v7+ uses web3.provider instead of web3.ws
-    # Try multiple locations for process_subscriptions
     process_subscriptions = getattr(web3.provider, "process_subscriptions", None)
     if process_subscriptions is None:
         # Fallback to older web3.ws location (v6)
@@ -110,14 +119,14 @@ async def _subscription_event_iterator(web3: Any, subscription: Any) -> AsyncIte
             process_subscriptions = getattr(process_subscriptions, "process_subscriptions", None)
 
     if process_subscriptions is None:
-        # If subscription itself has an iterator method, use it directly
-        if hasattr(subscription, "__aiter__"):
-            # The subscription object is itself an async iterator
-            async def _iterate_subscription(sub):
-                async for item in sub:
-                    yield item
-            return _iterate_subscription(subscription)
-        raise RuntimeError("web3 websocket connection is missing process_subscriptions")
+        # Provide more detailed error message for debugging
+        provider_type = type(web3.provider).__name__ if hasattr(web3, 'provider') else 'Unknown'
+        sub_type = type(subscription).__name__
+        raise RuntimeError(
+            f"web3 websocket connection is missing process_subscriptions. "
+            f"Provider type: {provider_type}, Subscription type: {sub_type}, "
+            f"Subscription has __aiter__: {hasattr(subscription, '__aiter__')}"
+        )
 
     try:
         iterator = process_subscriptions(subscription)
@@ -162,11 +171,26 @@ async def _managed_subscription(web3: Any, filter_params: Optional[dict[str, Any
     subscription_resource = web3.eth.subscribe("logs", filter_params)
     subscription = await _await_if_awaitable(subscription_resource)
 
+    # In web3.py v7, subscriptions with __aenter__/__aexit__ are async context managers
+    # but we should NOT use them as context managers if we want to iterate them
+    # because the context manager will close immediately upon exit
+    # Instead, we check if it's directly iterable and yield it
+    if hasattr(subscription, "__aiter__"):
+        # The subscription is an async iterator (web3.py v7)
+        # Don't use it as a context manager - just yield it directly
+        try:
+            yield subscription
+        finally:
+            await _unsubscribe_from_subscription(web3, subscription)
+        return
+
+    # For older web3.py versions, try to use as context manager if available
     if hasattr(subscription, "__aenter__") and hasattr(subscription, "__aexit__"):
         async with subscription as iterator:
             yield iterator
             return
 
+    # Fallback: yield without context management
     try:
         yield subscription
     finally:
