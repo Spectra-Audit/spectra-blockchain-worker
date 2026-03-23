@@ -111,32 +111,37 @@ def main() -> int:
 
         # Fix: Update database last_block if it's too far behind current block
         # This prevents the worker from spending hours processing historical blocks
+        # But we need to keep a small window to catch recent payments
         try:
             current_block = w3.eth.block_number
+
+            # Skip to (current - 2000) blocks if more than 10000 behind
+            # This keeps a ~2-hour window to catch recent pending payments
+            target_block = current_block - 2000
 
             # Check and update FeaturedScout's last block
             featured_last_block_str = scout_app.database.get_meta("featured_last_block")
             if featured_last_block_str:
                 featured_last_block = int(featured_last_block_str)
                 blocks_behind = current_block - featured_last_block
-                if blocks_behind > 10000:  # If more than 10000 blocks behind, skip to current
+                if blocks_behind > 10000:  # If more than 10000 blocks behind, skip closer to current
                     logger.warning(
                         f"FeaturedScout is {blocks_behind} blocks behind. "
-                        f"Updating to current block {current_block} to skip historical processing."
+                        f"Skipping to block {target_block} to catch recent payments."
                     )
-                    scout_app.database.set_meta("featured_last_block", str(current_block))
+                    scout_app.database.set_meta("featured_last_block", str(target_block))
 
             # Check and update ProScout's last block
             pro_last_block_str = scout_app.database.get_meta("pro_last_block")
             if pro_last_block_str:
                 pro_last_block = int(pro_last_block_str)
                 blocks_behind = current_block - pro_last_block
-                if blocks_behind > 10000:  # If more than 10000 blocks behind, skip to current
+                if blocks_behind > 10000:  # If more than 10000 blocks behind, skip closer to current
                     logger.warning(
                         f"ProScout is {blocks_behind} blocks behind. "
-                        f"Updating to current block {current_block} to skip historical processing."
+                        f"Skipping to block {target_block} to catch recent events."
                     )
-                    scout_app.database.set_meta("pro_last_block", str(current_block))
+                    scout_app.database.set_meta("pro_last_block", str(target_block))
         except Exception as e:
             logger.warning(f"Failed to check/update scout last_block values: {e}")
 
