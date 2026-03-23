@@ -31,6 +31,132 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _check_and_verify_missed_payments(w3, backend_client, database):
+    """Check for pending submissions and verify payments that may have been missed.
+
+    When the worker starts far behind and skips blocks, it might skip over
+    payment events. This function queries the backend for pending submissions
+    and checks if any payments were in blocks that were skipped.
+
+    Args:
+        w3: Web3 instance for blockchain queries
+        backend_client: BackendClient for API calls
+        database: DatabaseManager for state tracking
+    """
+    try:
+        # Get pending submissions from backend
+        response = backend_client.get("/admin/pending-submissions")
+        if response.status_code != 200:
+            logger.warning(f"Failed to fetch pending submissions: {response.status_code}")
+            return
+
+        data = response.json()
+        submissions = data.get("submissions", [])
+
+        if not submissions:
+            logger.info("No pending submissions to check")
+            return
+
+        logger.info(f"Found {len(submissions)} pending submissions to check")
+
+        # Get current block and the last processed block
+        current_block = w3.eth.block_number
+        featured_last_block_str = database.get_meta("featured_last_block")
+        featured_last_block = int(featured_last_block_str) if featured_last_block_str else 0
+
+        # Check if any pending payments were in blocks before our starting point
+        for submission in submissions:
+            submission_id = submission.get("submission_id")
+            creator_address = submission.get("creator_address")
+            tx_hash = submission.get("transaction_hash")
+
+            if not tx_hash:
+                logger.debug(f"Submission {submission_id} has no transaction hash, skipping")
+                continue
+
+            try:
+                # Get transaction receipt to find block number
+                receipt = w3.eth.get_transaction_receipt(tx_hash)
+                tx_block = receipt.blockNumber
+
+                # Check if this transaction was in a block we already processed
+                # or if it was before our starting point
+                if tx_block <= featured_last_block:
+                    logger.info(
+                        f"Payment at block {tx_block} was before worker starting point "
+                        f"({featured_last_block}), verifying now"
+                    )
+
+                    # Decode the Paid event and verify payment
+                    _verify_payment_from_receipt(w3, backend_client, receipt, creator_address)
+
+            except Exception as e:
+                logger.debug(f"Failed to check submission {submission_id}: {e}")
+
+    except Exception as e:
+        logger.warning(f"Error checking missed payments: {e}")
+
+
+def _verify_payment_from_receipt(w3, backend_client, receipt, expected_creator):
+    """Verify a payment from a transaction receipt and call the admin endpoint.
+
+    Args:
+        w3: Web3 instance
+        backend_client: BackendClient for API calls
+        receipt: Transaction receipt
+        expected_creator: Expected creator address from submission
+    """
+    # Paid event signature
+    PAID_TOPIC = w3.keccak(text="Paid(address,address,bytes32,uint256,uint8,uint256,uint64)").hex()
+
+    for log in receipt.logs:
+        if not log.topics:
+            continue
+
+        if log.topics[0].hex() == PAID_TOPIC:
+            # Extract indexed parameters from topics
+            creator = w3.to_checksum_address(log.topics[2][-20:])
+
+            # Only process if creator matches expected
+            if creator.lower() != expected_creator.lower():
+                continue
+
+            # Decode data
+            data = w3.codec.decode(["uint256", "uint8", "uint256", "uint64"], log.data)
+            amount_paid_fees = data[0]
+            round_id = data[3]
+
+            # Convert amount from wei to VERITAS
+            amount_veritas = int(amount_paid_fees / 1e18)
+
+            # Prepare payload for admin endpoint
+            payload = {
+                "creator_address": creator,
+                "amount_paid": str(amount_veritas),
+                "transaction_hash": receipt.transactionHash.hex(),
+                "block_number": receipt.blockNumber,
+                "round_id": round_id,
+            }
+
+            # Call admin endpoint to verify payment and create project
+            response = backend_client.post("/admin/verify-payment-and-create", json=payload)
+
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(
+                    f"Successfully verified missed payment: project_id={result.get('project_id')}, "
+                    f"submission_id={result.get('submission_id')}"
+                )
+            else:
+                logger.warning(
+                    f"Failed to verify missed payment: {response.status_code} - {response.text}"
+                )
+
+            return  # Only process first matching Paid event
+
+    logger.debug(f"No matching Paid event found in receipt {receipt.transactionHash.hex()}")
+
+
 def main() -> int:
     """Main entry point for Railway deployment."""
 
@@ -144,6 +270,15 @@ def main() -> int:
                     scout_app.database.set_meta("pro_last_block", str(target_block))
         except Exception as e:
             logger.warning(f"Failed to check/update scout last_block values: {e}")
+
+        # Check for missed payments from pending submissions
+        # This handles cases where the worker skipped past blocks containing payments
+        if backend_client:
+            try:
+                logger.info("Checking for pending submissions that may have been missed...")
+                _check_and_verify_missed_payments(w3, backend_client, scout_app.database)
+            except Exception as e:
+                logger.warning(f"Failed to check for missed payments: {e}")
 
         # Start the scouts in background (FeaturedScout monitors payments, ProScout monitors staking)
         logger.info("Starting blockchain monitoring scouts...")
