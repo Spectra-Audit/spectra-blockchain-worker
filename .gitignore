@@ -1,2 +1,20 @@
+# Environment variables (contain sensitive credentials)
+.env
+.env.local
+.env.*.local
+
+# Python
 __pycache__/
 *.py[cod]
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code workspace
+.claude/
