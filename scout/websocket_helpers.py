@@ -135,10 +135,14 @@ async def _subscription_event_iterator(web3: Any, subscription: Any) -> AsyncIte
             raise
         iterator = process_subscriptions()
         iterator = await _await_if_awaitable(iterator)
-        subscription_id = _normalize_subscription_id(
-            getattr(subscription, "subscription_id", None)
-            or getattr(subscription, "filter_id", None)
-        )
+        # Get subscription_id: if subscription is a string, it IS the ID
+        if isinstance(subscription, str):
+            subscription_id = subscription
+        else:
+            subscription_id = _normalize_subscription_id(
+                getattr(subscription, "subscription_id", None)
+                or getattr(subscription, "filter_id", None)
+            )
         # Use yield from to delegate to the filtered iterator
         async for item in _filtered_subscription_iterator(iterator, subscription_id):
             yield item
