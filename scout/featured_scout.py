@@ -982,9 +982,81 @@ class FeaturedScout:
         round_id = int(args.get("roundId", 0))
         block = int(event_data.get("blockNumber", 0))
         tx_hash = event_data.get("transactionHash", b"").hex()
+
+        # Get payment details
+        creator_address = self._coerce_address(args.get("creator"))
+        payer_address = self._coerce_address(args.get("payer"))
+        amount_paid_fees = self._coerce_int(args.get("amountPaidFees", 0))
+        number_of_contracts = int(args.get("numberOfContracts", 0))
+        featured_bid = self._coerce_int(args.get("featuredBid", 0))
+
         if project_hex is None:
             LOGGER.warning("Paid event project decode failed", extra={"roundId": round_id})
             return True
+
+        # Convert amount from wei to VERITAS (18 decimals)
+        amount_veritas = amount_paid_fees / 1e18
+
+        # NEW: First try to create project from pending submission (payment-first flow)
+        if creator_address:
+            try:
+                response = self._backend_client.post(
+                    "/admin/verify-payment-and-create",
+                    json={
+                        "creator_address": creator_address,
+                        "amount_paid": str(amount_veritas),
+                        "transaction_hash": tx_hash,
+                        "block_number": block,
+                        "round_id": round_id,
+                    },
+                    timeout=10.0,
+                    raise_for_status=False,
+                )
+
+                if response and response.status_code == 201:
+                    # Successfully created project from pending submission
+                    result = response.json()
+                    LOGGER.info(
+                        "Created project from pending submission",
+                        extra={
+                            "submission_id": result.get("submission_id"),
+                            "project_id": result.get("project_id"),
+                            "creator_address": creator_address,
+                            "amount_paid": str(amount_veritas),
+                            "tx": tx_hash,
+                            "block": block,
+                        },
+                    )
+                    return True
+                elif response and response.status_code == 404:
+                    # No pending submission found - fall through to legacy flow
+                    LOGGER.debug(
+                        "No pending submission found, trying legacy project patch",
+                        extra={"creator_address": creator_address, "tx": tx_hash}
+                    )
+                elif response and response.status_code == 400:
+                    # Insufficient payment or other error
+                    error_data = response.json() if response.content else {}
+                    LOGGER.warning(
+                        "Payment verification failed",
+                        extra={
+                            "creator_address": creator_address,
+                            "error": error_data.get("error", "Unknown error"),
+                            "tx": tx_hash,
+                        },
+                    )
+                    # Still return True to avoid reprocessing
+                    return True
+
+            except Exception as e:
+                LOGGER.error(
+                    "Failed to create project from pending submission",
+                    extra={"error": str(e), "creator_address": creator_address},
+                    exc_info=True,
+                )
+                # Continue to legacy flow on error
+
+        # LEGACY: Fall back to patching existing project
         backend_id = self._resolve_backend_project_id(project_hex)
         if backend_id is None:
             LOGGER.warning(
@@ -996,7 +1068,7 @@ class FeaturedScout:
         if not self._patch_project(backend_id, payload):
             return False
         LOGGER.info(
-            "Marked project as paid",
+            "Marked project as paid (legacy)",
             extra={
                 "roundId": round_id,
                 "project_hex": project_hex,
@@ -1007,6 +1079,22 @@ class FeaturedScout:
             },
         )
         return True
+
+    def _coerce_address(self, value: Any) -> Optional[str]:
+        """Coerce value to checksummed Ethereum address."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                return Web3.to_checksum_address(value)
+            except Exception:
+                return None
+        if isinstance(value, bytes):
+            try:
+                return Web3.to_checksum_address("0x" + value.hex())
+            except Exception:
+                return None
+        return None
 
     def _normalize_project_hex(self, value: Any) -> Optional[str]:
         if value is None:

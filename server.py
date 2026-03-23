@@ -100,6 +100,22 @@ def main() -> int:
         from scout.audit_orchestrator import create_audit_orchestrator
         from scout.unified_api import set_orchestrator, run_unified_api
         from scout.unified_audit_service import create_unified_audit_service
+        from scout.main import ScoutApp
+
+        # Create ScoutApp with all scouts (FeaturedScout, ProScout, etc.)
+        # This is needed for payment verification via FeaturedScout
+        logger.info("Creating ScoutApp with blockchain monitoring scouts...")
+        scout_app = ScoutApp.from_env(
+            database=database,
+            backend_client=backend_client,
+            admin_wallet=admin_wallet if backend_client else None,
+        )
+        logger.info("ScoutApp created successfully")
+
+        # Start the scouts in background (FeaturedScout monitors payments, ProScout monitors staking)
+        logger.info("Starting blockchain monitoring scouts...")
+        scout_app.start()
+        logger.info("Scouts started - FeaturedScout will monitor for Paid events")
 
         # Create unified audit service for code audits
         logger.info("Creating unified audit service...")
@@ -135,8 +151,27 @@ def main() -> int:
 
         logger.info(f"Starting unified API server on {host}:{port}")
 
-        # Run the unified API server
-        run_unified_api(host=host, port=port, log_level=log_level)
+        # Install shutdown hook for scouts
+        import atexit
+        def cleanup():
+            logger.info("Shutting down scouts...")
+            scout_app.shutdown()
+        atexit.register(cleanup)
+
+        # Also handle signals for graceful shutdown
+        import signal
+        def signal_handler(signum, frame):
+            logger.info(f"Received signal {signum}, shutting down...")
+            scout_app.shutdown()
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
+        # Run the unified API server (blocking call)
+        try:
+            run_unified_api(host=host, port=port, log_level=log_level)
+        finally:
+            scout_app.shutdown()
 
         return 0
 
