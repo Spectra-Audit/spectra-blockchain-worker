@@ -104,12 +104,9 @@ def main() -> int:
 
         # Create ScoutApp with all scouts (FeaturedScout, ProScout, etc.)
         # This is needed for payment verification via FeaturedScout
+        # ScoutApp.from_env() reads everything from environment variables
         logger.info("Creating ScoutApp with blockchain monitoring scouts...")
-        scout_app = ScoutApp.from_env(
-            database=database,
-            backend_client=backend_client,
-            admin_wallet=admin_wallet if backend_client else None,
-        )
+        scout_app = ScoutApp.from_env()
         logger.info("ScoutApp created successfully")
 
         # Start the scouts in background (FeaturedScout monitors payments, ProScout monitors staking)
@@ -117,29 +114,35 @@ def main() -> int:
         scout_app.start()
         logger.info("Scouts started - FeaturedScout will monitor for Paid events")
 
-        # Create unified audit service for code audits
-        logger.info("Creating unified audit service...")
-        unified_audit_service = create_unified_audit_service(
-            database=database,
-            w3=w3,
-            backend_client=backend_client,
-            token_holder_scout=None,
-            liquidity_analyzer_scout=None,
-            tokenomics_analyzer_scout=None,
-        )
+        # Get the audit orchestrator from ScoutApp (if it has one)
+        # Otherwise create a new one
+        if hasattr(scout_app, 'audit_orchestrator') and scout_app.audit_orchestrator:
+            orchestrator = scout_app.audit_orchestrator
+            logger.info("Using ScoutApp's audit orchestrator")
+        else:
+            # Create unified audit service for code audits
+            logger.info("Creating unified audit service...")
+            unified_audit_service = create_unified_audit_service(
+                database=scout_app.database,
+                w3=w3,
+                backend_client=scout_app.backend_client,
+                token_holder_scout=None,
+                liquidity_analyzer_scout=None,
+                tokenomics_analyzer_scout=None,
+            )
 
-        # Create audit orchestrator with unified audit service
-        # We only need the contract audit capability for Railway
-        logger.info("Creating audit orchestrator...")
-        orchestrator = create_audit_orchestrator(
-            database=database,
-            backend_client=backend_client,
-            w3=w3,
-            token_holder_scout=None,  # Not needed for triggered audits
-            tokenomics_analyzer_scout=None,
-            liquidity_analyzer_scout=None,
-            unified_audit_service=unified_audit_service,
-        )
+            # Create audit orchestrator with unified audit service
+            # We only need the contract audit capability for Railway
+            logger.info("Creating audit orchestrator...")
+            orchestrator = create_audit_orchestrator(
+                database=scout_app.database,
+                backend_client=scout_app.backend_client,
+                w3=w3,
+                token_holder_scout=None,  # Not needed for triggered audits
+                tokenomics_analyzer_scout=None,
+                liquidity_analyzer_scout=None,
+                unified_audit_service=unified_audit_service,
+            )
 
         # Register with unified API
         set_orchestrator(orchestrator)
