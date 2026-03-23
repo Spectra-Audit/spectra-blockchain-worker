@@ -100,14 +100,14 @@ def _filtered_subscription_iterator(
 
 
 async def _subscription_event_iterator(web3: Any, subscription: Any) -> AsyncIterator[Any]:
-    # web3.py v7+: subscription objects are async iterators themselves
-    # Check if subscription is directly iterable (v7+ behavior)
-    if hasattr(subscription, "__aiter__"):
-        # The subscription object is itself an async iterator (web3.py v7)
-        # Just iterate over it directly
-        async for item in subscription:
-            yield item
-        return
+    # Get subscription_id: if subscription is a string, it IS the ID
+    if isinstance(subscription, str):
+        subscription_id = subscription
+    else:
+        subscription_id = _normalize_subscription_id(
+            getattr(subscription, "subscription_id", None)
+            or getattr(subscription, "filter_id", None)
+        )
 
     # web3.py v6: Try to find process_subscriptions on provider
     # web3.py v7+ uses web3.provider instead of web3.ws
@@ -118,8 +118,39 @@ async def _subscription_event_iterator(web3: Any, subscription: Any) -> AsyncIte
         if process_subscriptions is not None:
             process_subscriptions = getattr(process_subscriptions, "process_subscriptions", None)
 
+    # web3.py v7: Use request processor's queue for string subscription IDs
     if process_subscriptions is None:
-        # Provide more detailed error message for debugging
+        request_processor = getattr(web3.provider, "_request_processor", None)
+        if request_processor is not None and subscription_id is not None:
+            # Use the v7 API: pop_raw_response(subscription=True)
+            while True:
+                try:
+                    raw_response = await request_processor.pop_raw_response(subscription=True)
+                    if raw_response is None:
+                        # Queue is empty, wait a bit
+                        await asyncio.sleep(0.1)
+                        continue
+
+                    # Check if this message is for our subscription
+                    payload_subscription = _payload_subscription_id(raw_response)
+                    if payload_subscription == subscription_id:
+                        yield _payload_result(raw_response)
+                    # If not our subscription, skip it (it's for another subscription)
+                except asyncio.CancelledError:
+                    # Task was cancelled, exit cleanly
+                    break
+                except Exception:
+                    # Queue might be closed or other error, exit
+                    break
+            return
+
+        # LAST RESORT: If subscription itself is iterable, use it directly
+        if hasattr(subscription, "__aiter__"):
+            async for item in subscription:
+                yield item
+            return
+
+        # If we get here, we couldn't find any way to iterate subscriptions
         provider_type = type(web3.provider).__name__ if hasattr(web3, 'provider') else 'Unknown'
         sub_type = type(subscription).__name__
         raise RuntimeError(
@@ -135,14 +166,6 @@ async def _subscription_event_iterator(web3: Any, subscription: Any) -> AsyncIte
             raise
         iterator = process_subscriptions()
         iterator = await _await_if_awaitable(iterator)
-        # Get subscription_id: if subscription is a string, it IS the ID
-        if isinstance(subscription, str):
-            subscription_id = subscription
-        else:
-            subscription_id = _normalize_subscription_id(
-                getattr(subscription, "subscription_id", None)
-                or getattr(subscription, "filter_id", None)
-            )
         # Use yield from to delegate to the filtered iterator
         async for item in _filtered_subscription_iterator(iterator, subscription_id):
             yield item
@@ -241,9 +264,16 @@ async def async_iter_websocket_messages(
         # web3.py v6: Use persistent_websocket context manager
         web3 = _AsyncWeb3(async_provider)
 
-        # Connect the provider (web3.py v7 WebSocketProvider needs explicit connect)
+        # Connect the provider
+        # web3.py v7 WebSocketProvider needs explicit connect()
+        # web3.py v6 style providers have socket_connect()
         if hasattr(web3.provider, 'connect') and callable(web3.provider.connect):
             await web3.provider.connect()
+        elif hasattr(web3.provider, 'socket_connect') and callable(web3.provider.socket_connect):
+            web3.provider.socket_connect()
+
+        # Track if we disconnected via web3.provider to avoid double-disconnect
+        disconnected_via_provider = False
 
         try:
             async with _managed_subscription(web3, subscription_params) as subscription:
@@ -255,14 +285,24 @@ async def async_iter_websocket_messages(
                     yield payload
         finally:
             # Disconnect the provider
-            if hasattr(web3.provider, 'disconnect') and callable(web3.provider.disconnect):
-                await web3.provider.disconnect()
+            # web3.py v7: provider.disconnect()
+            disconnect_method = getattr(web3.provider, 'disconnect', None)
+            if disconnect_method is not None and callable(disconnect_method):
+                await _await_if_awaitable(disconnect_method())
+                disconnected_via_provider = True
+            # web3.py v6: provider.socket_disconnect()
+            socket_disconnect_method = getattr(web3.provider, 'socket_disconnect', None)
+            if socket_disconnect_method is not None and callable(socket_disconnect_method):
+                socket_disconnect_method()
+                disconnected_via_provider = True
     finally:
         if on_disconnect is not None:
             on_disconnect()
-        disconnect = getattr(async_provider, "disconnect", None)
-        if callable(disconnect):
-            await _await_if_awaitable(disconnect())
+        # Only call disconnect on async_provider if we didn't already via web3.provider
+        if not disconnected_via_provider:
+            disconnect = getattr(async_provider, "disconnect", None)
+            if callable(disconnect):
+                await _await_if_awaitable(disconnect())
 
 
 class _AsyncErrorWrapper:
