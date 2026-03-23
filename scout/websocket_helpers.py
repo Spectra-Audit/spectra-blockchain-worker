@@ -245,8 +245,7 @@ async def async_iter_websocket_messages(
             async with _managed_subscription(web3, subscription_params) as subscription:
                 if on_connect is not None:
                     on_connect()
-                iterator = await _subscription_event_iterator(web3, subscription)
-                async for payload in iterator:
+                async for payload in _subscription_event_iterator(web3, subscription):
                     if stop_event.is_set():
                         break
                     yield payload
