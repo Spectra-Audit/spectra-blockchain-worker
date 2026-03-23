@@ -1010,6 +1010,25 @@ class FeaturedScout:
         # Convert amount from wei to VERITAS (18 decimals)
         amount_veritas = amount_paid_fees / 1e18
 
+        # Cache the payment event for fast lookup by frontend
+        try:
+            from scout.unified_api import add_payment_event
+            add_payment_event(
+                tx_hash=tx_hash,
+                creator_address=creator_address,
+                amount=int(amount_veritas),  # Store as integer VERITAS amount
+                block_number=block,
+                round_id=round_id,
+            )
+            LOGGER.debug(
+                "Cached payment event",
+                extra={"tx": tx_hash, "creator": creator_address, "amount": amount_veritas}
+            )
+        except ImportError:
+            pass  # unified_api not available
+        except Exception as e:
+            LOGGER.warning(f"Failed to cache payment event: {e}")
+
         # NEW: First try to create project from pending submission (payment-first flow)
         if creator_address:
             try:

@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 try:
@@ -39,6 +40,13 @@ LOGGER = logging.getLogger(__name__)
 # Global orchestrator instance - set by main app
 orchestrator: Optional[AuditOrchestrator] = None
 
+# Payment event cache - stores recently received Paid events from WebSocket
+# Format: {tx_hash: {creator_address, amount, block_number, round_id, received_at}}
+_payment_cache: Dict[str, Dict[str, Any]] = {}
+_payment_cache_lock = threading.RLock()
+# Keep payment events for 1 hour
+_PAYMENT_CACHE_TTL = timedelta(hours=1)
+
 
 def set_orchestrator(orch: AuditOrchestrator) -> None:
     """Set the global orchestrator instance.
@@ -58,6 +66,56 @@ def get_orchestrator() -> Optional[AuditOrchestrator]:
         AuditOrchestrator instance or None
     """
     return orchestrator
+
+
+def add_payment_event(tx_hash: str, creator_address: str, amount: int,
+                     block_number: int, round_id: int) -> None:
+    """Add a payment event to the cache.
+
+    Called by FeaturedScout when a Paid event is received via WebSocket.
+
+    Args:
+        tx_hash: Transaction hash
+        creator_address: Creator wallet address
+        amount: Amount paid in VERITAS (wei)
+        block_number: Block number
+        round_id: Round ID from the event
+    """
+    with _payment_cache_lock:
+        _payment_cache[tx_hash.lower()] = {
+            "creator_address": creator_address.lower(),
+            "amount": amount,
+            "block_number": block_number,
+            "round_id": round_id,
+            "received_at": datetime.utcnow(),
+        }
+        # Clean up old entries
+        _cleanup_payment_cache()
+
+
+def get_payment_event(tx_hash: str) -> Optional[Dict[str, Any]]:
+    """Get a payment event from the cache.
+
+    Args:
+        tx_hash: Transaction hash to look up
+
+    Returns:
+        Payment event data or None if not found
+    """
+    with _payment_cache_lock:
+        _cleanup_payment_cache()
+        return _payment_cache.get(tx_hash.lower())
+
+
+def _cleanup_payment_cache() -> None:
+    """Remove expired entries from the payment cache."""
+    now = datetime.utcnow()
+    expired = [
+        tx_hash for tx_hash, data in _payment_cache.items()
+        if now - data.get("received_at", now) > _PAYMENT_CACHE_TTL
+    ]
+    for tx_hash in expired:
+        del _payment_cache[tx_hash]
 
 
 if HAS_FASTAPI:
@@ -204,6 +262,53 @@ if HAS_FASTAPI:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to retrieve admin wallet: {str(e)}",
             )
+
+    @app.get("/admin/payment/{tx_hash}")
+    async def check_payment_status(tx_hash: str):
+        """Check if a payment transaction has been received via WebSocket subscription.
+
+        The blockchain worker constantly subscribes to Paid events from the
+        VeritasPaymentsAndBids contract. When a payment is detected, it's
+        cached in memory for fast lookup.
+
+        Args:
+            tx_hash: Transaction hash to check (with or without 0x prefix)
+
+        Returns:
+            Payment event data if found, 404 if not found
+
+            Response format when found:
+            {
+                "found": true,
+                "tx_hash": "0x...",
+                "creator_address": "0x...",
+                "amount": 4600,
+                "block_number": 12345,
+                "round_id": 27,
+                "received_at": "2024-01-01T00:00:00Z"
+            }
+        """
+        # Ensure 0x prefix
+        if not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
+
+        payment_data = get_payment_event(tx_hash)
+
+        if not payment_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Payment transaction not found in cache",
+            )
+
+        return {
+            "found": True,
+            "tx_hash": tx_hash,
+            "creator_address": payment_data["creator_address"],
+            "amount": payment_data["amount"],
+            "block_number": payment_data["block_number"],
+            "round_id": payment_data["round_id"],
+            "received_at": payment_data["received_at"].isoformat() + "Z",
+        }
 
     @app.post(
         "/audit/trigger",
