@@ -139,9 +139,15 @@ async def _subscription_event_iterator(web3: Any, subscription: Any) -> AsyncIte
             getattr(subscription, "subscription_id", None)
             or getattr(subscription, "filter_id", None)
         )
-        return _filtered_subscription_iterator(iterator, subscription_id)
+        # Use yield from to delegate to the filtered iterator
+        async for item in _filtered_subscription_iterator(iterator, subscription_id):
+            yield item
+        return
 
-    return await _await_if_awaitable(iterator)
+    # Iterate over the awaitable iterator and yield each item
+    iterator = await _await_if_awaitable(iterator)
+    async for item in iterator:
+        yield item
 
 
 async def _unsubscribe_from_subscription(web3: Any, subscription: Any) -> None:
