@@ -100,8 +100,23 @@ def _filtered_subscription_iterator(
 
 
 async def _subscription_event_iterator(web3: Any, subscription: Any) -> AsyncIterator[Any]:
-    process_subscriptions = getattr(web3.ws, "process_subscriptions", None)
+    # web3.py v7+ uses web3.provider instead of web3.ws
+    # Try multiple locations for process_subscriptions
+    process_subscriptions = getattr(web3.provider, "process_subscriptions", None)
     if process_subscriptions is None:
+        # Fallback to older web3.ws location (v6)
+        process_subscriptions = getattr(web3, "ws", None)
+        if process_subscriptions is not None:
+            process_subscriptions = getattr(process_subscriptions, "process_subscriptions", None)
+
+    if process_subscriptions is None:
+        # If subscription itself has an iterator method, use it directly
+        if hasattr(subscription, "__aiter__"):
+            # The subscription object is itself an async iterator
+            async def _iterate_subscription(sub):
+                async for item in sub:
+                    yield item
+            return _iterate_subscription(subscription)
         raise RuntimeError("web3 websocket connection is missing process_subscriptions")
 
     try:
