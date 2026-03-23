@@ -15,15 +15,18 @@ except Exception:  # pragma: no cover - gracefully handle missing web3
     _AsyncWeb3 = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency
-    from web3.providers.websocket import WebsocketProviderV2 as _WebsocketProviderFactory
+    from web3.providers.persistent.websocket import WebSocketProvider as _WebsocketProviderFactory
 except Exception:  # pragma: no cover - gracefully handle missing implementations
     try:
-        from web3.providers.websocket import WebSocketProvider as _WebsocketProviderFactory
+        from web3.providers.websocket import WebsocketProviderV2 as _WebsocketProviderFactory
     except Exception:
         try:
-            from web3.providers.async_rpc import AsyncWebsocketProvider as _WebsocketProviderFactory
+            from web3.providers.websocket import WebSocketProvider as _WebsocketProviderFactory
         except Exception:
-            _WebsocketProviderFactory = None  # type: ignore[assignment]
+            try:
+                from web3.providers.async_rpc import AsyncWebsocketProvider as _WebsocketProviderFactory
+            except Exception:
+                _WebsocketProviderFactory = None  # type: ignore[assignment]
 
 
 MessageCallback = Optional[Callable[[], None]]
@@ -185,7 +188,15 @@ async def async_iter_websocket_messages(
     async_provider = _WebsocketProviderFactory(endpoint_uri, **provider_kwargs)
 
     try:
-        async with _AsyncWeb3.persistent_websocket(async_provider) as web3:
+        # web3.py v7: Create AsyncWeb3 instance directly with WebSocketProvider
+        # web3.py v6: Use persistent_websocket context manager
+        web3 = _AsyncWeb3(async_provider)
+
+        # Connect the provider (web3.py v7 WebSocketProvider needs explicit connect)
+        if hasattr(web3.provider, 'connect') and callable(web3.provider.connect):
+            await web3.provider.connect()
+
+        try:
             async with _managed_subscription(web3, subscription_params) as subscription:
                 if on_connect is not None:
                     on_connect()
@@ -194,6 +205,10 @@ async def async_iter_websocket_messages(
                     if stop_event.is_set():
                         break
                     yield payload
+        finally:
+            # Disconnect the provider
+            if hasattr(web3.provider, 'disconnect') and callable(web3.provider.disconnect):
+                await web3.provider.disconnect()
     finally:
         if on_disconnect is not None:
             on_disconnect()

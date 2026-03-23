@@ -41,6 +41,19 @@ LOGGER = logging.getLogger(__name__)
 def resolve_ws_provider_class() -> Optional[type]:
     """Return the first available websocket provider class for the current web3 install."""
 
+    # web3.py v7: Persistent WebSocketProvider (for async use with iter_websocket_messages)
+    with contextlib.suppress(ImportError, AttributeError):
+        from web3.providers.persistent.websocket import WebSocketProvider as provider
+
+        if isinstance(provider, type):
+            return provider
+    # web3.py v7: Legacy WebSocketProvider (for sync use)
+    with contextlib.suppress(ImportError, AttributeError):
+        from web3.providers.legacy_websocket import LegacyWebSocketProvider as provider
+
+        if isinstance(provider, type):
+            return provider
+    # web3.py v6: Persistent WebSocketProvider
     with contextlib.suppress(ImportError, AttributeError):
         from web3.providers.persistent import WebSocketProvider as provider
 
