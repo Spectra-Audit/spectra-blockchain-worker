@@ -1660,8 +1660,11 @@ def _load_config_from_env(database: Optional[DatabaseManager] = None) -> ScoutCo
     admin_token = os.environ.get("ADMIN_ACCESS_TOKEN") or wallet.address
     admin_refresh_token = os.environ.get("ADMIN_REFRESH_TOKEN") or wallet.private_key
     poll_interval = int(os.environ.get("POLL_INTERVAL_SEC", "8"))
-    block_batch_size = int(os.environ.get("BLOCK_BATCH_SIZE", "1000"))
+    block_batch_size = int(os.environ.get("BLOCK_BATCH_SIZE", "7200"))
     reorg_conf = int(os.environ.get("REORG_CONF", "5"))
+    etherscan_api_key = os.environ.get("ETHERSCAN_API_KEY", "")
+    if not etherscan_api_key:
+        raise ValueError("ETHERSCAN_API_KEY environment variable is required")
     start_block_env = os.environ.get("START_BLOCK", "latest")
     start_block_latest = start_block_env.lower() == "latest"
     start_block = None
@@ -1683,6 +1686,7 @@ def _load_config_from_env(database: Optional[DatabaseManager] = None) -> ScoutCo
         reorg_confirmations=reorg_conf,
         start_block=start_block,
         start_block_latest=start_block_latest,
+        etherscan_api_key=etherscan_api_key,
         block_batch_size=block_batch_size,
     )
 
