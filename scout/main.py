@@ -134,7 +134,6 @@ class ScoutApp:
         if os.environ.get("PAYMENT_WALLET_ADDRESS"):
             try:
                 payment_wallet_scout = PaymentWalletScout.from_env(
-                    database=database,
                     backend_client=backend_client,
                     ws_provider_pool=shared_pool
                 )

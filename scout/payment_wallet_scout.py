@@ -1,27 +1,23 @@
 """PaymentWalletScout - Monitor USDT/USDC transfers for Pro subscriptions.
 
 This scout monitors ERC-20 Transfer events for USDT/USDC tokens sent to a
-configured wallet address. When accumulated payments reach $20, it creates
-or updates a Subscription record for the user.
+configured wallet address. When payments are detected, it immediately
+forwards them to the backend API for processing.
 
 Key Features:
 - Monitor ERC-20 Transfer() events for specific tokens
-- Track accumulated payments per user
-- Calculate Pro status: $20 = 1 month (proportional)
-- Create/update Subscription records
+- Forward payment events to backend API immediately
+- No local storage - backend handles accumulation and subscription creation
 - On-demand mode only (no background polling)
 """
 
 import logging
 import os
-import sqlite3
 import threading
-import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Optional, Sequence, Dict, Any, Iterator
+from typing import Optional, Sequence, Dict, Any
 
 import requests
 from web3 import Web3
@@ -82,15 +78,17 @@ class PaymentWalletConfig:
     # Reorg safety
     reorg_confirmations: int = 5
 
-    # Database path
-    db_path: str = "payments.db"
-
     # Feature flags
     enable_polling: bool = False  # On-demand mode by default
 
 
 class PaymentWalletScout:
-    """Monitor USDT/USDC transfers to wallet for Pro subscriptions."""
+    """Monitor USDT/USDC transfers to wallet for Pro subscriptions.
+
+    This scout forwards payment events to the backend API immediately,
+    without any local storage. The backend handles all payment tracking,
+    accumulation, and subscription creation.
+    """
 
     # Token contract addresses
     TOKEN_CONTRACTS: Dict[str, str] = {
@@ -102,18 +100,12 @@ class PaymentWalletScout:
         self,
         config: PaymentWalletConfig,
         *,
-        database=None,
         backend_client=None,
         ws_provider_pool=None,
     ):
         self._config = config
-        self._db = database
         self._backend_client = backend_client
         self._ws_provider_pool = ws_provider_pool
-
-        # Local SQLite connection for payment tracking
-        self._conn: Optional[sqlite3.Connection] = None
-        self._db_lock = threading.Lock()
 
         # State management
         self._stop_event = threading.Event()
@@ -123,15 +115,11 @@ class PaymentWalletScout:
         # Web3 setup
         self._web3: Optional[Web3] = None
         self._contracts: Dict[str, Contract] = {}
-        self._last_processed_block: Dict[str, int] = {}
 
         # Thread safety
         self._lock = threading.Lock()
 
-        # Initialize database
-        self._init_database()
-
-        LOGGER.info("PaymentWalletScout initialized", extra={
+        LOGGER.info("PaymentWalletScout initialized (API-only mode)", extra={
             "payment_wallet": config.payment_wallet_address,
             "monitored_tokens": list(config.monitored_tokens),
         })
@@ -164,7 +152,6 @@ class PaymentWalletScout:
         admin_refresh_token = os.environ.get("ADMIN_REFRESH_TOKEN", "")
 
         # Other config
-        db_path = os.environ.get("DB_PATH", "payments.db")
         poll_interval = int(os.environ.get("POLL_INTERVAL_SEC", "60"))
         reorg_conf = int(os.environ.get("REORG_CONF", "5"))
         enable_polling = os.environ.get("ENABLE_POLLING", "").lower() == "true"
@@ -177,65 +164,12 @@ class PaymentWalletScout:
             api_base_url=api_base_url,
             admin_access_token=admin_access_token,
             admin_refresh_token=admin_refresh_token,
-            db_path=db_path,
             poll_interval_sec=poll_interval,
             reorg_confirmations=reorg_conf,
             enable_polling=enable_polling,
         )
 
         return cls(config, **kwargs)
-
-    # Database management -----------------------------------------------
-
-    def _init_database(self) -> None:
-        """Initialize the local SQLite database for payment tracking."""
-        db_path = self._config.db_path
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-
-        with self._write_connection() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS wallet_payments (
-                    id TEXT PRIMARY KEY,
-                    from_address TEXT NOT NULL,
-                    to_address TEXT NOT NULL,
-                    token_address TEXT NOT NULL,
-                    amount NUMERIC NOT NULL,
-                    accumulated_amount NUMERIC NOT NULL DEFAULT 0,
-                    tx_hash TEXT NOT NULL UNIQUE,
-                    block_number INTEGER NOT NULL,
-                    log_index INTEGER NOT NULL,
-                    processed BOOLEAN NOT NULL DEFAULT 0,
-                    subscription_created BOOLEAN NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-                );
-                CREATE INDEX IF NOT EXISTS idx_wallet_payments_from ON wallet_payments(from_address, token_address);
-                CREATE INDEX IF NOT EXISTS idx_wallet_payments_processed ON wallet_payments(processed, subscription_created);
-                CREATE INDEX IF NOT EXISTS idx_wallet_payments_updated ON wallet_payments(updated_at);
-                """
-            )
-
-        LOGGER.info("PaymentWalletScout database initialized", extra={"db_path": db_path})
-
-    @contextmanager
-    def _write_connection(self) -> Iterator[sqlite3.Connection]:
-        """Yield a connection protected by the lock for write operations."""
-        with self._db_lock:
-            try:
-                yield self._conn
-                self._conn.commit()
-            except Exception:
-                self._conn.rollback()
-                raise
-
-    @contextmanager
-    def _read_connection(self) -> Iterator[sqlite3.Connection]:
-        """Yield a connection for read operations."""
-        with self._db_lock:
-            yield self._conn
 
     def start(self) -> None:
         """Start the payment wallet scout."""
@@ -261,12 +195,6 @@ class PaymentWalletScout:
             self._ws_thread.join(timeout=timeout)
             self._ws_thread = None
 
-        # Close database connection
-        if self._conn:
-            with self._db_lock:
-                self._conn.close()
-                self._conn = None
-
         LOGGER.info("PaymentWalletScout stopped")
 
     def _run(self) -> None:
@@ -282,9 +210,6 @@ class PaymentWalletScout:
             self._stop_event.wait()
             LOGGER.info("PaymentWalletScout stopping (on-demand mode)")
             return
-
-        # TODO: Implement polling loop if needed in the future
-        # For now, this scout is designed for on-demand use only
 
     def _initialize_web3(self) -> None:
         """Initialize Web3 and token contracts."""
@@ -321,6 +246,9 @@ class PaymentWalletScout:
     ) -> bool:
         """Process an ERC-20 Transfer event.
 
+        Forwards the payment event to the backend API immediately.
+        The backend handles storage, accumulation, and subscription creation.
+
         Args:
             token_symbol: Token symbol (USDT, USDC)
             from_address: Sender wallet address
@@ -342,39 +270,21 @@ class PaymentWalletScout:
             amount_decimal = Decimal(value) / Decimal(10 ** 18)
             usd_value = amount_decimal * STABLECOIN_PRICE_USD
 
-            LOGGER.info("Processing payment transfer", extra={
+            LOGGER.info("Payment detected - forwarding to backend", extra={
                 "token": token_symbol,
                 "from": from_address,
-                "to": to_address,
                 "amount": str(amount_decimal),
                 "usd_value": str(usd_value),
                 "tx_hash": tx_hash,
             })
 
-            # Calculate months of Pro status
-            months = self._calculate_pro_months(usd_value)
-
-            if months >= 1:
-                # Create or update subscription
-                self._create_or_update_subscription(
-                    from_address,
-                    usd_value,
-                    months,
-                    tx_hash
-                )
-            else:
-                LOGGER.info("Payment below $20 threshold, accumulating", extra={
-                    "from": from_address,
-                    "usd_value": str(usd_value),
-                    "months_needed": 1
-                })
-
-            # Store payment record (would integrate with database)
-            self._store_payment_record(
+            # Forward to backend API immediately
+            self._forward_to_backend(
                 token_symbol,
                 from_address,
                 to_address,
                 amount_decimal,
+                usd_value,
                 tx_hash,
                 block_number,
                 log_index
@@ -388,6 +298,76 @@ class PaymentWalletScout:
                 "tx_hash": tx_hash,
             })
             return False
+
+    def _forward_to_backend(
+        self,
+        token_symbol: str,
+        from_address: str,
+        to_address: str,
+        amount: Decimal,
+        usd_value: Decimal,
+        tx_hash: str,
+        block_number: int,
+        log_index: int
+    ) -> None:
+        """Forward payment event to backend API.
+
+        The backend will:
+        - Store the payment in wallet_payments table
+        - Accumulate payments until $20 threshold
+        - Create subscription when threshold reached
+
+        Args:
+            token_symbol: Token symbol
+            from_address: Sender address
+            to_address: Recipient address
+            amount: Transfer amount
+            usd_value: USD value
+            tx_hash: Transaction hash
+            block_number: Block number
+            log_index: Log index
+        """
+        try:
+            if not self._backend_client:
+                LOGGER.warning("No backend client configured, cannot forward payment")
+                return
+
+            # Calculate months this payment would provide
+            months = self._calculate_pro_months(usd_value)
+
+            # Forward to backend subscription endpoint
+            endpoint = "/payments/wallet/subscription"
+            payload = {
+                "wallet_address": from_address,
+                "usd_amount": str(usd_value),
+                "months": months,
+                "tx_hash": tx_hash,
+                "token_address": self.TOKEN_CONTRACTS.get(token_symbol, ""),
+            }
+
+            response = self._backend_client.post(endpoint, json=payload, timeout=30.0)
+
+            if response and response.status_code in (200, 201):
+                LOGGER.info("Payment forwarded to backend successfully", extra={
+                    "wallet": from_address,
+                    "usd_value": str(usd_value),
+                    "months": months,
+                    "tx_hash": tx_hash,
+                    "status": response.status_code,
+                })
+            else:
+                LOGGER.warning("Backend returned non-success status", extra={
+                    "wallet": from_address,
+                    "status": response.status_code if response else None,
+                    "response": response.text if response else None,
+                    "tx_hash": tx_hash,
+                })
+
+        except Exception as e:
+            LOGGER.error("Failed to forward payment to backend", extra={
+                "error": str(e),
+                "tx_hash": tx_hash,
+            })
 
     def _calculate_pro_months(self, usd_value: Decimal) -> int:
         """Calculate number of Pro months from USD value.
@@ -403,311 +383,6 @@ class PaymentWalletScout:
 
         months = int(usd_value / PRO_PRICE_USD)
         return max(months, 1)  # Minimum 1 month
-
-    def _create_or_update_subscription(
-        self,
-        wallet_address: str,
-        usd_value: Decimal,
-        months: int,
-        tx_hash: str
-    ) -> None:
-        """Create or update subscription for user.
-
-        Args:
-            wallet_address: User's wallet address
-            usd_value: Payment amount in USD
-            months: Number of months to grant
-            tx_hash: Transaction hash
-        """
-        try:
-            # Calculate subscription period
-            period_start = datetime.utcnow()
-            period_end = period_start + timedelta(days=30 * months)
-
-            LOGGER.info("Creating/updating subscription", extra={
-                "wallet": wallet_address,
-                "usd_value": str(usd_value),
-                "months": months,
-                "period_start": period_start.isoformat(),
-                "period_end": period_end.isoformat(),
-            })
-
-            # Call backend API to create/update subscription
-            success = self._call_backend_subscription_api(
-                wallet_address,
-                period_start,
-                period_end,
-                usd_value,
-                months,
-                tx_hash
-            )
-
-            # Mark payment as processed and subscription created if successful
-            if success:
-                self._mark_payment_processed(tx_hash, subscription_created=True)
-
-        except Exception as e:
-            LOGGER.error("Failed to create/update subscription", extra={
-                "error": str(e),
-                "wallet": wallet_address,
-            })
-
-    def _call_backend_subscription_api(
-        self,
-        wallet_address: str,
-        period_start: datetime,
-        period_end: datetime,
-        usd_value: Decimal,
-        months: int,
-        tx_hash: str
-    ) -> bool:
-        """Call backend API to create/update subscription.
-
-        Args:
-            wallet_address: User's wallet address
-            period_start: Subscription start date
-            period_end: Subscription end date
-            usd_value: Payment amount in USD
-            months: Number of months
-            tx_hash: Transaction hash
-
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            if not self._backend_client:
-                LOGGER.warning("No backend client configured, skipping API call")
-                return False
-
-            endpoint = "/payments/wallet/subscription"
-            payload = {
-                "wallet_address": wallet_address,
-                "usd_amount": str(usd_value),
-                "months": months,
-                "tx_hash": tx_hash,
-                "token_address": "",  # Will be filled by the backend
-            }
-
-            response = self._backend_client.post(endpoint, json=payload, timeout=30.0)
-
-            if response and response.status_code in (200, 201):
-                LOGGER.info("Backend subscription API called successfully", extra={
-                    "wallet": wallet_address,
-                    "period_end": period_end.isoformat(),
-                    "months": months,
-                    "status": response.status_code,
-                })
-                return True
-            else:
-                LOGGER.warning("Backend subscription API returned non-success status", extra={
-                    "wallet": wallet_address,
-                    "status": response.status_code if response else None,
-                    "response": response.text if response else None,
-                })
-                return False
-
-        except Exception as e:
-            LOGGER.error("Failed to call backend API", extra={
-                "error": str(e)
-            })
-            return False
-
-    def _store_payment_record(
-        self,
-        token_symbol: str,
-        from_address: str,
-        to_address: str,
-        amount: Decimal,
-        tx_hash: str,
-        block_number: int,
-        log_index: int
-    ) -> None:
-        """Store payment record in database.
-
-        Args:
-            token_symbol: Token symbol
-            from_address: Sender address
-            to_address: Recipient address
-            amount: Transfer amount
-            tx_hash: Transaction hash
-            block_number: Block number
-            log_index: Log index
-        """
-        try:
-            import uuid
-            token_address = self.TOKEN_CONTRACTS.get(token_symbol, "")
-            payment_id = str(uuid.uuid4())
-
-            # Calculate accumulated amount for this sender
-            with self._read_connection() as conn:
-                cursor = conn.execute(
-                    "SELECT COALESCE(SUM(amount), 0) FROM wallet_payments WHERE from_address = ?",
-                    (from_address.lower(),)
-                )
-                previous_total = Decimal(cursor.fetchone()[0] or "0")
-
-            accumulated_amount = previous_total + amount
-
-            with self._write_connection() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO wallet_payments (
-                        id, from_address, to_address, token_address, amount,
-                        accumulated_amount, tx_hash, block_number, log_index,
-                        processed, subscription_created
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        payment_id,
-                        from_address.lower(),
-                        to_address.lower(),
-                        token_address.lower(),
-                        str(amount),
-                        str(accumulated_amount),
-                        tx_hash,
-                        block_number,
-                        log_index,
-                        False,  # processed
-                        False,  # subscription_created
-                    )
-                )
-
-            LOGGER.info("Stored payment record", extra={
-                "token": token_symbol,
-                "from": from_address,
-                "amount": str(amount),
-                "accumulated": str(accumulated_amount),
-                "tx_hash": tx_hash,
-            })
-
-        except Exception as e:
-            LOGGER.error("Failed to store payment record", extra={
-                "error": str(e)
-            })
-
-    def _mark_payment_processed(self, tx_hash: str, subscription_created: bool = False) -> None:
-        """Mark a payment as processed.
-
-        Args:
-            tx_hash: Transaction hash
-            subscription_created: Whether subscription was created for this payment
-        """
-        try:
-            with self._write_connection() as conn:
-                conn.execute(
-                    """
-                    UPDATE wallet_payments
-                    SET processed = 1, subscription_created = ?, updated_at = datetime('now')
-                    WHERE tx_hash = ?
-                    """,
-                    (1 if subscription_created else 0, tx_hash)
-                )
-
-            LOGGER.info("Marked payment as processed", extra={
-                "tx_hash": tx_hash,
-                "subscription_created": subscription_created,
-            })
-
-        except Exception as e:
-            LOGGER.error("Failed to mark payment as processed", extra={
-                "error": str(e),
-                "tx_hash": tx_hash,
-            })
-
-    def check_wallet_payment_status(self, wallet_address: str) -> Dict[str, Any]:
-        """Check payment status for a wallet address.
-
-        This is an on-demand method that can be called by the frontend
-        to check if a user has made any recent payments.
-
-        Args:
-            wallet_address: User's wallet address
-
-        Returns:
-            Dictionary with payment status:
-            {
-                "wallet_address": str,
-                "has_payments": bool,
-                "accumulated_amount": str,
-                "months_earned": int,
-                "subscription_active": bool,
-                "subscription_end": Optional[str],
-                "next_tier_milestone": str
-            }
-        """
-        try:
-            with self._read_connection() as conn:
-                # Get all payments for this wallet
-                cursor = conn.execute(
-                    """
-                    SELECT COUNT(*), COALESCE(SUM(amount), 0)
-                    FROM wallet_payments
-                    WHERE from_address = ?
-                    """,
-                    (wallet_address.lower(),)
-                )
-                payment_count, total_amount = cursor.fetchone()
-
-                # Get latest payment info
-                cursor = conn.execute(
-                    """
-                    SELECT subscription_created, updated_at
-                    FROM wallet_payments
-                    WHERE from_address = ?
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (wallet_address.lower(),)
-                )
-                row = cursor.fetchone()
-                subscription_created = row[0] if row else False
-
-                total_amount = Decimal(str(total_amount))
-                months_earned = int(total_amount / PRO_PRICE_USD)
-
-                result = {
-                    "wallet_address": wallet_address,
-                    "has_payments": payment_count > 0,
-                    "accumulated_amount": str(total_amount),
-                    "months_earned": months_earned,
-                    "subscription_active": subscription_created,
-                    "subscription_end": None,
-                    "next_tier_milestone": str(max(0, PRO_PRICE_USD - total_amount)),
-                }
-
-            # Optionally fetch real-time subscription status from backend
-            if self._backend_client:
-                try:
-                    endpoint = f"/payments/wallet/check/{wallet_address}"
-                    response = self._backend_client.get(endpoint, timeout=10.0)
-
-                    if response and response.status_code == 200:
-                        backend_data = response.json()
-                        # Merge backend data with local data
-                        result["subscription_active"] = backend_data.get("subscription_active", result["subscription_active"])
-                        result["subscription_end"] = backend_data.get("subscription_end")
-                except Exception as api_error:
-                    LOGGER.debug("Failed to fetch backend subscription status", extra={
-                        "error": str(api_error),
-                        "wallet": wallet_address,
-                    })
-
-            return result
-
-        except Exception as e:
-            LOGGER.error("Failed to check payment status", extra={
-                "error": str(e),
-                "wallet": wallet_address
-            })
-            return {
-                "wallet_address": wallet_address,
-                "has_payments": False,
-                "accumulated_amount": "0",
-                "months_earned": 0,
-                "subscription_active": False,
-                "subscription_end": None,
-                "error": str(e),
-            }
 
     def _start_ws_listener(self) -> None:
         """Start WebSocket listener for real-time Transfer events."""
