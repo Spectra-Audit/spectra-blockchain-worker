@@ -121,12 +121,30 @@ EVENT_ABI: List[Dict[str, Any]] = [
         "name": "Paid",
         "type": "event",
     },
+    {
+        "inputs": [],
+        "name": "winningBids",
+        "outputs": [
+            {
+                "components": [
+                    {"internalType": "address", "name": "creator", "type": "address"},
+                    {"internalType": "bytes32", "name": "projectId", "type": "bytes32"},
+                    {"internalType": "uint256", "name": "amount", "type": "uint256"},
+                ],
+                "internalType": "struct LeaderEntry[]",
+                "name": "winners",
+                "type": "tuple[]"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 
 @dataclass(frozen=True)
 class ScoutConfig:
-    rpc_http_urls: Sequence[str]
+    rpc_http_urls: Sequence[str]  # Deprecated: Not used, WebSocket + Etherscan only
     rpc_ws_urls: Sequence[str]
     contract_address: str
     chain_id: Optional[int]
@@ -141,7 +159,10 @@ class ScoutConfig:
     reorg_confirmations: int
     start_block: Optional[int]
     start_block_latest: bool
-    block_batch_size: int = 7200
+    etherscan_api_key: str  # Required: Etherscan API key for catch-up
+    block_batch_size: int = 7200  # Used for Etherscan pagination
+    featured_sync_interval_sec: int = 604800  # 7 days (1 week)
+    etherscan_poll_interval_sec: int = 3  # Respect Etherscan 3 calls/sec rate limit
 
 
 class FeaturedScout:
@@ -230,6 +251,9 @@ class FeaturedScout:
         self._ws_healthy_block_requirement = 1
         self._ws_healthy_since_time = 0.0
         self._ws_healthy_since_block = 0
+        # Featured projects sync tracking
+        self._last_featured_sync_time = 0.0
+        self._featured_sync_meta_key = "featured_last_sync_time"
         self._ws_provider_pool = ws_provider_pool or WebSocketProviderPool(
             provider_resolver=resolve_ws_provider_class
         )
@@ -424,38 +448,86 @@ class FeaturedScout:
 
     def _run(self) -> None:
         LOGGER.info("FeaturedScout loop started")
+
+        # Sync featured projects from contract on startup
+        if self._should_sync_featured_projects():
+            LOGGER.info("Syncing featured projects from contract on startup")
+            self._sync_featured_projects_from_contract()
+
         try:
             while not self._stop_event.is_set():
-                if not self._poll_gate.wait(timeout=self._config.poll_interval_sec):
+                # Determine poll interval based on connection health
+                # Use Etherscan rate limit (3 sec) when WebSocket is not healthy
+                # Use longer interval when WebSocket is healthy (reduces unnecessary checks)
+                with self._ws_state_lock:
+                    ws_ready = self._ws_ready.is_set()
+                    ws_healthy = self._is_websocket_healthy()
+                if ws_ready and ws_healthy:
+                    poll_interval = self._config.poll_interval_sec  # Normal interval
+                else:
+                    poll_interval = self._config.etherscan_poll_interval_sec  # Etherscan rate limit
+
+                if not self._poll_gate.wait(timeout=poll_interval):
                     self._evaluate_polling_state()
                     continue
+
+                # Check if it's time to sync featured projects
+                if self._should_sync_featured_projects():
+                    LOGGER.info("Periodic featured projects sync")
+                    self._sync_featured_projects_from_contract()
+
                 success = self._poll_once()
                 if self._once:
                     break
                 if not success:
-                    time.sleep(self._config.poll_interval_sec)
+                    time.sleep(poll_interval)
                     continue
-                time.sleep(self._config.poll_interval_sec)
+                time.sleep(poll_interval)
         finally:
             LOGGER.info("FeaturedScout loop exited")
 
     def _poll_once(self) -> bool:
-        web3 = self._ensure_provider()
-        if web3 is None:
+        """Poll for logs using Etherscan when WebSocket is not available.
+
+        Architecture:
+        - WebSocket eth_subscribe: Primary, real-time, zero HTTP
+        - Etherscan getLogs: Fallback for catch-up only
+
+        No HTTP RPC polling for logs used.
+        """
+        # Check if WebSocket is healthy and handling new blocks
+        with self._ws_state_lock:
+            ws_ready = self._ws_ready.is_set()
+            ws_healthy = self._is_websocket_healthy()
+        if ws_ready and ws_healthy:
+            # WebSocket is handling new blocks, no need to poll
+            LOGGER.debug(
+                "Skipping poll (WebSocket is healthy)",
+                extra={
+                    "ws_ready": ws_ready,
+                    "ws_healthy": ws_healthy,
+                    "ws_last_block": self._ws_last_block,
+                },
+            )
+            # Update last block to track WebSocket progress
+            with self._lock:
+                if self._ws_last_block > 0:
+                    self._save_last_block(self._ws_last_block)
+                    self._last_block = self._ws_last_block
+            self._evaluate_polling_state()
+            return True
+
+        # WebSocket is not healthy, use Etherscan to catch up
+        latest_block = self._get_current_block_number()
+        if latest_block is None:
+            LOGGER.warning("Cannot get current block number from Etherscan or RPC")
             return False
-        try:
-            latest_block = web3.eth.block_number
-        except Exception as exc:  # noqa: BLE001
-            self._handle_provider_error(exc)
-            return False
-        self._mark_provider_success()
+
         safe_block = max(
             latest_block - (self._effective_reorg_confirmations - 1), 0
         )
         self._last_safe_block = safe_block
-        with self._ws_state_lock:
-            ws_ready = self._ws_ready.is_set()
-            ws_start_block = self._ws_start_block
+
         with self._lock:
             last_block = self._load_last_block()
             if last_block is None:
@@ -465,81 +537,97 @@ class FeaturedScout:
                     last_block = max((self._config.start_block or 0) - 1, 0)
                 self._save_last_block(last_block)
             self._last_block = last_block
-        poll_end_block = safe_block
-        if ws_ready and ws_start_block is not None:
-            poll_end_block = min(poll_end_block, ws_start_block)
-        if poll_end_block <= last_block:
+
+        # No new blocks to process
+        if safe_block <= last_block:
             LOGGER.debug(
                 "No new finalized blocks",
                 extra={"safe_block": safe_block, "last_block": last_block},
             )
-            self._evaluate_polling_state()
             return True
+
+        # Catch up from last_block to safe_block using Etherscan
         window_start = last_block + 1
-        window_end = poll_end_block
-        batch_size = self._config.block_batch_size
+        window_end = safe_block
+
+        # Use larger batch size for Etherscan (max 1000 per request)
+        batch_size = min(self._config.block_batch_size, 1000)
+
+        blocks_behind = window_end - window_start + 1
+        LOGGER.info(
+            "Catching up using Etherscan",
+            extra={
+                "from_block": window_start,
+                "to_block": window_end,
+                "blocks_behind": blocks_behind,
+            },
+        )
+
         total_logs = 0
         current_from = window_start
+        page = 1
+
         while current_from <= window_end:
             if self._stop_event.is_set():
                 return False
             current_to = min(current_from + batch_size - 1, window_end)
-            from_block = self._to_hex_block(current_from)
-            to_block = self._to_hex_block(current_to)
-            filter_params: FilterParams = {
-                "address": self._checksum_contract_address,
-                "fromBlock": from_block,
-                "toBlock": to_block,
-                "topics": [[topic for topic in self._event_topic_map]],
-            }
-            LOGGER.info(
-                "Fetching logs from %s to %s",
-                current_from,
-                current_to,
-                extra={"from_block": current_from, "to_block": current_to},
+
+            # Use Etherscan API for log fetching
+            logs = self._fetch_logs_from_etherscan(
+                from_block=current_from,
+                to_block=current_to,
+                page=page,
+                offset=batch_size,
             )
-            try:
-                logs: Sequence[LogReceipt] = web3.eth.get_logs(filter_params)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.exception(
-                    "Failed to fetch logs",
-                    extra={"from_block": current_from, "to_block": current_to},
-                    exc_info=exc,
+            if logs is None:
+                LOGGER.error(
+                    "Failed to fetch logs from Etherscan",
+                    extra={"from_block": current_from, "to_block": current_to}
                 )
-                self._handle_provider_error(exc)
                 return False
-            self._mark_provider_success()
+
+            # Sort logs by blockNumber and logIndex
             sorted_logs = sorted(
                 logs, key=lambda entry: (entry["blockNumber"], entry["logIndex"])
             )
+
+            # Process logs
             for log_entry in sorted_logs:
                 if self._stop_event.is_set():
                     return False
                 if not self._process_log_entry(log_entry):
                     return False
+
+            # Update progress
             with self._lock:
                 self._save_last_block(current_to)
                 self._last_block = current_to
+
             total_logs += len(sorted_logs)
             LOGGER.info(
-                "Processed block chunk %s-%s",
+                "Processed block chunk %s-%s (Etherscan page %d)",
                 current_from,
                 current_to,
+                page,
                 extra={
                     "from_block": current_from,
                     "to_block": current_to,
                     "log_count": len(sorted_logs),
                 },
             )
+
             current_from = current_to + 1
+
+            # Check if we need to fetch more pages (Etherscan pagination)
+            if len(sorted_logs) == batch_size:
+                page += 1
+
         LOGGER.info(
-            "Processed blocks %s-%s",
-            window_start,
-            window_end,
+            "Catch-up complete via Etherscan",
             extra={
                 "from_block": window_start,
                 "to_block": window_end,
-                "log_count": total_logs,
+                "total_logs": total_logs,
             },
         )
         self._evaluate_polling_state()
@@ -572,7 +660,12 @@ class FeaturedScout:
             return False
         event_name = event_data["event"]
         if event_name == "RoundFinalized":
-            return self._handle_round_finalized(event_data)
+            # Skip RoundFinalized events - we use the winningBids() view function instead
+            LOGGER.debug(
+                "Skipping RoundFinalized event (using winningBids view function)",
+                extra={"event": event_name}
+            )
+            return True
         if event_name == "Paid":
             return self._handle_paid(event_data)
         LOGGER.debug("Unhandled event", extra={"event": event_name})
@@ -644,6 +737,154 @@ class FeaturedScout:
                 )
         self._upsert_featured_projects(round_id, projects_current)
         return True
+
+    def _sync_featured_projects_from_contract(self) -> bool:
+        """Sync featured projects by calling the winningBids() view function directly.
+
+        This is more efficient than processing RoundFinalized events because:
+        - Only the current round's winners matter
+        - No need to scan historical events
+        - Direct contract call returns the current state
+        """
+        web3 = self._get_web3_for_contract_calls()
+        if web3 is None:
+            return False
+
+        try:
+            # Call the winningBids() view function
+            contract = web3.eth.contract(
+                address=self._checksum_contract_address,
+                abi=EVENT_ABI
+            )
+            winners_result = contract.functions.winningBids().call()
+
+            # Extract winner data from the result
+            # winners_result is a list of tuples: (creator_address, project_id_bytes, amount)
+            current_featured_hexes: List[str] = []
+            block = web3.eth.block_number
+
+            for winner in winners_result:
+                if len(winner) < 2:
+                    continue
+                creator_address = winner[0] if isinstance(winner[0], str) else winner[0].hex()
+                project_id_bytes = winner[1]
+                project_hex = self._normalize_project_hex(project_id_bytes)
+                if project_hex is None:
+                    LOGGER.warning(
+                        "Winner projectId decode failed in sync",
+                        extra={"creator": creator_address}
+                    )
+                    continue
+                current_featured_hexes.append(project_hex)
+
+            # Get previously featured projects from database (any round)
+            previous_featured = self._list_all_featured_projects()
+
+            # Mark new winners as featured
+            for project_hex in current_featured_hexes:
+                if project_hex in previous_featured:
+                    continue  # Already featured
+                backend_id = self._resolve_backend_project_id(project_hex)
+                if backend_id is None:
+                    LOGGER.warning(
+                        "No backend mapping for featured project",
+                        extra={"project_hex": project_hex}
+                    )
+                    continue
+                if not self._patch_project(backend_id, {"is_featured": True}):
+                    return False
+                LOGGER.info(
+                    "Marked project as featured (via contract view)",
+                    extra={
+                        "project_hex": project_hex,
+                        "backend_id": backend_id,
+                        "action": "feature",
+                        "block": block,
+                    },
+                )
+
+            # Unfeature projects that are no longer in the current winners
+            for project_hex in previous_featured:
+                if project_hex in current_featured_hexes:
+                    continue  # Still featured
+                backend_id = self._resolve_backend_project_id(project_hex)
+                if backend_id is None:
+                    continue
+                if not self._patch_project(backend_id, {"is_featured": False}):
+                    return False
+                LOGGER.info(
+                    "Cleared featured flag (via contract view)",
+                    extra={
+                        "project_hex": project_hex,
+                        "backend_id": backend_id,
+                        "action": "unfeature",
+                        "block": block,
+                    },
+                )
+
+            # Update the featured projects table with current winners (using a synthetic round ID)
+            # Use current timestamp as round ID to indicate this is from a direct contract view
+            synthetic_round_id = int(time.time() // self._config.featured_sync_interval_sec)
+            self._upsert_featured_projects(synthetic_round_id, current_featured_hexes)
+
+            # Update last sync time
+            self._last_featured_sync_time = time.time()
+            self._save_featured_sync_time(self._last_featured_sync_time)
+
+            LOGGER.info(
+                "Synced featured projects from contract",
+                extra={
+                    "count": len(current_featured_hexes),
+                    "projects": current_featured_hexes[:5],  # Log first 5
+                },
+            )
+            return True
+
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Failed to sync featured projects from contract", exc_info=exc)
+            return False
+
+    def _list_all_featured_projects(self) -> List[str]:
+        """List all featured projects from the database across all rounds."""
+        try:
+            cursor = self._db.get_connection().cursor()
+            cursor.execute(
+                """
+                SELECT DISTINCT project_hex FROM featured_projects
+                ORDER BY project_hex
+                """
+            )
+            return [row[0] for row in cursor.fetchall()]
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Failed to list featured projects", exc_info=exc)
+            return []
+
+    def _save_featured_sync_time(self, sync_time: float) -> None:
+        """Save the last featured sync time to the database."""
+        try:
+            self._db.set_meta(self._featured_sync_meta_key, str(sync_time))
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Failed to save featured sync time", exc_info=exc)
+
+    def _load_featured_sync_time(self) -> Optional[float]:
+        """Load the last featured sync time from the database."""
+        try:
+            value = self._db.get_meta(self._featured_sync_meta_key)
+            if value:
+                return float(value)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _should_sync_featured_projects(self) -> bool:
+        """Check if it's time to sync featured projects from the contract."""
+        now = time.time()
+        last_sync = self._load_featured_sync_time()
+        if last_sync is None:
+            # Never synced, do it now
+            return True
+        time_since_sync = now - last_sync
+        return time_since_sync >= self._config.featured_sync_interval_sec
 
     def _process_log_entry(self, log_entry: LogReceipt) -> bool:
         tx_hash = self._coerce_hex_str(log_entry.get("transactionHash"))
@@ -886,6 +1127,142 @@ class FeaturedScout:
                 self._ws_healthy_since_time = timestamp
                 self._ws_healthy_since_block = max(block_number, 0)
             return self._ws_healthy_since_time, self._ws_healthy_since_block
+
+    def _is_websocket_healthy(self) -> bool:
+        """Check if WebSocket connection is healthy and should be used instead of HTTP.
+
+        Returns True if WebSocket is ready, receiving messages, and making progress.
+        """
+        with self._ws_state_lock:
+            if not self._ws_ready.is_set():
+                return False
+            now = time.time()
+            # Check if WebSocket is receiving messages
+            if self._ws_last_message == 0.0 or (now - self._ws_last_message) > self._ws_stale_threshold:
+                return False
+            # Check if WebSocket is making progress (processing blocks)
+            healthy_since_time, healthy_since_block = self._ensure_ws_health_marker(
+                self._ws_last_block, now
+            )
+            healthy_time_elapsed = (now - healthy_since_time) >= self._ws_healthy_time_requirement
+            healthy_block_span = self._ws_last_block - healthy_since_block
+            healthy_enough = healthy_time_elapsed or (
+                healthy_block_span >= self._ws_healthy_block_requirement
+            )
+            return healthy_enough
+
+    def _fetch_logs_from_etherscan(
+        self,
+        from_block: int,
+        to_block: int,
+        page: int = 1,
+        offset: int = 1000,
+    ) -> Optional[List[LogReceipt]]:
+        """Fetch logs from Etherscan API instead of direct RPC calls.
+
+        Etherscan API is more reliable and handles large block ranges efficiently.
+        Rate limit: 3 calls/sec for free tier.
+        """
+        if not self._config.etherscan_api_key:
+            LOGGER.warning("Etherscan API key not configured, cannot use Etherscan fallback")
+            return None
+
+        chain_id = self._config.chain_id or 1
+        url = "https://api.etherscan.io/v2/api"
+        params = {
+            "chainid": str(chain_id),
+            "module": "logs",
+            "action": "getLogs",
+            "address": self._checksum_contract_address,
+            "fromBlock": from_block,
+            "toBlock": to_block,
+            "page": page,
+            "offset": offset,
+            "apikey": self._config.etherscan_api_key,
+        }
+
+        try:
+            LOGGER.debug(
+                "Fetching logs from Etherscan",
+                extra={
+                    "from_block": from_block,
+                    "to_block": to_block,
+                    "page": page,
+                    "offset": offset,
+                },
+            )
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("status") != "1":
+                error_msg = data.get("message", "Unknown error")
+                LOGGER.warning(
+                    "Etherscan API error",
+                    extra={"error": error_msg, "response": data},
+                )
+                return None
+
+            # Convert Etherscan format to web3 LogReceipt format
+            logs = []
+            for log in data.get("result", []):
+                logs.append({
+                    "address": log["address"],
+                    "topics": [bytes.fromhex(t[2:]) if t.startswith("0x") else t for t in log["topics"]],
+                    "data": log["data"],
+                    "blockNumber": int(log["blockNumber"], 16),
+                    "transactionHash": bytes.fromhex(log["transactionHash"][2:]),
+                    "logIndex": int(log.get("logIndex", "0"), 16),
+                    "transactionIndex": int(log.get("transactionIndex", "0"), 16),
+                })
+
+            LOGGER.info(
+                "Fetched logs from Etherscan",
+                extra={
+                    "from_block": from_block,
+                    "to_block": to_block,
+                    "log_count": len(logs),
+                },
+            )
+            return logs
+
+        except requests.RequestException as exc:
+            LOGGER.warning("Etherscan API request failed", exc_info=exc)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Failed to fetch logs from Etherscan", exc_info=exc)
+            return None
+
+    def _get_current_block_number(self) -> Optional[int]:
+        """Get the current block number, trying Etherscan first then RPC fallback.
+
+        Returns None if both methods fail.
+        """
+        # Try Etherscan first (lightweight, no full RPC connection needed)
+        block_number = self._get_current_block_number_from_etherscan()
+        if block_number is not None:
+            return block_number
+
+        # Fallback: Use minimal RPC connection
+        if self._rpc_urls:
+            try:
+                web3 = Web3(Web3.HTTPProvider(self._rpc_urls[0]))
+                return web3.eth.block_number
+            except Exception as exc:
+                LOGGER.warning("Failed to get block number from RPC", exc_info=exc)
+        return None
+
+    def _get_web3_for_contract_calls(self) -> Optional[Web3]:
+        """Get a Web3 instance for making contract view calls (e.g., winningBids).
+
+        Creates a minimal HTTP provider only when needed.
+        """
+        if self._rpc_urls:
+            try:
+                return Web3(Web3.HTTPProvider(self._rpc_urls[0]))
+            except Exception as exc:
+                LOGGER.warning("Failed to create Web3 for contract calls", exc_info=exc)
+        return None
 
     def _evaluate_polling_state(self) -> None:
         if self._stop_event.is_set():

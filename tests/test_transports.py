@@ -627,6 +627,7 @@ def test_featured_scout_topics_are_hex_prefixed(tmp_path, scout_modules):
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
     scout = featured.FeaturedScout(config, once=True)
     topics = list(scout._event_topic_map.keys())
@@ -666,6 +667,7 @@ def test_featured_scout_processes_http_and_websocket_logs(tmp_path, scout_module
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
     scout = featured.FeaturedScout(config, once=True)
     scout._handle_log = lambda *args, **kwargs: True  # type: ignore[assignment]
@@ -724,6 +726,7 @@ def test_featured_scout_limits_http_window_when_ws_ready(tmp_path, scout_modules
         reorg_confirmations=2,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
     scout = featured.FeaturedScout(config, once=True)
     scout._process_log_entry = lambda *args, **kwargs: True  # type: ignore[assignment]
@@ -797,6 +800,7 @@ def test_featured_scout_pauses_http_when_websocket_healthy(tmp_path, scout_modul
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
 
     scout = featured.FeaturedScout(config, once=True)
@@ -862,6 +866,7 @@ def test_featured_scout_http_catch_up_synchronizes_ws_progress(
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
 
     scout = featured.FeaturedScout(config, once=True)
@@ -1157,6 +1162,7 @@ def test_featured_scout_rotates_rpc_endpoints(tmp_path, scout_modules):
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
     scout = featured.FeaturedScout(config, once=True)
     scout._handle_log = lambda *args, **kwargs: True  # type: ignore[assignment]
@@ -1315,6 +1321,7 @@ def test_featured_scout_websocket_retries_before_switch(monkeypatch, tmp_path, s
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
     scout = featured.FeaturedScout(config, once=True)
 
@@ -1378,6 +1385,7 @@ def test_featured_scout_ws_provider_without_timeout(monkeypatch, tmp_path, scout
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
     scout = featured.FeaturedScout(config, once=True)
 
@@ -1412,6 +1420,7 @@ def test_featured_scout_consumes_persistent_provider(monkeypatch, tmp_path, scou
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
 
     scout = featured.FeaturedScout(config, once=True)
@@ -1477,6 +1486,7 @@ def test_featured_scout_skips_non_text_websocket_payload(
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
 
     scout = featured.FeaturedScout(config, once=True)
@@ -1608,6 +1618,7 @@ def test_featured_scout_ws_provider_fallback(monkeypatch, caplog, tmp_path, scou
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
     scout = featured.FeaturedScout(config, once=True)
 

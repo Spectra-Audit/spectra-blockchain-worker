@@ -135,6 +135,7 @@ def test_featured_scout_prefers_first_rpc_on_start(tmp_path: Path) -> None:
         reorg_confirmations=1,
         start_block=None,
         start_block_latest=True,
+        etherscan_api_key="test_key",
     )
 
     scout = FeaturedScout(config, database=db, backend_client=DummyBackendClient())

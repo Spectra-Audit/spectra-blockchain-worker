@@ -116,6 +116,7 @@ def test_reorg_confirmation_is_normalized(
         start_block=None,
         start_block_latest=True,
         block_batch_size=10,
+        etherscan_api_key="test_key",
     )
 
     scout = FeaturedScout(config, backend_client=DummyBackendClient())
