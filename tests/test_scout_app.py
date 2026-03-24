@@ -47,11 +47,13 @@ def env_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]
     monkeypatch.setenv("RPC_HTTP_URL", "http://rpc.local")
     monkeypatch.setenv("API_BASE_URL", "http://api.local")
     monkeypatch.setenv("PROJECT_ID_RESOLVER_URL", "http://resolver.local")
+    monkeypatch.setenv("ETHERSCAN_API_KEY", "test_key")
     yield db_path
     monkeypatch.delenv("SCOUT_DB_PATH", raising=False)
     monkeypatch.delenv("RPC_HTTP_URL", raising=False)
     monkeypatch.delenv("API_BASE_URL", raising=False)
     monkeypatch.delenv("PROJECT_ID_RESOLVER_URL", raising=False)
+    monkeypatch.delenv("ETHERSCAN_API_KEY", raising=False)
 
 
 @pytest.fixture()

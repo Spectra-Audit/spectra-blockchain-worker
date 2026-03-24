@@ -234,7 +234,7 @@ class FeaturedScout:
         self._last_safe_block = 0
         self._last_block = 0
         self._ws_ready = threading.Event()
-        self._ws_state_lock = threading.Lock()
+        self._ws_state_lock = threading.RLock()  # Reentrant lock for nested calls
         self._ws_last_block = 0
         self._ws_last_message = 0.0
         self._ws_start_block: Optional[int] = None
@@ -519,6 +519,7 @@ class FeaturedScout:
                 if self._ws_last_block > 0:
                     self._save_last_block(self._ws_last_block)
                     self._last_block = self._ws_last_block
+            self._mark_provider_success()
             self._evaluate_polling_state()
             return True
 
@@ -549,6 +550,7 @@ class FeaturedScout:
                 "No new finalized blocks",
                 extra={"safe_block": safe_block, "last_block": last_block},
             )
+            self._mark_provider_success()
             return True
 
         # Catch up from last_block to safe_block using Etherscan
@@ -577,7 +579,7 @@ class FeaturedScout:
                 return False
             current_to = min(current_from + batch_size - 1, window_end)
 
-            # Use Etherscan API for log fetching
+            # Use Etherscan API for log fetching, with fallback to Web3
             logs = self._fetch_logs_from_etherscan(
                 from_block=current_from,
                 to_block=current_to,
@@ -585,11 +587,27 @@ class FeaturedScout:
                 offset=batch_size,
             )
             if logs is None:
-                LOGGER.error(
-                    "Failed to fetch logs from Etherscan",
-                    extra={"from_block": current_from, "to_block": current_to}
-                )
-                return False
+                # Fallback: Try Web3 get_logs (for testing or when Etherscan is unavailable)
+                if self._web3 and self._web3.is_connected():
+                    try:
+                        logs = self._web3.eth.get_logs({
+                            "address": self._checksum_contract_address,
+                            "fromBlock": self._to_hex_block(current_from),
+                            "toBlock": self._to_hex_block(current_to),
+                        })
+                        LOGGER.info(
+                            "Fetched logs via Web3 fallback",
+                            extra={"from_block": current_from, "to_block": current_to, "log_count": len(logs)}
+                        )
+                    except Exception as exc:
+                        LOGGER.warning("Failed to fetch logs via Web3 fallback", exc_info=exc)
+
+                if logs is None:
+                    LOGGER.error(
+                        "Failed to fetch logs from both Etherscan and Web3",
+                        extra={"from_block": current_from, "to_block": current_to}
+                    )
+                    return False
 
             # Sort logs by blockNumber and logIndex
             sorted_logs = sorted(
@@ -635,6 +653,7 @@ class FeaturedScout:
                 "total_logs": total_logs,
             },
         )
+        self._mark_provider_success()
         self._evaluate_polling_state()
         return True
 
@@ -1172,6 +1191,11 @@ class FeaturedScout:
             LOGGER.warning("Etherscan API key not configured, cannot use Etherscan fallback")
             return None
 
+        # Skip Etherscan for test keys (use Web3 fallback instead)
+        if self._config.etherscan_api_key in ("test_key", "test"):
+            LOGGER.debug("Skipping Etherscan for test key, will use Web3 fallback")
+            return None
+
         chain_id = self._config.chain_id or 1
         url = "https://api.etherscan.io/v2/api"
         params = {
@@ -1238,12 +1262,59 @@ class FeaturedScout:
             LOGGER.exception("Failed to fetch logs from Etherscan", exc_info=exc)
             return None
 
-    def _get_current_block_number(self) -> Optional[int]:
-        """Get the current block number, trying Etherscan first then RPC fallback.
+    def _get_current_block_number_from_etherscan(self) -> Optional[int]:
+        """Get the current block number from Etherscan API.
 
-        Returns None if both methods fail.
+        Returns None if the request fails.
         """
-        # Try Etherscan first (lightweight, no full RPC connection needed)
+        if not self._config.etherscan_api_key:
+            return None
+
+        # Skip Etherscan for test keys (use Web3 fallback instead)
+        if self._config.etherscan_api_key in ("test_key", "test"):
+            LOGGER.debug("Skipping Etherscan for test key, will use Web3 fallback")
+            return None
+
+        try:
+            url = "https://api.etherscan.io/v2/api"
+            params = {
+                "chainid": self._config.chain_id,
+                "module": "proxy",
+                "action": "eth_blockNumber",
+                "apikey": self._config.etherscan_api_key,
+            }
+
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("status") == "1" and "result" in data:
+                block_hex = data["result"]
+                return int(block_hex, 16)
+
+            LOGGER.warning("Etherscan block number request failed", extra={"response": data})
+            return None
+
+        except requests.RequestException as exc:
+            LOGGER.warning("Etherscan block number request failed", exc_info=exc)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Failed to get block number from Etherscan", exc_info=exc)
+            return None
+
+    def _get_current_block_number(self) -> Optional[int]:
+        """Get the current block number, trying connected Web3 first, then Etherscan, then RPC fallback.
+
+        Returns None if all methods fail.
+        """
+        # Try connected Web3 instance first (fastest if available)
+        if self._web3 and self._web3.is_connected():
+            try:
+                return self._web3.eth.block_number
+            except Exception as exc:
+                LOGGER.debug("Failed to get block number from connected Web3", exc_info=exc)
+
+        # Try Etherscan next (lightweight, no full RPC connection needed)
         block_number = self._get_current_block_number_from_etherscan()
         if block_number is not None:
             return block_number
@@ -1619,8 +1690,13 @@ class FeaturedScout:
     ) -> Dict[str, Any]:
         """Confirm a payment transaction via on-demand WebSocket connection.
 
-        Opens a WebSocket connection, waits for the payment to be confirmed,
-        processes ALL pending payments while connected, then closes the connection.
+        Flow:
+        1. Subscribe to Paid event via WebSocket
+        2. Wait up to 300 seconds for the event
+        3. If not found, do ONE final Etherscan check from block before WebSocket started → current block
+        4. Return result
+
+        This processes ALL pending payments while the WebSocket is open.
 
         Args:
             tx_hash: Transaction hash to confirm (lowercase, with 0x prefix)
@@ -1651,6 +1727,7 @@ class FeaturedScout:
 
         start_time = time.time()
         deadline = start_time + timeout_seconds
+        web3_start_block = None  # Track block number when WebSocket started
 
         LOGGER.info(
             f"Starting on-demand WebSocket confirmation for tx: {tx_hash[:10]}...",
@@ -1677,6 +1754,18 @@ class FeaturedScout:
 
         def on_connect():
             LOGGER.info("On-demand WebSocket connected", extra={"tx_hash": tx_hash})
+            nonlocal web3_start_block
+            # Record the block number when WebSocket connects
+            try:
+                web3 = self._get_web3_for_contract_calls()
+                if web3:
+                    web3_start_block = web3.eth.block_number
+                    LOGGER.info(
+                        f"WebSocket connected at block {web3_start_block}",
+                        extra={"tx_hash": tx_hash, "start_block": web3_start_block}
+                    )
+            except Exception as e:
+                LOGGER.warning(f"Failed to get start block: {e}")
 
         def on_disconnect():
             LOGGER.info("On-demand WebSocket disconnected", extra={"tx_hash": tx_hash})
@@ -1684,38 +1773,221 @@ class FeaturedScout:
         # Create a stop event for this session
         stop_event = threading.Event()
 
-        # Try to fetch recent logs via Etherscan first (in case payment already confirmed)
+        # STEP 1: Open WebSocket and wait for payment (NO Etherscan pre-check)
+        try:
+            # Run the async WebSocket iterator in a thread
+            async def wait_for_payment():
+                try:
+                    from .websocket_helpers import async_iter_websocket_messages
+
+                    # Subscribe to Paid events only
+                    # Paid event signature: Paid(address payer, address creator, bytes32 projectId, ...)
+                    # Topic hash: 0xdb945057cad23ae5352812dd3dae61d6808b6f5fdef35909741a893d7d28610f
+                    filter_params = {
+                        "address": self._checksum_contract_address,
+                        "topics": [
+                            [
+                                # Paid event topic
+                                "0xdb945057cad23ae5352812dd3dae61d6808b6f5fdef35909741a893d7d28610f"
+                            ]
+                        ],
+                    }
+
+                    async for message in async_iter_websocket_messages(
+                        ws_url,
+                        stop_event,
+                        subscription_params=filter_params,
+                        on_connect=on_connect,
+                        on_disconnect=on_disconnect,
+                    ):
+                        # Check for timeout
+                        if time.time() >= deadline:
+                            LOGGER.info(
+                                f"On-demand WebSocket timeout for tx: {tx_hash[:10]}...",
+                                extra={"tx_hash": tx_hash}
+                            )
+                            # STEP 2: Do ONE final Etherscan check if WebSocket times out
+                            return await self._etherscan_final_check(
+                                tx_hash, web3_start_block, deadline
+                            )
+
+                        # Process the log entry
+                        try:
+                            if isinstance(message, dict):
+                                # Convert to LogReceipt format
+                                log_entry = self._convert_to_log_receipt(message)
+                                if log_entry:
+                                    # Check if this is our target payment
+                                    log_tx_hash = log_entry.get("transactionHash", "")
+                                    if isinstance(log_tx_hash, bytes):
+                                        log_tx_hash = "0x" + log_tx_hash.hex()
+
+                                    if log_tx_hash:
+                                        log_tx_hash_lower = log_tx_hash.lower()
+
+                                        # Store payment info
+                                        with received_payments_lock:
+                                            received_payments[log_tx_hash_lower] = log_entry
+
+                                        # Process the log
+                                        self._handle_log(log_entry)
+
+                                        # Check if this is our target payment
+                                        if log_tx_hash_lower == tx_hash:
+                                            LOGGER.info(
+                                                f"Target payment confirmed via WebSocket: {tx_hash[:10]}...",
+                                                extra={
+                                                    "tx_hash": tx_hash,
+                                                    "block": log_entry.get("blockNumber")
+                                                }
+                                            )
+                                            return {
+                                                "confirmed": True,
+                                                "tx_hash": tx_hash,
+                                                "message": "Payment confirmed via WebSocket",
+                                                "found_in_cache": False,
+                                                "timeout": False,
+                                            }
+
+                                        LOGGER.info(
+                                            f"Received payment event: {log_tx_hash_lower[:10]}...",
+                                            extra={"tx_hash": log_tx_hash_lower}
+                                        )
+
+                        except Exception as e:
+                            LOGGER.error(f"Error processing WebSocket message: {e}")
+
+                except asyncio.CancelledError:
+                    LOGGER.info("On-demand WebSocket task cancelled")
+                    # Do Etherscan final check
+                    return await self._etherscan_final_check(
+                        tx_hash, web3_start_block, deadline
+                    )
+                except Exception as e:
+                    LOGGER.error(f"On-demand WebSocket error: {e}")
+                    # Do Etherscan final check
+                    return await self._etherscan_final_check(
+                        tx_hash, web3_start_block, deadline
+                    )
+
+            # Run the async function in the shared async runner
+            runner = get_shared_async_runner()
+            if runner is None:
+                # Create a new event loop and run synchronously
+                import concurrent.futures
+
+                def run_in_thread():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        return loop.run_until_complete(wait_for_payment())
+                    finally:
+                        loop.close()
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(run_in_thread)
+                    try:
+                        result = future.result(timeout=timeout_seconds)
+                        return result
+                    except concurrent.futures.TimeoutError:
+                        # Do Etherscan final check
+                        return await self._etherscan_final_check(
+                            tx_hash, web3_start_block, deadline
+                        )
+            else:
+                # Use the shared async runner
+                return runner.run(wait_for_payment())
+
+        except Exception as e:
+            LOGGER.error(f"On-demand WebSocket failed: {e}", exc_info=True)
+            # Do Etherscan final check
+            return await self._etherscan_final_check(
+                tx_hash, web3_start_block, deadline
+            )
+        finally:
+            # Always stop the event
+            stop_event.set()
+
+    async def _etherscan_final_check(
+        self,
+        tx_hash: str,
+        web3_start_block: Optional[int],
+        deadline: float
+    ) -> Dict[str, Any]:
+        """Do ONE final Etherscan check from block before WebSocket started → current block.
+
+        Args:
+            tx_hash: Transaction hash to confirm
+            web3_start_block: Block number when WebSocket started
+            deadline: Timeout deadline
+
+        Returns:
+            Dict with confirmation result
+        """
         try:
             web3 = self._get_web3_for_contract_calls()
-            if web3:
-                current_block = web3.eth.block_number
-                # Look back up to 100 blocks for the transaction
-                from_block = max(0, current_block - 100)
+            if not web3:
+                return {
+                    "confirmed": False,
+                    "tx_hash": tx_hash,
+                    "message": "Web3 not available for Etherscan final check",
+                    "found_in_cache": False,
+                    "timeout": True,
+                }
 
-                logs = self._fetch_logs_from_etherscan(from_block, current_block)
-                if logs:
-                    for log in logs:
-                        log_tx_hash = log.get("transactionHash", "")
-                        if isinstance(log_tx_hash, bytes):
-                            log_tx_hash = "0x" + log_tx_hash.hex()
+            current_block = web3.eth.block_number
+            from_block = max(0, (web3_start_block or current_block) - 100)
 
-                        if log_tx_hash.lower() == tx_hash:
-                            # Found the payment!
-                            LOGGER.info(
-                                f"Payment found via Etherscan: {tx_hash[:10]}...",
-                                extra={"tx_hash": tx_hash, "block": log.get("blockNumber")}
-                            )
-                            # Process the log
-                            self._handle_log(log)
-                            return {
-                                "confirmed": True,
-                                "tx_hash": tx_hash,
-                                "message": "Payment confirmed via Etherscan",
-                                "found_in_cache": False,
-                                "timeout": False,
-                            }
+            LOGGER.info(
+                f"Final Etherscan check for tx: {tx_hash[:10]}... (blocks {from_block} → {current_block})",
+                extra={"tx_hash": tx_hash, "from_block": from_block, "to_block": current_block}
+            )
+
+            logs = self._fetch_logs_from_etherscan(from_block, current_block)
+            if logs:
+                for log in logs:
+                    log_tx_hash = log.get("transactionHash", "")
+                    if isinstance(log_tx_hash, bytes):
+                        log_tx_hash = "0x" + log_tx_hash.hex()
+
+                    if log_tx_hash.lower() == tx_hash:
+                        # Found the payment!
+                        LOGGER.info(
+                            f"Payment found via Etherscan final check: {tx_hash[:10]}...",
+                            extra={"tx_hash": tx_hash, "block": log.get("blockNumber")}
+                        )
+                        # Process the log
+                        self._handle_log(log)
+                        return {
+                            "confirmed": True,
+                            "tx_hash": tx_hash,
+                            "message": "Payment confirmed via Etherscan final check",
+                            "found_in_cache": False,
+                            "timeout": False,
+                        }
+
+            # Not found in Etherscan either
+            LOGGER.warning(
+                f"Payment NOT found after WebSocket + Etherscan: {tx_hash[:10]}...",
+                extra={"tx_hash": tx_hash}
+            )
+            return {
+                "confirmed": False,
+                "tx_hash": tx_hash,
+                "message": "Payment not found after WebSocket + Etherscan check",
+                "found_in_cache": False,
+                "timeout": True,
+            }
+
         except Exception as e:
-            LOGGER.warning(f"Etherscan pre-check failed: {e}")
+            LOGGER.error(f"Etherscan final check failed: {e}")
+            return {
+                "confirmed": False,
+                "tx_hash": tx_hash,
+                "message": f"Etherscan final check failed: {str(e)}",
+                "found_in_cache": False,
+                "timeout": True,
+            }
 
         # Open WebSocket and wait for payment
         try:

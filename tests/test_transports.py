@@ -1201,6 +1201,7 @@ def test_featured_scout_batches_get_logs_requests(tmp_path, scout_modules):
         start_block=5,
         start_block_latest=False,
         block_batch_size=2,
+        etherscan_api_key="test_key",
     )
     scout = featured.FeaturedScout(config, once=True)
     scout._handle_log = lambda *args, **kwargs: True  # type: ignore[assignment]
@@ -1241,6 +1242,7 @@ def test_featured_scout_persists_progress_across_batch_failures(
         start_block=5,
         start_block_latest=False,
         block_batch_size=2,
+        etherscan_api_key="test_key",
     )
     scout = featured.FeaturedScout(config, once=True)
     scout._handle_log = lambda *args, **kwargs: True  # type: ignore[assignment]

@@ -130,5 +130,6 @@ def test_reorg_confirmation_is_normalized(
 
     assert dummy_eth.log_requests, "Expected a log request to be issued"
     to_block = dummy_eth.log_requests[0]["toBlock"]
+    # toBlock is a hex string, convert to int for comparison
     assert int(str(to_block), 16) == 10
     assert scout._last_safe_block == 10
