@@ -5,6 +5,8 @@ Provides a single API for:
 - Querying audit results
 - Contract update notifications
 - Health and status monitoring
+- Payment confirmation via WebSocket
+- Featured projects management
 
 Endpoints:
 - POST /audit/trigger          - Trigger full or partial audit
@@ -13,6 +15,11 @@ Endpoints:
 - POST /audit/contract-update  - Trigger code audit on contract change
 - GET  /health                  - Health check
 - GET  /stats                   - Service statistics
+- GET  /admin/wallet            - Get admin wallet address
+- POST /admin/payment/confirm   - Confirm payment via on-demand WebSocket
+- GET  /admin/payment/{tx_hash} - Check payment status
+- POST /admin/featured/sync     - Sync featured projects from contract
+- GET  /admin/featured          - List current featured projects
 """
 from __future__ import annotations
 
@@ -446,6 +453,122 @@ if HAS_FASTAPI:
             "round_id": payment_data["round_id"],
             "received_at": payment_data["received_at"].isoformat() + "Z",
         }
+
+    class FeaturedSyncResponse(BaseModel):
+        """Response for featured projects sync."""
+
+        success: bool
+        message: str
+        featured_count: int = 0
+        unfeatured_count: int = 0
+        block_number: Optional[int] = None
+        featured_projects: List[str] = []
+
+    @app.post("/admin/featured/sync", response_model=FeaturedSyncResponse)
+    async def sync_featured_projects():
+        """Sync featured projects from the VeritasPaymentsAndBids contract.
+
+        Calls the winningBids() view function to get the current round's winners
+        and updates the backend accordingly.
+
+        This endpoint:
+        - Marks current winning bids as featured
+        - Unfeatures projects that are no longer winning
+        - Returns the list of featured projects
+
+        The sync also runs automatically once a week (every 604800 seconds).
+
+        Returns:
+            Featured sync results with counts and project list
+
+        Raises:
+            HTTPException: If FeaturedScout is not ready or sync fails
+        """
+        if not featured_scout:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="FeaturedScout not ready",
+            )
+
+        try:
+            LOGGER.info("Manual featured projects sync requested via admin API")
+
+            # Call the sync method
+            success = featured_scout._sync_featured_projects_from_contract()
+
+            if not success:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to sync featured projects from contract",
+                )
+
+            # Get current featured projects for response
+            featured_projects = featured_scout._list_all_featured_projects()
+            web3 = featured_scout._get_web3_for_contract_calls()
+            block_number = web3.eth.block_number if web3 else None
+
+            LOGGER.info(
+                f"Featured projects sync completed: {len(featured_projects)} featured",
+                extra={"featured_count": len(featured_projects)}
+            )
+
+            return FeaturedSyncResponse(
+                success=True,
+                message="Featured projects synced successfully",
+                featured_count=len(featured_projects),
+                unfeatured_count=0,  # Not tracked separately in current implementation
+                block_number=block_number,
+                featured_projects=featured_projects,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            LOGGER.error(f"Featured projects sync failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Featured sync failed: {str(e)}",
+            )
+
+    @app.get("/admin/featured")
+    async def list_featured_projects():
+        """Get the current list of featured projects.
+
+        Returns all projects currently marked as featured from the local database.
+
+        Returns:
+            List of featured project hex IDs
+
+        Response format:
+        {
+            "featured_projects": ["0x3000...", "0x3001..."],
+            "count": 2,
+            "last_sync_block": 12345
+        }
+        """
+        if not featured_scout:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="FeaturedScout not ready",
+            )
+
+        try:
+            featured_projects = featured_scout._list_all_featured_projects()
+            web3 = featured_scout._get_web3_for_contract_calls()
+            block_number = web3.eth.block_number if web3 else None
+
+            return {
+                "featured_projects": featured_projects,
+                "count": len(featured_projects),
+                "last_sync_block": block_number,
+            }
+
+        except Exception as e:
+            LOGGER.error(f"Failed to list featured projects: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to list featured projects: {str(e)}",
+            )
 
     @app.post(
         "/audit/trigger",
