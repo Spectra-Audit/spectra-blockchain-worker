@@ -5,10 +5,13 @@ configured wallet address. When payments are detected, it immediately
 forwards them to the backend API for processing.
 
 Key Features:
-- Monitor ERC-20 Transfer() events for specific tokens
+- Monitor ERC-20 Transfer() events by TOKEN ADDRESS (not symbol) for security
 - Forward payment events to backend API immediately
 - No local storage - backend handles accumulation and subscription creation
 - On-demand mode only (no background polling)
+
+SECURITY: Always monitor by token contract address, never by symbol,
+to prevent fake tokens with legitimate symbols from being processed.
 """
 
 import logging
@@ -42,9 +45,16 @@ TRANSFER_EVENT_ABI = [
     }
 ]
 
-# Common ERC-20 token addresses on Ethereum
-USDT_CONTRACT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
-USDC_CONTRACT = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+# Official ERC-20 token addresses on Ethereum (MAINNET ONLY)
+# ONLY monitor these specific contract addresses
+USDT_CONTRACT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # Tether USD
+USDC_CONTRACT = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USD Coin
+
+# Token address -> symbol mapping for logging
+TOKEN_SYMBOLS: Dict[str, str] = {
+    USDT_CONTRACT.lower(): "USDT",
+    USDC_CONTRACT.lower(): "USDC",
+}
 
 # Price of stablecoins (assumed $1)
 STABLECOIN_PRICE_USD = Decimal("1.0")
@@ -64,8 +74,9 @@ class PaymentWalletConfig:
     # Wallet to monitor for incoming payments
     payment_wallet_address: str
 
-    # Tokens to monitor (USDT, USDC)
-    monitored_tokens: Sequence[str]
+    # Token ADDRESSES to monitor (not symbols - critical for security)
+    # Example: ["0xdAC17F958D2ee523a2206206994597C13D831ec7", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"]
+    monitored_token_addresses: Sequence[str]
 
     # Backend API configuration
     api_base_url: str
@@ -88,12 +99,15 @@ class PaymentWalletScout:
     This scout forwards payment events to the backend API immediately,
     without any local storage. The backend handles all payment tracking,
     accumulation, and subscription creation.
+
+    SECURITY: Monitors by token contract address, not symbol.
+    Only processes transfers from the configured token addresses.
     """
 
-    # Token contract addresses
-    TOKEN_CONTRACTS: Dict[str, str] = {
-        "USDT": USDT_CONTRACT,
-        "USDC": USDC_CONTRACT,
+    # Official token addresses (for validation)
+    OFFICIAL_TOKEN_ADDRESSES = {
+        USDT_CONTRACT.lower(),
+        USDC_CONTRACT.lower(),
     }
 
     def __init__(
@@ -114,6 +128,8 @@ class PaymentWalletScout:
 
         # Web3 setup
         self._web3: Optional[Web3] = None
+        # Store monitored token addresses (lowercase for comparison)
+        self._monitored_addresses = {addr.lower() for addr in config.monitored_token_addresses}
         self._contracts: Dict[str, Contract] = {}
 
         # Thread safety
@@ -121,7 +137,7 @@ class PaymentWalletScout:
 
         LOGGER.info("PaymentWalletScout initialized (API-only mode)", extra={
             "payment_wallet": config.payment_wallet_address,
-            "monitored_tokens": list(config.monitored_tokens),
+            "monitored_addresses": list(self._monitored_addresses),
         })
 
     @classmethod
@@ -142,9 +158,22 @@ class PaymentWalletScout:
         if not payment_wallet_address:
             raise ValueError("PAYMENT_WALLET_ADDRESS environment variable is required")
 
-        # Tokens to monitor (USDT, USDC by default)
-        monitored_tokens_env = os.environ.get("MONITORED_TOKENS", "USDT,USDC")
-        monitored_tokens = [t.strip() for t in monitored_tokens_env.split(",") if t.strip()]
+        # Token ADDRESSES to monitor (CRITICAL: use addresses, not symbols)
+        # Default to official USDT and USDC on Ethereum mainnet
+        monitored_tokens_env = os.environ.get("MONITORED_TOKEN_ADDRESSES", "")
+        if not monitored_tokens_env:
+            # Use official addresses by default
+            monitored_token_addresses = [USDT_CONTRACT, USDC_CONTRACT]
+            LOGGER.info("Using default official token addresses", extra={
+                "USDT": USDT_CONTRACT,
+                "USDC": USDC_CONTRACT,
+            })
+        else:
+            monitored_token_addresses = [addr.strip() for addr in monitored_tokens_env.split(",") if addr.strip()]
+            # Validate that addresses look like Ethereum addresses
+            for addr in monitored_token_addresses:
+                if not addr.startswith("0x") or len(addr) != 42:
+                    raise ValueError(f"Invalid token address: {addr}")
 
         # Backend API
         api_base_url = os.environ.get("API_BASE_URL", "")
@@ -160,7 +189,7 @@ class PaymentWalletScout:
             rpc_http_urls=rpc_http_urls,
             rpc_ws_urls=rpc_ws_urls,
             payment_wallet_address=payment_wallet_address,
-            monitored_tokens=monitored_tokens,
+            monitored_token_addresses=monitored_token_addresses,
             api_base_url=api_base_url,
             admin_access_token=admin_access_token,
             admin_refresh_token=admin_refresh_token,
@@ -221,22 +250,24 @@ class PaymentWalletScout:
         rpc_url = self._config.rpc_http_urls[0]
         self._web3 = Web3(Web3.HTTPProvider(rpc_url))
 
-        # Initialize token contracts
-        for token_symbol in self._config.monitored_tokens:
-            token_address = self.TOKEN_CONTRACTS.get(token_symbol)
-            if token_address:
-                contract = self._web3.eth.contract(
-                    address=token_address,
-                    abi=TRANSFER_EVENT_ABI
-                )
-                self._contracts[token_symbol] = contract
-                LOGGER.info(f"Initialized {token_symbol} contract", extra={
-                    "address": token_address
-                })
+        # Initialize token contracts by address (not symbol)
+        for token_address in self._config.monitored_token_addresses:
+            contract = self._web3.eth.contract(
+                address=token_address,
+                abi=TRANSFER_EVENT_ABI
+            )
+            self._contracts[token_address.lower()] = contract
+
+            # Get symbol for logging
+            symbol = TOKEN_SYMBOLS.get(token_address.lower(), "UNKNOWN")
+            LOGGER.info(f"Initialized token contract", extra={
+                "symbol": symbol,
+                "address": token_address
+            })
 
     def process_transfer_event(
         self,
-        token_symbol: str,
+        token_address: str,
         from_address: str,
         to_address: str,
         value: int,
@@ -249,8 +280,10 @@ class PaymentWalletScout:
         Forwards the payment event to the backend API immediately.
         The backend handles storage, accumulation, and subscription creation.
 
+        SECURITY: Only processes transfers from monitored token ADDRESSES.
+
         Args:
-            token_symbol: Token symbol (USDT, USDC)
+            token_address: Token contract address (must be in monitored list)
             from_address: Sender wallet address
             to_address: Recipient wallet address
             value: Transfer amount in wei (smallest unit)
@@ -262,16 +295,25 @@ class PaymentWalletScout:
             True if processed successfully, False otherwise
         """
         try:
+            # SECURITY: Verify token address is in our monitored list
+            token_address_lower = token_address.lower()
+            if token_address_lower not in self._monitored_addresses:
+                return True  # Not a monitored token, skip
+
             # Check if this is a payment to our monitored wallet
             if to_address.lower() != self._config.payment_wallet_address.lower():
                 return True  # Not for us, but not an error
+
+            # Get symbol for logging
+            symbol = TOKEN_SYMBOLS.get(token_address_lower, "UNKNOWN")
 
             # Calculate USD value (stablecoins are $1)
             amount_decimal = Decimal(value) / Decimal(10 ** 18)
             usd_value = amount_decimal * STABLECOIN_PRICE_USD
 
             LOGGER.info("Payment detected - forwarding to backend", extra={
-                "token": token_symbol,
+                "token": symbol,
+                "token_address": token_address,
                 "from": from_address,
                 "amount": str(amount_decimal),
                 "usd_value": str(usd_value),
@@ -280,7 +322,7 @@ class PaymentWalletScout:
 
             # Forward ALL payments to backend - let it handle accumulation
             self._forward_to_backend(
-                token_symbol,
+                token_address,
                 from_address,
                 to_address,
                 amount_decimal,
@@ -301,7 +343,7 @@ class PaymentWalletScout:
 
     def _forward_to_backend(
         self,
-        token_symbol: str,
+        token_address: str,
         from_address: str,
         to_address: str,
         amount: Decimal,
@@ -318,7 +360,7 @@ class PaymentWalletScout:
         - Create subscription when threshold reached
 
         Args:
-            token_symbol: Token symbol
+            token_address: Token contract address
             from_address: Sender address
             to_address: Recipient address
             amount: Transfer amount
@@ -338,7 +380,7 @@ class PaymentWalletScout:
                 "wallet_address": from_address,
                 "usd_amount": str(usd_value),
                 "tx_hash": tx_hash,
-                "token_address": self.TOKEN_CONTRACTS.get(token_symbol, ""),
+                "token_address": token_address,
             }
 
             response = self._backend_client.post(endpoint, json=payload, timeout=30.0)
