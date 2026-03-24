@@ -90,7 +90,7 @@ class PaymentWalletConfig:
     reorg_confirmations: int = 5
 
     # Feature flags
-    enable_polling: bool = False  # On-demand mode by default
+    enable_polling: bool = True  # Always monitor for incoming payments
 
 
 class PaymentWalletScout:
