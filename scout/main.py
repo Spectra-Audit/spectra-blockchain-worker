@@ -21,6 +21,7 @@ from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
 from .featured_scout import FeaturedScout, _load_config_from_env, resolve_ws_provider_class
+from .payment_wallet_scout import PaymentWalletScout
 from .pro_scout import DEFAULT_DB_PATH, ProScout
 from .project_scout import ProjectScout
 from .siwe_authenticator import SiweAuthenticator
@@ -33,7 +34,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class ScoutApp:
-    """Facade that wires ProScout, FeaturedScout, ProjectScout, TokenDistributionScout, TokenHolderScout, USDTPaymentScout, LiquidityAnalyzerScout, TokenomicsAnalyzerScout, AuditOrchestrator, and UnifiedAuditService around a shared database."""
+    """Facade that wires ProScout, FeaturedScout, ProjectScout, TokenDistributionScout, TokenHolderScout, USDTPaymentScout, PaymentWalletScout, LiquidityAnalyzerScout, TokenomicsAnalyzerScout, AuditOrchestrator, and UnifiedAuditService around a shared database."""
 
     def __init__(
         self,
@@ -43,6 +44,7 @@ class ScoutApp:
         featured_scout: FeaturedScout,
         project_scout: ProjectScout,
         usdt_payment_scout: Optional[USDTPaymentScout],
+        payment_wallet_scout: Optional["PaymentWalletScout"] = None,
         token_distribution_scout: Optional[TokenDistributionScout],
         token_holder_scout: Optional[TokenHolderScout],
         liquidity_analyzer_scout: Optional["LiquidityAnalyzerScout"] = None,
@@ -57,6 +59,7 @@ class ScoutApp:
         self.featured_scout = featured_scout
         self.project_scout = project_scout
         self.usdt_payment_scout = usdt_payment_scout
+        self.payment_wallet_scout = payment_wallet_scout
         self.token_distribution_scout = token_distribution_scout
         self.token_holder_scout = token_holder_scout
         self.liquidity_analyzer_scout = liquidity_analyzer_scout
@@ -125,6 +128,19 @@ class ScoutApp:
                 usdt_payment_scout = USDTPaymentScout.from_env(database, backend_client, shared_pool)
             except Exception as e:
                 LOGGER.warning(f"Failed to initialize USDT Payment Scout: {e}")
+
+        # Initialize Payment Wallet Scout if configured
+        payment_wallet_scout = None
+        if os.environ.get("PAYMENT_WALLET_ADDRESS"):
+            try:
+                payment_wallet_scout = PaymentWalletScout.from_env(
+                    database=database,
+                    backend_client=backend_client,
+                    ws_provider_pool=shared_pool
+                )
+                LOGGER.info("Payment Wallet Scout initialized")
+            except Exception as e:
+                LOGGER.warning(f"Failed to initialize Payment Wallet Scout: {e}")
 
         # Initialize Token Distribution Scout (works without backend client)
         token_distribution_scout = None
@@ -321,6 +337,7 @@ class ScoutApp:
             featured_scout=featured_scout,
             project_scout=project_scout,
             usdt_payment_scout=usdt_payment_scout,
+            payment_wallet_scout=payment_wallet_scout,
             token_distribution_scout=token_distribution_scout,
             token_holder_scout=token_holder_scout,
             liquidity_analyzer_scout=liquidity_analyzer_scout,
@@ -349,6 +366,10 @@ class ScoutApp:
         if self.usdt_payment_scout:
             self.usdt_payment_scout.start()
 
+        # Start Payment Wallet Scout if configured
+        if self.payment_wallet_scout:
+            self.payment_wallet_scout.start()
+
         self._running = True
 
     def stop(self, timeout: float = 10.0) -> None:
@@ -359,6 +380,10 @@ class ScoutApp:
         # Add USDT scout if configured
         if self.usdt_payment_scout:
             services_to_stop.append(self.usdt_payment_scout)
+
+        # Add Payment Wallet Scout if configured
+        if self.payment_wallet_scout:
+            services_to_stop.append(self.payment_wallet_scout)
 
         for service in services_to_stop:
             try:

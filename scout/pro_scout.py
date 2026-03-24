@@ -133,6 +133,7 @@ class ProScout:
         start_block: Optional[int] = None,
         block_batch_size: int = 5000,  # Limited to 5000 by BlockPI RPC constraint
         ws_provider_pool: Optional[WebSocketProviderPool] = None,
+        enable_polling: bool = False,  # Disable background polling, on-demand mode only
     ) -> None:
         http_urls = [url.strip() for url in rpc_http_urls if url]
         if not http_urls:
@@ -161,6 +162,7 @@ class ProScout:
         self.default_user_tier = default_user_tier
         self.chain_id = chain_id
         self.block_batch_size = max(block_batch_size, 1)
+        self.enable_polling = enable_polling
         self._provider_lock = threading.Lock()
         self._rpc_fail_counts = [0 for _ in self.rpc_http_urls]
         self._rpc_backoff_until = [0.0 for _ in self.rpc_http_urls]
@@ -342,6 +344,13 @@ class ProScout:
     # Poller loop -----------------------------------------------------------------
 
     def _poller_loop(self) -> None:
+        # If polling is disabled, wait for stop event (on-demand mode only)
+        if not self.enable_polling:
+            self.logger.info("Polling disabled - waiting for on-demand API requests")
+            self._stop_event.wait()
+            self.logger.info("ProScout stopping (on-demand mode)")
+            return
+
         while not self._stop_event.is_set():
             if not self._poll_gate.wait(timeout=self.poll_interval):
                 self._evaluate_polling_state()
@@ -874,6 +883,7 @@ class ProScout:
         chain_id = int(chain_id_env) if chain_id_env else None
         start_block_env = os.environ.get("START_BLOCK")
         start_block = int(start_block_env) if start_block_env else None
+        enable_polling = os.environ.get("ENABLE_POLLING", "").lower() == "true"
         if database is not None:
             wallet = admin_wallet or load_or_create_admin_wallet(database)
         else:
@@ -917,6 +927,7 @@ class ProScout:
             start_block=start_block,
             rpc_ws_urls=rpc_ws_urls,
             ws_provider_pool=ws_provider_pool,
+            enable_polling=enable_polling,
         )
 
     def _start_ws_listener(self) -> None:

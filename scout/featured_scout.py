@@ -164,6 +164,7 @@ class ScoutConfig:
     featured_sync_interval_sec: int = 604800  # 7 days (1 week)
     etherscan_poll_interval_sec: int = 3  # Respect Etherscan 3 calls/sec rate limit
     enable_automatic_websocket: bool = False  # Disable automatic WebSocket, use on-demand only
+    enable_polling: bool = False  # Disable background polling, on-demand mode only
 
 
 class FeaturedScout:
@@ -458,6 +459,13 @@ class FeaturedScout:
         if self._should_sync_featured_projects():
             LOGGER.info("Syncing featured projects from contract on startup")
             self._sync_featured_projects_from_contract()
+
+        # If polling is disabled, wait for stop event (on-demand mode only)
+        if not self._config.enable_polling:
+            LOGGER.info("Polling disabled - waiting for on-demand API requests")
+            self._stop_event.wait()
+            LOGGER.info("FeaturedScout stopping (on-demand mode)")
+            return
 
         try:
             while not self._stop_event.is_set():
@@ -2240,6 +2248,7 @@ def _load_config_from_env(database: Optional[DatabaseManager] = None) -> ScoutCo
     if not etherscan_api_key:
         raise ValueError("ETHERSCAN_API_KEY environment variable is required")
     enable_automatic_websocket = os.environ.get("ENABLE_AUTOMATIC_WEBSOCKET", "").lower() == "true"
+    enable_polling = os.environ.get("ENABLE_POLLING", "").lower() == "true"
     start_block_env = os.environ.get("START_BLOCK", "latest")
     start_block_latest = start_block_env.lower() == "latest"
     start_block = None
@@ -2264,6 +2273,7 @@ def _load_config_from_env(database: Optional[DatabaseManager] = None) -> ScoutCo
         etherscan_api_key=etherscan_api_key,
         block_batch_size=block_batch_size,
         enable_automatic_websocket=enable_automatic_websocket,
+        enable_polling=enable_polling,
     )
 
 
