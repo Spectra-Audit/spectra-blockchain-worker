@@ -307,6 +307,7 @@ class FeaturedScout:
                 )
             ): event
             for event in EVENT_ABI
+            if event.get("type") == "event"  # Only include events, not functions
         }
 
     def _load_active_rpc_index(self) -> int:
