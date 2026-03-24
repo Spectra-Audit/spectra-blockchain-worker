@@ -278,7 +278,7 @@ class PaymentWalletScout:
                 "tx_hash": tx_hash,
             })
 
-            # Forward to backend API immediately
+            # Forward ALL payments to backend - let it handle accumulation
             self._forward_to_backend(
                 token_symbol,
                 from_address,
@@ -332,15 +332,11 @@ class PaymentWalletScout:
                 LOGGER.warning("No backend client configured, cannot forward payment")
                 return
 
-            # Calculate months this payment would provide
-            months = self._calculate_pro_months(usd_value)
-
-            # Forward to backend subscription endpoint
+            # Forward raw payment to backend - let it handle accumulation and subscription
             endpoint = "/payments/wallet/subscription"
             payload = {
                 "wallet_address": from_address,
                 "usd_amount": str(usd_value),
-                "months": months,
                 "tx_hash": tx_hash,
                 "token_address": self.TOKEN_CONTRACTS.get(token_symbol, ""),
             }
@@ -348,10 +344,9 @@ class PaymentWalletScout:
             response = self._backend_client.post(endpoint, json=payload, timeout=30.0)
 
             if response and response.status_code in (200, 201):
-                LOGGER.info("Payment forwarded to backend successfully", extra={
+                LOGGER.info("Payment forwarded to backend", extra={
                     "wallet": from_address,
                     "usd_value": str(usd_value),
-                    "months": months,
                     "tx_hash": tx_hash,
                     "status": response.status_code,
                 })
