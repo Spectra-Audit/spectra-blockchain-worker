@@ -455,10 +455,10 @@ class FeaturedScout:
     def _run(self) -> None:
         LOGGER.info("FeaturedScout loop started")
 
-        # Sync featured projects from contract on startup
-        if self._should_sync_featured_projects():
-            LOGGER.info("Syncing featured projects from contract on startup")
-            self._sync_featured_projects_from_contract()
+        # NOTE: Startup sync removed - featured projects sync will be done:
+        # - Periodically (once a week)
+        # - On-demand via admin API endpoint
+        # This prevents the 'no-eth' error from breaking startup
 
         # If polling is disabled, wait for stop event (on-demand mode only)
         if not self._config.enable_polling:
