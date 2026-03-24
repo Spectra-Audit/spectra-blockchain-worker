@@ -40,6 +40,9 @@ LOGGER = logging.getLogger(__name__)
 # Global orchestrator instance - set by main app
 orchestrator: Optional[AuditOrchestrator] = None
 
+# Global FeaturedScout instance - set by main app for on-demand payment confirmation
+featured_scout = None
+
 # Payment event cache - stores recently received Paid events from WebSocket
 # Format: {tx_hash: {creator_address, amount, block_number, round_id, received_at}}
 _payment_cache: Dict[str, Dict[str, Any]] = {}
@@ -66,6 +69,26 @@ def get_orchestrator() -> Optional[AuditOrchestrator]:
         AuditOrchestrator instance or None
     """
     return orchestrator
+
+
+def set_featured_scout(scout) -> None:
+    """Set the global FeaturedScout instance.
+
+    Args:
+        scout: FeaturedScout instance
+    """
+    global featured_scout
+    featured_scout = scout
+    LOGGER.info("FeaturedScout registered with unified API server")
+
+
+def get_featured_scout():
+    """Get the global FeaturedScout instance.
+
+    Returns:
+        FeaturedScout instance or None
+    """
+    return featured_scout
 
 
 def add_payment_event(tx_hash: str, creator_address: str, amount: int,
@@ -261,6 +284,120 @@ if HAS_FASTAPI:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to retrieve admin wallet: {str(e)}",
+            )
+
+    class PaymentConfirmationRequest(BaseModel):
+        """Request to confirm a payment transaction via on-demand WebSocket."""
+
+        tx_hash: str = Field(..., description="Transaction hash to confirm")
+        timeout_seconds: int = Field(default=300, description="Timeout in seconds (default: 300, max: 600)")
+        project_hex: Optional[str] = Field(None, description="Project hex ID (optional, for logging)")
+
+        @validator("tx_hash")
+        def validate_tx_hash(cls, v: str) -> str:
+            """Validate transaction hash format."""
+            if not v.startswith("0x") or len(v) not in (66, 70):  # 66 for 0x + 64 hex chars
+                raise ValueError("Invalid transaction hash format")
+            return v.lower()
+
+        @validator("timeout_seconds")
+        def validate_timeout(cls, v: int) -> int:
+            """Validate timeout is reasonable."""
+            if v < 10:
+                raise ValueError("Timeout must be at least 10 seconds")
+            if v > 600:  # Max 10 minutes
+                raise ValueError("Timeout cannot exceed 600 seconds")
+            return v
+
+        class Config:
+            """Pydantic config."""
+
+            json_schema_extra = {
+                "example": {
+                    "tx_hash": "0x789468322a0cb8b056aa8ecbf2a06d2390be245b20329cb9495b1c3d068478e9",
+                    "timeout_seconds": 300,
+                    "project_hex": "0x3000000000000000000000000000000000000000000000000000000000000001",
+                }
+            }
+
+    class PaymentConfirmationResponse(BaseModel):
+        """Response for payment confirmation."""
+
+        confirmed: bool
+        tx_hash: str
+        message: str
+        creator_address: Optional[str] = None
+        amount: Optional[int] = None
+        block_number: Optional[int] = None
+        round_id: Optional[int] = None
+        found_in_cache: bool = False
+        timeout: bool = False
+
+    @app.post("/admin/payment/confirm", response_model=PaymentConfirmationResponse)
+    async def confirm_payment_via_websocket(request: PaymentConfirmationRequest):
+        """Confirm a payment transaction via on-demand WebSocket connection.
+
+        Opens a WebSocket connection, waits for the payment to be confirmed,
+        processes ALL pending payments while connected, then closes the connection.
+
+        This is more efficient than keeping WebSocket open permanently.
+
+        Args:
+            request: Payment confirmation request with tx_hash and timeout
+
+        Returns:
+            Payment confirmation result
+        """
+        if not featured_scout:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="FeaturedScout not ready",
+            )
+
+        try:
+            LOGGER.info(
+                f"On-demand WebSocket confirmation requested for tx: {request.tx_hash[:10]}...",
+                extra={"tx_hash": request.tx_hash, "timeout": request.timeout_seconds}
+            )
+
+            # Check if payment is already in cache
+            cached_payment = get_payment_event(request.tx_hash)
+            if cached_payment:
+                LOGGER.info(
+                    f"Payment found in cache: {request.tx_hash[:10]}...",
+                    extra={"tx_hash": request.tx_hash}
+                )
+                return PaymentConfirmationResponse(
+                    confirmed=True,
+                    tx_hash=request.tx_hash,
+                    message="Payment confirmed from cache",
+                    creator_address=cached_payment.get("creator_address"),
+                    amount=cached_payment.get("amount"),
+                    block_number=cached_payment.get("block_number"),
+                    round_id=cached_payment.get("round_id"),
+                    found_in_cache=True,
+                    timeout=False,
+                )
+
+            # Open on-demand WebSocket and wait for confirmation
+            result = await featured_scout.confirm_payment_on_demand(
+                tx_hash=request.tx_hash,
+                timeout_seconds=request.timeout_seconds,
+                project_hex=request.project_hex
+            )
+
+            LOGGER.info(
+                f"On-demand WebSocket confirmation {'succeeded' if result['confirmed'] else 'timed out'}: {request.tx_hash[:10]}...",
+                extra={"tx_hash": request.tx_hash, "confirmed": result['confirmed']}
+            )
+
+            return PaymentConfirmationResponse(**result)
+
+        except Exception as e:
+            LOGGER.error(f"Payment confirmation failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Payment confirmation failed: {str(e)}",
             )
 
     @app.get("/admin/payment/{tx_hash}")

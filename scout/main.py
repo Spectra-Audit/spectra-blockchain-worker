@@ -107,6 +107,15 @@ class ScoutApp:
             backend_client=backend_client,
             ws_provider_pool=shared_pool,
         )
+
+        # Register FeaturedScout with unified API server for on-demand payment confirmation
+        if os.environ.get("ENABLE_UNIFIED_API", "").lower() == "true":
+            try:
+                from .unified_api import set_featured_scout
+                set_featured_scout(featured_scout)
+                LOGGER.info("FeaturedScout registered with unified API server")
+            except ImportError:
+                LOGGER.warning("FastAPI not available, FeaturedScout not registered with unified API")
         project_scout = ProjectScout.from_env(backend_client, database)
 
         # Initialize USDT Payment Scout if configured

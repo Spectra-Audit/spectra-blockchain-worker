@@ -163,6 +163,7 @@ class ScoutConfig:
     block_batch_size: int = 7200  # Used for Etherscan pagination
     featured_sync_interval_sec: int = 604800  # 7 days (1 week)
     etherscan_poll_interval_sec: int = 3  # Respect Etherscan 3 calls/sec rate limit
+    enable_automatic_websocket: bool = False  # Disable automatic WebSocket, use on-demand only
 
 
 class FeaturedScout:
@@ -275,8 +276,11 @@ class FeaturedScout:
             raise RuntimeError("FeaturedScout already running")
         self._thread = threading.Thread(target=self._run, name="FeaturedScout", daemon=True)
         self._thread.start()
-        if self._ws_urls:
+        # Only start automatic WebSocket if enabled (default: False for on-demand mode)
+        if self._ws_urls and self._config.enable_automatic_websocket:
             self._start_ws_listener()
+        elif not self._config.enable_automatic_websocket:
+            LOGGER.info("Automatic WebSocket disabled - using on-demand mode only")
 
     def stop(self, timeout: float = 10.0) -> None:
         self._stop_event.set()
@@ -1607,6 +1611,303 @@ class FeaturedScout:
     def _is_log_processed(self, tx_hash: str, log_index: int) -> bool:
         return self._db.is_log_processed(tx_hash, log_index)
 
+    async def confirm_payment_on_demand(
+        self,
+        tx_hash: str,
+        timeout_seconds: int = 300,
+        project_hex: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Confirm a payment transaction via on-demand WebSocket connection.
+
+        Opens a WebSocket connection, waits for the payment to be confirmed,
+        processes ALL pending payments while connected, then closes the connection.
+
+        Args:
+            tx_hash: Transaction hash to confirm (lowercase, with 0x prefix)
+            timeout_seconds: Maximum time to wait for confirmation (default: 300, max: 600)
+            project_hex: Optional project hex ID for logging
+
+        Returns:
+            Dict with confirmation result:
+            {
+                'confirmed': bool,
+                'tx_hash': str,
+                'message': str,
+                'creator_address': Optional[str],
+                'amount': Optional[int],
+                'block_number': Optional[int],
+                'round_id': Optional[int],
+                'found_in_cache': bool,
+                'timeout': bool
+            }
+        """
+        import asyncio
+        from .async_runner import get_shared_async_runner
+
+        # Normalize tx_hash
+        tx_hash = tx_hash.lower()
+        if not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
+
+        start_time = time.time()
+        deadline = start_time + timeout_seconds
+
+        LOGGER.info(
+            f"Starting on-demand WebSocket confirmation for tx: {tx_hash[:10]}...",
+            extra={"tx_hash": tx_hash, "timeout": timeout_seconds, "project_hex": project_hex}
+        )
+
+        # Get a WebSocket URL
+        ws_urls = self._config.rpc_ws_urls
+        if not ws_urls:
+            return {
+                "confirmed": False,
+                "tx_hash": tx_hash,
+                "message": "No WebSocket URLs configured",
+                "found_in_cache": False,
+                "timeout": False,
+            }
+
+        # Use the first available WebSocket URL
+        ws_url = ws_urls[0]
+
+        # Track payments received during this session
+        received_payments = {}
+        received_payments_lock = threading.Lock()
+
+        def on_connect():
+            LOGGER.info("On-demand WebSocket connected", extra={"tx_hash": tx_hash})
+
+        def on_disconnect():
+            LOGGER.info("On-demand WebSocket disconnected", extra={"tx_hash": tx_hash})
+
+        # Create a stop event for this session
+        stop_event = threading.Event()
+
+        # Try to fetch recent logs via Etherscan first (in case payment already confirmed)
+        try:
+            web3 = self._get_web3_for_contract_calls()
+            if web3:
+                current_block = web3.eth.block_number
+                # Look back up to 100 blocks for the transaction
+                from_block = max(0, current_block - 100)
+
+                logs = self._fetch_logs_from_etherscan(from_block, current_block)
+                if logs:
+                    for log in logs:
+                        log_tx_hash = log.get("transactionHash", "")
+                        if isinstance(log_tx_hash, bytes):
+                            log_tx_hash = "0x" + log_tx_hash.hex()
+
+                        if log_tx_hash.lower() == tx_hash:
+                            # Found the payment!
+                            LOGGER.info(
+                                f"Payment found via Etherscan: {tx_hash[:10]}...",
+                                extra={"tx_hash": tx_hash, "block": log.get("blockNumber")}
+                            )
+                            # Process the log
+                            self._handle_log(log)
+                            return {
+                                "confirmed": True,
+                                "tx_hash": tx_hash,
+                                "message": "Payment confirmed via Etherscan",
+                                "found_in_cache": False,
+                                "timeout": False,
+                            }
+        except Exception as e:
+            LOGGER.warning(f"Etherscan pre-check failed: {e}")
+
+        # Open WebSocket and wait for payment
+        try:
+            # Run the async WebSocket iterator in a thread
+            async def wait_for_payment():
+                try:
+                    from .websocket_helpers import async_iter_websocket_messages
+
+                    # Subscribe to Paid events only
+                    filter_params = {
+                        "address": self._checksum_contract_address,
+                        "topics": [
+                            [
+                                # Paid event topic
+                                "0xdb945057cad23ae5352812dd3dae61d6808b6f5fdef35909741a893d7d28610f"
+                            ]
+                        ],
+                    }
+
+                    async for message in async_iter_websocket_messages(
+                        ws_url,
+                        stop_event,
+                        subscription_params=filter_params,
+                        on_connect=on_connect,
+                        on_disconnect=on_disconnect,
+                    ):
+                        # Check for timeout
+                        if time.time() >= deadline:
+                            LOGGER.info(
+                                f"On-demand WebSocket timeout for tx: {tx_hash[:10]}...",
+                                extra={"tx_hash": tx_hash}
+                            )
+                            return {
+                                "confirmed": False,
+                                "tx_hash": tx_hash,
+                                "message": f"Timeout after {timeout_seconds}s",
+                                "found_in_cache": False,
+                                "timeout": True,
+                            }
+
+                        # Process the log entry
+                        try:
+                            if isinstance(message, dict):
+                                # Convert to LogReceipt format
+                                log_entry = self._convert_to_log_receipt(message)
+                                if log_entry:
+                                    # Check if this is our target payment
+                                    log_tx_hash = log_entry.get("transactionHash", "")
+                                    if isinstance(log_tx_hash, bytes):
+                                        log_tx_hash = "0x" + log_tx_hash.hex()
+
+                                    if log_tx_hash:
+                                        log_tx_hash_lower = log_tx_hash.lower()
+
+                                        # Store payment info
+                                        with received_payments_lock:
+                                            received_payments[log_tx_hash_lower] = log_entry
+
+                                        # Process the log
+                                        self._handle_log(log_entry)
+
+                                        # Check if this is our target payment
+                                        if log_tx_hash_lower == tx_hash:
+                                            LOGGER.info(
+                                                f"Target payment confirmed via WebSocket: {tx_hash[:10]}...",
+                                                extra={
+                                                    "tx_hash": tx_hash,
+                                                    "block": log_entry.get("blockNumber")
+                                                }
+                                            )
+                                            return {
+                                                "confirmed": True,
+                                                "tx_hash": tx_hash,
+                                                "message": "Payment confirmed via WebSocket",
+                                                "found_in_cache": False,
+                                                "timeout": False,
+                                            }
+
+                                        LOGGER.info(
+                                            f"Received payment event: {log_tx_hash_lower[:10]}...",
+                                            extra={"tx_hash": log_tx_hash_lower}
+                                        )
+
+                        except Exception as e:
+                            LOGGER.error(f"Error processing WebSocket message: {e}")
+
+                except asyncio.CancelledError:
+                    LOGGER.info("On-demand WebSocket task cancelled")
+                    return {
+                        "confirmed": False,
+                        "tx_hash": tx_hash,
+                        "message": "WebSocket connection cancelled",
+                        "found_in_cache": False,
+                        "timeout": False,
+                    }
+                except Exception as e:
+                    LOGGER.error(f"On-demand WebSocket error: {e}")
+                    return {
+                        "confirmed": False,
+                        "tx_hash": tx_hash,
+                        "message": f"WebSocket error: {str(e)}",
+                        "found_in_cache": False,
+                        "timeout": False,
+                    }
+
+            # Run the async function in the shared async runner
+            runner = get_shared_async_runner()
+            if runner is None:
+                # Create a new event loop and run synchronously
+                import concurrent.futures
+
+                def run_in_thread():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        return loop.run_until_complete(wait_for_payment())
+                    finally:
+                        loop.close()
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(run_in_thread)
+                    try:
+                        result = future.result(timeout=timeout_seconds)
+                        return result
+                    except concurrent.futures.TimeoutError:
+                        return {
+                            "confirmed": False,
+                            "tx_hash": tx_hash,
+                            "message": f"Timeout after {timeout_seconds}s",
+                            "found_in_cache": False,
+                            "timeout": True,
+                        }
+            else:
+                # Use the shared async runner
+                return runner.run(wait_for_payment())
+
+        except Exception as e:
+            LOGGER.error(f"On-demand WebSocket failed: {e}", exc_info=True)
+            return {
+                "confirmed": False,
+                "tx_hash": tx_hash,
+                "message": f"Failed to open WebSocket: {str(e)}",
+                "found_in_cache": False,
+                "timeout": False,
+            }
+        finally:
+            # Always stop the event
+            stop_event.set()
+
+    def _convert_to_log_receipt(self, message: Dict[str, Any]) -> Optional[LogReceipt]:
+        """Convert WebSocket message to LogReceipt format."""
+        try:
+            # Extract standard log fields
+            transaction_hash = message.get("transactionHash") or message.get("transaction_hash")
+            log_index = message.get("logIndex") or message.get("log_index")
+            block_number = message.get("blockNumber") or message.get("block_number")
+            block_hash = message.get("blockHash") or message.get("block_hash")
+            address = message.get("address") or message.get("contract_address", self._checksum_contract_address)
+            topics = message.get("topics", [])
+            data = message.get("data", "")
+
+            # Convert to proper types
+            if isinstance(transaction_hash, str):
+                transaction_hash = bytes.fromhex(transaction_hash.replace("0x", ""))
+            if isinstance(block_hash, str):
+                block_hash = bytes.fromhex(block_hash.replace("0x", ""))
+            if isinstance(data, str):
+                data = bytes.fromhex(data.replace("0x", ""))
+
+            # Convert topics
+            converted_topics = []
+            for topic in topics:
+                if isinstance(topic, str):
+                    converted_topics.append(bytes.fromhex(topic.replace("0x", "")))
+                elif isinstance(topic, bytes):
+                    converted_topics.append(topic)
+                else:
+                    converted_topics.append(topic)
+
+            return {
+                "transactionHash": transaction_hash,
+                "logIndex": log_index,
+                "blockNumber": block_number,
+                "blockHash": block_hash,
+                "address": address,
+                "topics": converted_topics,
+                "data": data,
+            }
+        except Exception as e:
+            LOGGER.error(f"Failed to convert message to LogReceipt: {e}")
+            return None
+
     def _load_last_block(self) -> Optional[int]:
         value = self._db.get_meta(self._meta_key)
         if value is None:
@@ -1666,6 +1967,7 @@ def _load_config_from_env(database: Optional[DatabaseManager] = None) -> ScoutCo
     etherscan_api_key = os.environ.get("ETHERSCAN_API_KEY", "")
     if not etherscan_api_key:
         raise ValueError("ETHERSCAN_API_KEY environment variable is required")
+    enable_automatic_websocket = os.environ.get("ENABLE_AUTOMATIC_WEBSOCKET", "").lower() == "true"
     start_block_env = os.environ.get("START_BLOCK", "latest")
     start_block_latest = start_block_env.lower() == "latest"
     start_block = None
@@ -1689,6 +1991,7 @@ def _load_config_from_env(database: Optional[DatabaseManager] = None) -> ScoutCo
         start_block_latest=start_block_latest,
         etherscan_api_key=etherscan_api_key,
         block_batch_size=block_batch_size,
+        enable_automatic_websocket=enable_automatic_websocket,
     )
 
 
