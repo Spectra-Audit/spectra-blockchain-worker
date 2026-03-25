@@ -108,20 +108,6 @@ EVENT_ABI: List[Dict[str, Any]] = [
         "type": "event",
     },
     {
-        "anonymous": False,
-        "inputs": [
-            {"indexed": True, "internalType": "address", "name": "payer", "type": "address"},
-            {"indexed": True, "internalType": "address", "name": "creator", "type": "address"},
-            {"indexed": True, "internalType": "bytes32", "name": "projectId", "type": "bytes32"},
-            {"indexed": False, "internalType": "uint256", "name": "amountPaidFees", "type": "uint256"},
-            {"indexed": False, "internalType": "uint8", "name": "numberOfContracts", "type": "uint8"},
-            {"indexed": False, "internalType": "uint256", "name": "featuredBid", "type": "uint256"},
-            {"indexed": False, "internalType": "uint64", "name": "roundId", "type": "uint64"},
-        ],
-        "name": "Paid",
-        "type": "event",
-    },
-    {
         "inputs": [],
         "name": "winningBids",
         "outputs": [
@@ -168,7 +154,15 @@ class ScoutConfig:
 
 
 class FeaturedScout:
-    """Consumes Featured contract events and mirrors them to the backend."""
+    """Manages featured projects by syncing from the winningBids() view function.
+
+    This scout no longer monitors blockchain events. Instead, it periodically
+    calls the winningBids() view function to get current featured projects
+    and updates the backend accordingly.
+
+    Payment verification is now handled by PaymentVerifierScout via direct
+    tx_hash verification.
+    """
 
     def __init__(
         self,
@@ -698,8 +692,6 @@ class FeaturedScout:
                 extra={"event": event_name}
             )
             return True
-        if event_name == "Paid":
-            return self._handle_paid(event_data)
         LOGGER.debug("Unhandled event", extra={"event": event_name})
         return True
 
@@ -1449,129 +1441,6 @@ class FeaturedScout:
         if hasattr(value, "__int__"):
             return int(value)
         raise TypeError(f"Cannot convert value to int: {value!r}")
-
-    def _handle_paid(self, event_data: AttributeDict) -> bool:
-        args = event_data["args"]
-        project_hex = self._normalize_project_hex(args.get("projectId"))
-        round_id = int(args.get("roundId", 0))
-        block = int(event_data.get("blockNumber", 0))
-        tx_hash = event_data.get("transactionHash", b"").hex()
-
-        # Get payment details
-        creator_address = self._coerce_address(args.get("creator"))
-        payer_address = self._coerce_address(args.get("payer"))
-        amount_paid_fees = self._coerce_int(args.get("amountPaidFees", 0))
-        number_of_contracts = int(args.get("numberOfContracts", 0))
-        featured_bid = self._coerce_int(args.get("featuredBid", 0))
-
-        if project_hex is None:
-            LOGGER.warning("Paid event project decode failed", extra={"roundId": round_id})
-            return True
-
-        # Convert amount from wei to VERITAS (18 decimals)
-        amount_veritas = amount_paid_fees / 1e18
-
-        # Cache the payment event for fast lookup by frontend
-        try:
-            from scout.unified_api import add_payment_event
-            add_payment_event(
-                tx_hash=tx_hash,
-                creator_address=creator_address,
-                amount=int(amount_veritas),  # Store as integer VERITAS amount
-                block_number=block,
-                round_id=round_id,
-            )
-            LOGGER.debug(
-                "Cached payment event",
-                extra={"tx": tx_hash, "creator": creator_address, "amount": amount_veritas}
-            )
-        except ImportError:
-            pass  # unified_api not available
-        except Exception as e:
-            LOGGER.warning(f"Failed to cache payment event: {e}")
-
-        # NEW: First try to create project from pending submission (payment-first flow)
-        if creator_address:
-            try:
-                response = self._backend_client.post(
-                    "/admin/verify-payment-and-create",
-                    json={
-                        "creator_address": creator_address,
-                        "amount_paid": str(amount_veritas),
-                        "transaction_hash": tx_hash,
-                        "block_number": block,
-                        "round_id": round_id,
-                    },
-                    timeout=10.0,
-                    raise_for_status=False,
-                )
-
-                if response and response.status_code == 201:
-                    # Successfully created project from pending submission
-                    result = response.json()
-                    LOGGER.info(
-                        "Created project from pending submission",
-                        extra={
-                            "submission_id": result.get("submission_id"),
-                            "project_id": result.get("project_id"),
-                            "creator_address": creator_address,
-                            "amount_paid": str(amount_veritas),
-                            "tx": tx_hash,
-                            "block": block,
-                        },
-                    )
-                    return True
-                elif response and response.status_code == 404:
-                    # No pending submission found - fall through to legacy flow
-                    LOGGER.debug(
-                        "No pending submission found, trying legacy project patch",
-                        extra={"creator_address": creator_address, "tx": tx_hash}
-                    )
-                elif response and response.status_code == 400:
-                    # Insufficient payment or other error
-                    error_data = response.json() if response.content else {}
-                    LOGGER.warning(
-                        "Payment verification failed",
-                        extra={
-                            "creator_address": creator_address,
-                            "error": error_data.get("error", "Unknown error"),
-                            "tx": tx_hash,
-                        },
-                    )
-                    # Still return True to avoid reprocessing
-                    return True
-
-            except Exception as e:
-                LOGGER.error(
-                    "Failed to create project from pending submission",
-                    extra={"error": str(e), "creator_address": creator_address},
-                    exc_info=True,
-                )
-                # Continue to legacy flow on error
-
-        # LEGACY: Fall back to patching existing project
-        backend_id = self._resolve_backend_project_id(project_hex)
-        if backend_id is None:
-            LOGGER.warning(
-                "No backend mapping for Paid event",
-                extra={"project_hex": project_hex, "roundId": round_id},
-            )
-            return True
-        payload = {"pending_pay": False, "last_paid_round_id": round_id}
-        if not self._patch_project(backend_id, payload):
-            return False
-        LOGGER.info(
-            "Marked project as paid (legacy)",
-            extra={
-                "roundId": round_id,
-                "project_hex": project_hex,
-                "backend_id": backend_id,
-                "action": "paid",
-                "block": block,
-                "tx": tx_hash,
-            },
-        )
-        return True
 
     def _coerce_address(self, value: Any) -> Optional[str]:
         """Coerce value to checksummed Ethereum address."""
