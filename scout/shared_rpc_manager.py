@@ -431,6 +431,33 @@ def create_rpc_manager(
     )
 
 
+# Global RPC manager instance for shared access across scouts
+_global_rpc_manager: Optional[UnifiedRpcManager] = None
+_global_rpc_manager_lock = threading.Lock()
+
+
+def set_rpc_manager(manager: UnifiedRpcManager) -> None:
+    """Set the global RPC manager instance.
+
+    Args:
+        manager: UnifiedRpcManager instance to set as global
+    """
+    global _global_rpc_manager
+    with _global_rpc_manager_lock:
+        _global_rpc_manager = manager
+        LOGGER.debug("Global RPC manager updated")
+
+
+def get_rpc_manager() -> Optional[UnifiedRpcManager]:
+    """Get the global RPC manager instance.
+
+    Returns:
+        UnifiedRpcManager instance or None if not set
+    """
+    with _global_rpc_manager_lock:
+        return _global_rpc_manager
+
+
 async def get_token_holder_count_nodereal(
     token_address: str,
     chain_id: int,
