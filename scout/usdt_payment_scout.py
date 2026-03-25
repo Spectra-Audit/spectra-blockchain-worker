@@ -30,7 +30,7 @@ from .async_runner import get_shared_async_runner
 from .backend_client import BackendClient
 from .database_manager import DatabaseManager
 from .env_loader import load_env_file
-from .rpc_manager import create_rpc_manager
+from .shared_rpc_manager import create_rpc_manager
 from .websocket_helpers import iter_websocket_messages
 from .websocket_provider_pool import WebSocketProviderHandle, WebSocketProviderPool
 

@@ -235,7 +235,7 @@ class HolderAPIManager:
 
         rpc_mgr = None
         try:
-            from scout.rpc_manager import create_rpc_manager
+            from scout.shared_rpc_manager import create_rpc_manager
 
             # Create RPC manager for this chain
             rpc_mgr = create_rpc_manager(chain_id, self.database)

@@ -25,7 +25,7 @@ from web3.exceptions import Web3Exception
 from .async_runner import get_shared_async_runner
 from .database_manager import DatabaseManager
 from .rpc_pool import RpcProvider, create_rpc_pool
-from .rpc_manager import UnifiedRpcManager, create_rpc_manager
+from .shared_rpc_manager import UnifiedRpcManager, create_rpc_manager
 from .rpc_providers_config import (
     get_all_providers,
     get_optimized_chunk_size,
