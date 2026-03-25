@@ -98,7 +98,7 @@ class ScoutApp:
         # Initialize shared RPC Manager for all scouts
         rpc_manager = None
         try:
-            from .shared_rpc_manager import RPCManager, set_rpc_manager
+            from .shared_rpc_manager import UnifiedRpcManager as RPCManager, set_rpc_manager
 
             rpc_manager = RPCManager.from_env()
             set_rpc_manager(rpc_manager)  # Set as global
