@@ -236,6 +236,39 @@ class UnifiedRpcManager:
             f"with {len(self.providers)} providers"
         )
 
+    @classmethod
+    def from_env(cls, db_manager: Optional[DatabaseManager] = None) -> "UnifiedRpcManager":
+        """Create UnifiedRpcManager from environment configuration.
+
+        Reads RPC configuration from environment variables and initializes
+        the manager with all available providers.
+
+        Args:
+            db_manager: Optional database manager for failure tracking
+
+        Returns:
+            Configured UnifiedRpcManager instance
+
+        Raises:
+            ValueError: If no chain_id configured or no providers available
+        """
+        import os
+
+        # Get chain ID from environment
+        chain_id_str = os.environ.get("CHAIN_ID", "1")
+        try:
+            chain_id = int(chain_id_str)
+        except ValueError:
+            raise ValueError(f"Invalid CHAIN_ID: {chain_id_str}")
+
+        # Create database manager if not provided
+        if db_manager is None:
+            from .database_manager import DatabaseManager
+            db_path = os.environ.get("SCOUT_DB_PATH") or os.environ.get("DB_PATH") or "/app/data/scout.db"
+            db_manager = DatabaseManager(db_path)
+
+        return cls(chain_id=chain_id, db_manager=db_manager)
+
     def get_provider_for_block(
         self,
         block_number: int,
