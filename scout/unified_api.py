@@ -98,6 +98,30 @@ def get_featured_scout():
     return featured_scout
 
 
+# Global PaymentVerifierScout instance - set by main app for on-demand payment verification
+payment_verifier_scout = None
+
+
+def set_payment_verifier_scout(scout) -> None:
+    """Set the global PaymentVerifierScout instance.
+
+    Args:
+        scout: PaymentVerifierScout instance
+    """
+    global payment_verifier_scout
+    payment_verifier_scout = scout
+    LOGGER.info("PaymentVerifierScout registered with unified API server")
+
+
+def get_payment_verifier_scout():
+    """Get the global PaymentVerifierScout instance.
+
+    Returns:
+        PaymentVerifierScout instance or None
+    """
+    return payment_verifier_scout
+
+
 def add_payment_event(tx_hash: str, creator_address: str, amount: int,
                      block_number: int, round_id: int) -> None:
     """Add a payment event to the cache.
@@ -340,6 +364,54 @@ if HAS_FASTAPI:
         found_in_cache: bool = False
         timeout: bool = False
 
+    class PaymentVerifyRequest(BaseModel):
+        """Request to verify a payment transaction by tx_hash."""
+
+        tx_hash: str = Field(..., description="Transaction hash to verify")
+        submission_id: str = Field(..., description="Pending submission ID from backend")
+        creator_address: str = Field(..., description="Expected creator wallet address")
+        expected_amount: int = Field(..., description="Expected payment amount in wei")
+
+        @validator("tx_hash")
+        def validate_tx_hash(cls, v: str) -> str:
+            """Validate transaction hash format."""
+            if not v.startswith("0x") or len(v) not in (66, 70):
+                raise ValueError("Invalid transaction hash format")
+            return v.lower()
+
+        @validator("creator_address")
+        def validate_creator_address(cls, v: str) -> str:
+            """Validate creator address format."""
+            if not v.startswith("0x") or len(v) != 42:
+                raise ValueError("Invalid creator address format")
+            return v.lower()
+
+        @validator("expected_amount")
+        def validate_expected_amount(cls, v: int) -> int:
+            """Validate expected amount is positive."""
+            if v <= 0:
+                raise ValueError("Expected amount must be positive")
+            return v
+
+        class Config:
+            """Pydantic config."""
+
+            json_schema_extra = {
+                "example": {
+                    "tx_hash": "0x789468322a0cb8b056aa8ecbf2a06d2390be245b20329cb9495b1c3d068478e9",
+                    "submission_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "creator_address": "0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0",
+                    "expected_amount": 460000000000000000000,  # 460 VERITAS in wei
+                }
+            }
+
+    class PaymentVerifyResponse(BaseModel):
+        """Response for payment verification request."""
+
+        status: str = Field(..., description="Status of the verification: 'pending' or 'queued'")
+        message: str = Field(..., description="Human-readable message")
+        submission_id: str = Field(..., description="Submission ID for tracking")
+
     @app.post("/admin/payment/confirm", response_model=PaymentConfirmationResponse)
     async def confirm_payment_via_websocket(request: PaymentConfirmationRequest):
         """Confirm a payment transaction via on-demand WebSocket connection.
@@ -453,6 +525,68 @@ if HAS_FASTAPI:
             "round_id": payment_data["round_id"],
             "received_at": payment_data["received_at"].isoformat() + "Z",
         }
+
+    @app.post("/admin/payment/verify", response_model=PaymentVerifyResponse, status_code=status.HTTP_202_ACCEPTED)
+    async def verify_payment(request: PaymentVerifyRequest):
+        """Verify a payment transaction by fetching and decoding the receipt.
+
+        This endpoint queues an asynchronous payment verification request.
+        The PaymentVerifierScout will:
+        1. Fetch the transaction receipt from the blockchain
+        2. Decode the Paid() event from the receipt logs
+        3. Verify the creator address and amount match expectations
+        4. Send a callback to the backend with the verification result
+
+        The backend should poll the GET /v1/pending/{submission_id} endpoint
+        to receive the verification result.
+
+        Args:
+            request: Payment verification request
+
+        Returns:
+            202 Accepted with submission ID for tracking
+
+        Raises:
+            HTTPException: If PaymentVerifierScout is not ready
+        """
+        if not payment_verifier_scout:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="PaymentVerifierScout not ready",
+            )
+
+        try:
+            LOGGER.info(
+                f"Payment verification requested: tx={request.tx_hash[:10]}..., "
+                f"submission={request.submission_id}",
+                extra={
+                    "tx_hash": request.tx_hash,
+                    "submission_id": request.submission_id,
+                    "creator_address": request.creator_address,
+                    "expected_amount": request.expected_amount,
+                }
+            )
+
+            # Queue the verification request
+            payment_verifier_scout.verify_payment(
+                tx_hash=request.tx_hash,
+                submission_id=request.submission_id,
+                creator_address=request.creator_address,
+                expected_amount=request.expected_amount,
+            )
+
+            return PaymentVerifyResponse(
+                status="pending",
+                message="Payment verification queued. The backend will be notified when complete.",
+                submission_id=request.submission_id,
+            )
+
+        except Exception as e:
+            LOGGER.error(f"Failed to queue payment verification: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to queue payment verification: {str(e)}",
+            )
 
     class FeaturedSyncResponse(BaseModel):
         """Response for featured projects sync."""

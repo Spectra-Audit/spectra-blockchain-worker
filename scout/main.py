@@ -95,6 +95,17 @@ class ScoutApp:
         except Exception as e:
             LOGGER.warning(f"Failed to initialize backend client (backend may not be running): {e}")
 
+        # Initialize shared RPC Manager for all scouts
+        rpc_manager = None
+        try:
+            from .shared_rpc_manager import RPCManager, set_rpc_manager
+
+            rpc_manager = RPCManager.from_env()
+            set_rpc_manager(rpc_manager)  # Set as global
+            LOGGER.info("Shared RPC Manager initialized")
+        except Exception as e:
+            LOGGER.warning(f"Failed to initialize RPC Manager: {e}")
+
         shared_pool = WebSocketProviderPool(provider_resolver=resolve_ws_provider_class)
         pro_scout = ProScout.from_env(
             database=database,
@@ -114,9 +125,26 @@ class ScoutApp:
         # Register FeaturedScout with unified API server for on-demand payment confirmation
         if os.environ.get("ENABLE_UNIFIED_API", "").lower() == "true":
             try:
-                from .unified_api import set_featured_scout
+                from .unified_api import set_featured_scout, set_payment_verifier_scout
                 set_featured_scout(featured_scout)
                 LOGGER.info("FeaturedScout registered with unified API server")
+
+                # Initialize Payment Verifier Scout for on-demand tx verification
+                if backend_client:
+                    try:
+                        from .payment_verifier_scout import PaymentVerifierScout
+
+                        payment_verifier_scout = PaymentVerifierScout(
+                            backend_url=api_base_url,
+                            backend_token=os.environ.get("ADMIN_ACCESS_TOKEN", ""),
+                            rpc_manager=rpc_manager,
+                        )
+                        payment_verifier_scout.start()
+                        set_payment_verifier_scout(payment_verifier_scout)
+                        LOGGER.info("Payment Verifier Scout initialized and registered with unified API")
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to initialize Payment Verifier Scout: {e}")
+
             except ImportError:
                 LOGGER.warning("FastAPI not available, FeaturedScout not registered with unified API")
         project_scout = ProjectScout.from_env(backend_client, database)
