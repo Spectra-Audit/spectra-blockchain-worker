@@ -234,11 +234,22 @@ class PaymentVerifierScout:
             if not self._rpc_manager:
                 raise ConnectionError("RPC Manager not available")
 
-            # Fetch transaction receipt using RPC Manager
-            def get_receipt(web3):
-                return web3.eth.get_transaction_receipt(tx_hash)
+            # Get a provider for this transaction (block 0 = any block)
+            provider = self._rpc_manager.get_provider_for_block(0, "eth_getTransactionReceipt")
+            if not provider:
+                raise ConnectionError("No healthy RPC providers available")
 
-            receipt = self._rpc_manager.execute_call(get_receipt)
+            # Fetch transaction receipt using async provider
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            receipt = loop.run_until_complete(
+                provider.make_request("eth_getTransactionReceipt", [tx_hash])
+            )
 
             # Check if transaction was successful
             if receipt.get("status") != 1:
