@@ -133,23 +133,30 @@ class ScoutApp:
                 LOGGER.info("FeaturedScout registered with unified API server")
 
                 # Initialize Payment Verifier Scout for on-demand tx verification
-                if backend_client:
-                    try:
-                        from .payment_verifier_scout import PaymentVerifierScout
+                # Note: PaymentVerifierScout works independently and doesn't require backend_client
+                # It only needs: backend_url, backend_token (from env), and rpc_manager
+                try:
+                    from .payment_verifier_scout import PaymentVerifierScout
 
-                        LOGGER.info("Initializing Payment Verifier Scout...")
-                        payment_verifier_scout = PaymentVerifierScout(
-                            backend_url=api_base_url,
-                            backend_token=os.environ.get("ADMIN_ACCESS_TOKEN", ""),
-                            rpc_manager=rpc_manager,
+                    # Validate required environment variables
+                    admin_token = os.environ.get("ADMIN_ACCESS_TOKEN", "")
+                    if not admin_token:
+                        LOGGER.warning(
+                            "ADMIN_ACCESS_TOKEN not set - Payment Verifier Scout will not be able to "
+                            "send callbacks to backend. Payment verification will fail."
                         )
-                        payment_verifier_scout.start()
-                        set_payment_verifier_scout(payment_verifier_scout)
-                        LOGGER.info("Payment Verifier Scout initialized and registered with unified API")
-                    except Exception as e:
-                        LOGGER.error(f"Failed to initialize Payment Verifier Scout: {e}", exc_info=True)
-                else:
-                    LOGGER.warning("Backend client not available, skipping Payment Verifier Scout")
+
+                    LOGGER.info("Initializing Payment Verifier Scout...")
+                    payment_verifier_scout = PaymentVerifierScout(
+                        backend_url=api_base_url,
+                        backend_token=admin_token,
+                        rpc_manager=rpc_manager,
+                    )
+                    payment_verifier_scout.start()
+                    set_payment_verifier_scout(payment_verifier_scout)
+                    LOGGER.info("Payment Verifier Scout initialized and registered with unified API")
+                except Exception as e:
+                    LOGGER.error(f"Failed to initialize Payment Verifier Scout: {e}", exc_info=True)
 
             except ImportError as e:
                 LOGGER.warning(f"FastAPI not available, FeaturedScout not registered with unified API: {e}")
