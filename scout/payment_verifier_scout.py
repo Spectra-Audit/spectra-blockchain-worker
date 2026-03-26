@@ -391,7 +391,9 @@ class PaymentVerifierScout:
 
             # Get current block number for confirmation check
             current_block = self._get_current_block_number(provider)
-            tx_block = int(receipt.get("blockNumber", "0x0"), 16) if isinstance(receipt.get("blockNumber"), str) else receipt.get("blockNumber", 0)
+            tx_block = receipt.get("blockNumber", "0x0")
+            if isinstance(tx_block, str):
+                tx_block = int(tx_block, 16) if tx_block.startswith("0x") else int(tx_block)
 
             # Check confirmations (require at least 1)
             if current_block is not None:
@@ -411,8 +413,21 @@ class PaymentVerifierScout:
                         failure_reason=f"Insufficient confirmations: {confirmations} < 1",
                     )
 
-            # Check if transaction was successful
-            if receipt.get("status") != 1:
+            # Check if transaction was successful (status is "0x1" for success, "0x0" for failure)
+            tx_status = receipt.get("status")
+            if tx_status == "0x1":
+                tx_status_int = 1
+            elif tx_status == "0x0":
+                tx_status_int = 0
+            elif isinstance(tx_status, str):
+                tx_status_int = int(tx_status, 16) if tx_status.startswith("0x") else int(tx_status)
+            else:
+                tx_status_int = tx_status
+
+            if tx_status_int != 1:
+                LOGGER.warning(
+                    f"Transaction {tx_hash[:10]}... has status {tx_status} (parsed as {tx_status_int})"
+                )
                 return PaymentVerificationResult(
                     tx_hash=tx_hash,
                     submission_id=request.submission_id,
