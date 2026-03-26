@@ -45,8 +45,12 @@ ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
 # Blockchain RPC Configuration
 RPC_HTTP_URL = "https://eth.llamarpc.com"
 RPC_WS_URLS = ""  # Optional: comma-separated WebSocket URLs
-CONTRACT_ADDRESS = "0xe6733635aF5Ce7a1E022fbD87670EADa95397558"  # VeritaStaking contract
+
+# Smart Contract Addresses
+CONTRACT_ADDRESS = "0xe6733635aF5Ce7a1E022fbD87670EADa95397558"  # VeritaStaking contract (ProScout)
 VERITAS_STAKING_ADDRESS = "0xe6733635aF5Ce7a1E022fbD87670EADa95397558"  # Same contract for staking verification
+PAYMENTS_CONTRACT_ADDRESS = "0x9b64a162B497F0581Bf7B7B8B7471640b035B6C6"  # VeritaPaymentsAndBids contract (FeaturedScout, PaymentVerifierScout)
+
 CHAIN_ID = "1"
 
 # Backend API Configuration

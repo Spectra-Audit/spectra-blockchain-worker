@@ -45,7 +45,7 @@ PAID_EVENT_SIGNATURE = "0x" + Web3.keccak(
 ).hex() if HAS_WEB3 else "0x"
 
 # VeritasPaymentsAndBids contract address
-VERITAS_PAYMENTS_CONTRACT = "0xe6733635aF5Ce7a1E022fbD87670EADa95397558"
+VERITAS_PAYMENTS_CONTRACT = "0x9b64a162B497F0581Bf7B7B8B7471640b035B6C6"
 
 # Retry backoff intervals in seconds: 10s, 20s, 40s, 80s, 160s
 RETRY_DELAYS = [10, 20, 40, 80, 160]
