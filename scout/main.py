@@ -123,7 +123,10 @@ class ScoutApp:
         )
 
         # Register FeaturedScout with unified API server for on-demand payment confirmation
-        if os.environ.get("ENABLE_UNIFIED_API", "").lower() == "true":
+        enable_unified_api = os.environ.get("ENABLE_UNIFIED_API", "").lower() == "true"
+        LOGGER.info(f"ENABLE_UNIFIED_API check: {enable_unified_api} (env={os.environ.get('ENABLE_UNIFIED_API', 'not set')})")
+
+        if enable_unified_api:
             try:
                 from .unified_api import set_featured_scout, set_payment_verifier_scout
                 set_featured_scout(featured_scout)
@@ -134,6 +137,7 @@ class ScoutApp:
                     try:
                         from .payment_verifier_scout import PaymentVerifierScout
 
+                        LOGGER.info("Initializing Payment Verifier Scout...")
                         payment_verifier_scout = PaymentVerifierScout(
                             backend_url=api_base_url,
                             backend_token=os.environ.get("ADMIN_ACCESS_TOKEN", ""),
@@ -143,10 +147,14 @@ class ScoutApp:
                         set_payment_verifier_scout(payment_verifier_scout)
                         LOGGER.info("Payment Verifier Scout initialized and registered with unified API")
                     except Exception as e:
-                        LOGGER.warning(f"Failed to initialize Payment Verifier Scout: {e}")
+                        LOGGER.error(f"Failed to initialize Payment Verifier Scout: {e}", exc_info=True)
+                else:
+                    LOGGER.warning("Backend client not available, skipping Payment Verifier Scout")
 
-            except ImportError:
-                LOGGER.warning("FastAPI not available, FeaturedScout not registered with unified API")
+            except ImportError as e:
+                LOGGER.warning(f"FastAPI not available, FeaturedScout not registered with unified API: {e}")
+        else:
+            LOGGER.info("Unified API registration skipped - ENABLE_UNIFIED_API not set to 'true'")
         project_scout = ProjectScout.from_env(backend_client, database)
 
         # Initialize USDT Payment Scout if configured
