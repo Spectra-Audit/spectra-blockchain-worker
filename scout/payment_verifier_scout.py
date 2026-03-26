@@ -44,6 +44,12 @@ PAID_EVENT_SIGNATURE = "0x" + Web3.keccak(
     text="Paid(address,address,bytes32,uint256,uint8,uint256,uint64)"
 ).hex() if HAS_WEB3 else "0x"
 
+# VeritasPaymentsAndBids contract address
+VERITAS_PAYMENTS_CONTRACT = "0xe6733635aF5Ce7a1E022fbD87670EADa95397558"
+
+# Retry backoff intervals in seconds: 10s, 20s, 40s, 80s, 160s
+RETRY_DELAYS = [10, 20, 40, 80, 160]
+
 
 @dataclass
 class PaymentVerificationRequest:
@@ -54,11 +60,28 @@ class PaymentVerificationRequest:
     expected_amount: int  # in wei
     backend_url: str
     backend_token: str
+    number_of_contracts: int = 0  # Expected number of contracts from Paid() event
+    retry_attempt: int = 0  # Current retry attempt (0-4)
     requested_at: datetime = None
 
     def __post_init__(self):
         if self.requested_at is None:
             self.requested_at = datetime.now()
+
+    @property
+    def max_retries(self) -> int:
+        """Maximum number of retry attempts."""
+        return 5
+
+    @property
+    def should_retry(self) -> bool:
+        """Check if this request should be retried."""
+        return self.retry_attempt < self.max_retries
+
+    @property
+    def retry_delay_seconds(self) -> int:
+        """Calculate retry delay using exponential backoff: 10s, 20s, 40s, 80s, 160s."""
+        return 10 * (2 ** self.retry_attempt)
 
 
 @dataclass
@@ -167,6 +190,7 @@ class PaymentVerifierScout:
         submission_id: str,
         creator_address: str,
         expected_amount: int,
+        number_of_contracts: int = 0,
     ) -> None:
         """
         Queue a payment verification request.
@@ -176,12 +200,14 @@ class PaymentVerifierScout:
             submission_id: Pending submission ID
             creator_address: Expected creator address
             expected_amount: Expected payment amount in wei
+            number_of_contracts: Expected number of contracts from Paid() event
         """
         request = PaymentVerificationRequest(
             tx_hash=tx_hash,
             submission_id=submission_id,
             creator_address=creator_address,
             expected_amount=expected_amount,
+            number_of_contracts=number_of_contracts,
             backend_url=self._backend_url,
             backend_token=self._backend_token,
         )
@@ -204,8 +230,43 @@ class PaymentVerifierScout:
                 # Process the verification
                 result = self._verify_transaction(request)
 
-                # Send callback to backend
-                self._send_callback(request, result)
+                # Check if we should retry (pending/insufficient confirmations)
+                if result.verified:
+                    # Payment verified - send success callback
+                    self._send_callback(request, result)
+                elif self._should_retry_verification(request, result):
+                    # Requeue with delay for retry
+                    request.retry_attempt += 1
+                    delay = request.retry_delay_seconds
+                    LOGGER.info(
+                        f"Requeuing payment verification: {request.tx_hash[:10]}... "
+                        f"(attempt {request.retry_attempt}/{request.max_retries}, "
+                        f"delay {delay}s, reason: {result.failure_reason})"
+                    )
+
+                    # Schedule retry with delay
+                    def requeue_with_delay(req, d):
+                        time.sleep(d)
+                        if not self._stop_event.is_set():
+                            self._request_queue.put(req)
+
+                    retry_thread = threading.Thread(
+                        target=requeue_with_delay,
+                        args=(request, delay),
+                        daemon=True,
+                    )
+                    retry_thread.start()
+                else:
+                    # Final failure - send failure callback with timeout reason
+                    LOGGER.warning(
+                        f"Payment verification failed after {request.retry_attempt} attempts: "
+                        f"{request.tx_hash[:10]}... - {result.failure_reason}"
+                    )
+                    # Update failure reason to verification_timeout if it was a retryable failure
+                    if result.failure_reason and ("Transaction receipt not found" in result.failure_reason or
+                                                   "Insufficient confirmations" in result.failure_reason):
+                        result.failure_reason = "verification_timeout"
+                    self._send_callback(request, result)
 
                 # Mark task done
                 self._request_queue.task_done()
@@ -214,6 +275,68 @@ class PaymentVerifierScout:
                 LOGGER.error(f"Error in verification loop: {e}", exc_info=True)
 
         LOGGER.info("Payment verification loop stopped")
+
+    def _should_retry_verification(
+        self,
+        request: PaymentVerificationRequest,
+        result: PaymentVerificationResult,
+    ) -> bool:
+        """
+        Determine if verification should be retried.
+
+        Args:
+            request: Verification request
+            result: Verification result
+
+        Returns:
+            True if should retry, False otherwise
+        """
+        # Don't retry if already verified
+        if result.verified:
+            return False
+
+        # Don't retry if max attempts reached
+        if not request.should_retry:
+            return False
+
+        # Retry if transaction not mined yet
+        if "Transaction receipt not found" in result.failure_reason:
+            return True
+
+        # Retry if insufficient confirmations
+        if "Insufficient confirmations" in result.failure_reason:
+            return True
+
+        # Don't retry on permanent failures (wrong contract, wrong amount, etc.)
+        return False
+
+    def _get_current_block_number(self, provider) -> Optional[int]:
+        """
+        Get current block number.
+
+        Args:
+            provider: RPC provider
+
+        Returns:
+            Current block number or None
+        """
+        try:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            result = loop.run_until_complete(
+                provider.make_request("eth_blockNumber", [])
+            )
+            if isinstance(result, str) and result.startswith("0x"):
+                return int(result, 16)
+            return result
+        except Exception as e:
+            LOGGER.error(f"Failed to get current block number: {e}")
+            return None
 
     def _verify_transaction(
         self,
@@ -266,6 +389,28 @@ class PaymentVerifierScout:
                     failure_reason="Transaction receipt not found - transaction may not be mined yet",
                 )
 
+            # Get current block number for confirmation check
+            current_block = self._get_current_block_number(provider)
+            tx_block = int(receipt.get("blockNumber", "0x0"), 16) if isinstance(receipt.get("blockNumber"), str) else receipt.get("blockNumber", 0)
+
+            # Check confirmations (require at least 1)
+            if current_block is not None:
+                confirmations = current_block - tx_block
+                if confirmations < 1:
+                    LOGGER.info(
+                        f"Transaction {tx_hash[:10]}... has {confirmations} confirmations "
+                        f"(block {tx_block}, current {current_block}) - waiting for more"
+                    )
+                    return PaymentVerificationResult(
+                        tx_hash=tx_hash,
+                        submission_id=request.submission_id,
+                        verified=False,
+                        creator_address=request.creator_address,
+                        amount_paid=0,
+                        expected_amount=request.expected_amount,
+                        failure_reason=f"Insufficient confirmations: {confirmations} < 1",
+                    )
+
             # Check if transaction was successful
             if receipt.get("status") != 1:
                 return PaymentVerificationResult(
@@ -278,7 +423,7 @@ class PaymentVerifierScout:
                     failure_reason="Transaction failed",
                 )
 
-            # Find Paid() event in logs
+            # Find Paid() event in logs (also verifies contract address)
             paid_event = self._find_paid_event(receipt)
 
             if not paid_event:
@@ -291,6 +436,20 @@ class PaymentVerifierScout:
                     expected_amount=request.expected_amount,
                     failure_reason="No Paid() event found in transaction",
                 )
+
+            # Verify numberOfContracts matches (if provided)
+            if request.number_of_contracts > 0:
+                event_contracts = paid_event.get("number_of_contracts", 0)
+                if event_contracts != request.number_of_contracts:
+                    return PaymentVerificationResult(
+                        tx_hash=tx_hash,
+                        submission_id=request.submission_id,
+                        verified=False,
+                        creator_address=paid_event.get("creator", ""),
+                        amount_paid=paid_event.get("amount_paid_fees", 0),
+                        expected_amount=request.expected_amount,
+                        failure_reason=f"Contract count mismatch: expected {request.number_of_contracts}, got {event_contracts}",
+                    )
 
             # Verify creator address matches
             event_creator = paid_event.get("creator", "").lower()
@@ -355,6 +514,18 @@ class PaymentVerifierScout:
             Decoded event data or None
         """
         for log in receipt.get("logs", []):
+            # First verify the contract address (log.address)
+            log_address = log.get("address", "")
+            if isinstance(log_address, bytes):
+                log_address = "0x" + log_address.hex()
+            elif isinstance(log_address, str):
+                log_address = log_address.lower()
+
+            expected_address = VERITAS_PAYMENTS_CONTRACT.lower()
+            if log_address != expected_address:
+                # This log is from a different contract, skip it
+                continue
+
             # Check if log has Paid event signature
             topics = log.get("topics", [])
             if not topics:

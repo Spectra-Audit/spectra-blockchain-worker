@@ -159,9 +159,6 @@ class FeaturedScout:
     This scout no longer monitors blockchain events. Instead, it periodically
     calls the winningBids() view function to get current featured projects
     and updates the backend accordingly.
-
-    Payment verification is now handled by PaymentVerifierScout via direct
-    tx_hash verification.
     """
 
     def __init__(
@@ -685,81 +682,7 @@ class FeaturedScout:
             LOGGER.exception("Failed to decode log", extra={"topic": topic0}, exc_info=exc)
             return False
         event_name = event_data["event"]
-        if event_name == "RoundFinalized":
-            # Skip RoundFinalized events - we use the winningBids() view function instead
-            LOGGER.debug(
-                "Skipping RoundFinalized event (using winningBids view function)",
-                extra={"event": event_name}
-            )
-            return True
         LOGGER.debug("Unhandled event", extra={"event": event_name})
-        return True
-
-    def _handle_round_finalized(self, event_data: AttributeDict) -> bool:
-        args = event_data["args"]
-        round_id = int(args.get("roundId"))
-        winners_raw = list(args.get("winners", []))
-        count = int(args.get("count", len(winners_raw)))
-        winners = winners_raw[:count]
-        block = int(event_data.get("blockNumber", 0))
-        tx_hash = event_data.get("transactionHash", b"").hex()
-        projects_current: List[str] = []
-        for index, winner in enumerate(winners):
-            project_id_value = winner.get("projectId") if isinstance(winner, dict) else winner[1]
-            project_hex = self._normalize_project_hex(project_id_value)
-            if project_hex is None:
-                LOGGER.warning(
-                    "Winner projectId decode failed",
-                    extra={"roundId": round_id, "winner_index": index},
-                )
-                continue
-            projects_current.append(project_hex)
-            backend_id = self._resolve_backend_project_id(project_hex)
-            if backend_id is None:
-                LOGGER.warning(
-                    "No backend mapping for project",
-                    extra={"project_hex": project_hex, "roundId": round_id},
-                )
-                continue
-            payload = {"is_featured": True}
-            if not self._patch_project(backend_id, payload):
-                return False
-            LOGGER.info(
-                "Marked project as featured",
-                extra={
-                    "roundId": round_id,
-                    "project_hex": project_hex,
-                    "backend_id": backend_id,
-                    "action": "feature",
-                    "block": block,
-                    "tx": tx_hash,
-                },
-            )
-        previous_round = self._get_previous_round_id(round_id)
-        if previous_round is not None:
-            previous_projects = self._list_featured_projects(previous_round)
-            for project_hex in previous_projects:
-                backend_id = self._resolve_backend_project_id(project_hex)
-                if backend_id is None:
-                    LOGGER.warning(
-                        "Cannot unfeature project without backend mapping",
-                        extra={"project_hex": project_hex, "roundId": previous_round},
-                    )
-                    continue
-                if not self._patch_project(backend_id, {"is_featured": False}):
-                    return False
-                LOGGER.info(
-                    "Cleared featured flag",
-                    extra={
-                        "roundId": previous_round,
-                        "project_hex": project_hex,
-                        "backend_id": backend_id,
-                        "action": "unfeature",
-                        "block": block,
-                        "tx": tx_hash,
-                    },
-                )
-        self._upsert_featured_projects(round_id, projects_current)
         return True
 
     def _sync_featured_projects_from_contract(self) -> bool:
