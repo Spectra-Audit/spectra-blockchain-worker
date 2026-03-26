@@ -133,23 +133,26 @@ class ScoutApp:
                 LOGGER.info("FeaturedScout registered with unified API server")
 
                 # Initialize Payment Verifier Scout for on-demand tx verification
-                # Note: PaymentVerifierScout works independently and doesn't require backend_client
-                # It only needs: backend_url, backend_token (from env), and rpc_manager
+                # PaymentVerifierScout uses the SIWE-authenticated token from backend_client
                 try:
                     from .payment_verifier_scout import PaymentVerifierScout
 
-                    # Validate required environment variables
-                    admin_token = os.environ.get("ADMIN_ACCESS_TOKEN", "")
+                    # Get access token from SIWE-authenticated backend client
+                    admin_token = None
+                    if backend_client:
+                        admin_token = backend_client.get_access_token()
+
                     if not admin_token:
                         LOGGER.warning(
-                            "ADMIN_ACCESS_TOKEN not set - Payment Verifier Scout will not be able to "
-                            "send callbacks to backend. Payment verification will fail."
+                            "No access token available (backend_client not authenticated or ADMIN_ACCESS_TOKEN not set). "
+                            "Payment Verifier Scout will not be able to send callbacks to backend. "
+                            "Payment verification will fail."
                         )
 
                     LOGGER.info("Initializing Payment Verifier Scout...")
                     payment_verifier_scout = PaymentVerifierScout(
                         backend_url=api_base_url,
-                        backend_token=admin_token,
+                        backend_token=admin_token or os.environ.get("ADMIN_ACCESS_TOKEN", ""),
                         rpc_manager=rpc_manager,
                     )
                     payment_verifier_scout.start()

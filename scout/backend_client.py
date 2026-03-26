@@ -260,6 +260,15 @@ class BackendClient:
             return response
         return None
 
+    def get_access_token(self) -> Optional[str]:
+        """Get the current access token.
+
+        Returns:
+            Current access token or None if not authenticated
+        """
+        with self._lock:
+            return self._access_token
+
     def update_tokens(self, access_token: str, refresh_token: Optional[str] = None) -> None:
         if not access_token:
             raise ValueError("access_token is required")
