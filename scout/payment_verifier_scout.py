@@ -251,6 +251,21 @@ class PaymentVerifierScout:
                 provider.make_request("eth_getTransactionReceipt", [tx_hash])
             )
 
+            LOGGER.info(f"Fetched receipt for {tx_hash[:10]}...: receipt={'found' if receipt else 'None'}")
+
+            # Check if receipt exists (transaction might not be mined yet)
+            if receipt is None:
+                LOGGER.warning(f"Transaction receipt not found for {tx_hash[:10]}... - transaction may not be mined yet")
+                return PaymentVerificationResult(
+                    tx_hash=tx_hash,
+                    submission_id=request.submission_id,
+                    verified=False,
+                    creator_address=request.creator_address,
+                    amount_paid=0,
+                    expected_amount=request.expected_amount,
+                    failure_reason="Transaction receipt not found - transaction may not be mined yet",
+                )
+
             # Check if transaction was successful
             if receipt.get("status") != 1:
                 return PaymentVerificationResult(
@@ -411,7 +426,10 @@ class PaymentVerifierScout:
             request: Original verification request
             result: Verification result
         """
-        url = f"{request.backend_url}/v1/pending/{request.submission_id}"
+        # backend_url already includes /v1 suffix, so don't add it again
+        url = f"{request.backend_url}/pending/{request.submission_id}"
+
+        LOGGER.info(f"Sending callback to: {url} (verified={result.verified})")
 
         payload = {
             "status": "verified" if result.verified else "failed",
