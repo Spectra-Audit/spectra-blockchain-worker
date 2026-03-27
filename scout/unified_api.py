@@ -57,6 +57,13 @@ _payment_cache_lock = threading.RLock()
 # Keep payment events for 1 hour
 _PAYMENT_CACHE_TTL = timedelta(hours=1)
 
+# Staking verification cache - stores recently verified staking information
+# Format: {wallet_address: {staked_amount, staking_tier, verified_at}}
+_staking_cache: Dict[str, Dict[str, Any]] = {}
+_staking_cache_lock = threading.RLock()
+# Keep staking data for 5 minutes (balances don't change that frequently)
+_STAKING_CACHE_TTL = timedelta(minutes=5)
+
 
 def set_orchestrator(orch: AuditOrchestrator) -> None:
     """Set the global orchestrator instance.
@@ -170,6 +177,49 @@ def _cleanup_payment_cache() -> None:
     ]
     for tx_hash in expired:
         del _payment_cache[tx_hash]
+
+
+def get_staking_info(wallet_address: str) -> Optional[Dict[str, Any]]:
+    """Get staking information from cache.
+
+    Args:
+        wallet_address: Wallet address to look up
+
+    Returns:
+        Staking info dict or None if not found/expired
+    """
+    with _staking_cache_lock:
+        _cleanup_staking_cache()
+        return _staking_cache.get(wallet_address.lower())
+
+
+def set_staking_info(wallet_address: str, staked_amount: int, staking_tier: str) -> None:
+    """Store staking information in cache.
+
+    Args:
+        wallet_address: Wallet address
+        staked_amount: Amount staked in wei
+        staking_tier: Staking tier (free, basic, etc.)
+    """
+    with _staking_cache_lock:
+        _staking_cache[wallet_address.lower()] = {
+            "staked_amount": staked_amount,
+            "staking_tier": staking_tier,
+            "verified_at": datetime.utcnow(),
+        }
+        # Clean up old entries
+        _cleanup_staking_cache()
+
+
+def _cleanup_staking_cache() -> None:
+    """Remove expired entries from the staking cache."""
+    now = datetime.utcnow()
+    expired = [
+        wallet for wallet, data in _staking_cache.items()
+        if now - data.get("verified_at", now) > _STAKING_CACHE_TTL
+    ]
+    for wallet in expired:
+        del _staking_cache[wallet]
 
 
 if HAS_FASTAPI:
@@ -924,6 +974,21 @@ if HAS_FASTAPI:
             from datetime import datetime
 
             checksum_address = to_checksum_address(request.wallet_address)
+
+            # Check cache first to avoid expensive Web3 calls
+            cached_info = get_staking_info(checksum_address)
+            if cached_info:
+                LOGGER.debug(f"Using cached staking info for {checksum_address[:10]}...")
+                return StakingVerificationResponse(
+                    wallet_address=checksum_address,
+                    staked_amount=cached_info["staked_amount"],
+                    staked_amount_formatted=f"{from_wei(cached_info['staked_amount'], 'ether')} VERITAS LP",
+                    staking_tier=cached_info["staking_tier"],
+                    staking_contract_address=os.environ.get("VERITAS_STAKING_ADDRESS"),
+                    is_verified=True,
+                    last_updated=cached_info["verified_at"].isoformat(),
+                )
+
             w3 = orchestrator.w3
 
             # Get staking contract address from environment
@@ -1004,6 +1069,9 @@ if HAS_FASTAPI:
                 if staked_amount >= amount * (10 ** 18):
                     staking_tier = tier
                     break
+
+            # Cache the results for future requests
+            set_staking_info(checksum_address, staked_amount, staking_tier)
 
             return StakingVerificationResponse(
                 wallet_address=checksum_address,
