@@ -348,45 +348,61 @@ class AuditOrchestrator:
 
         # Add internal API secret header for authentication
         internal_secret = os.environ.get("INTERNAL_API_SECRET")
-        headers = {}
+        headers = {"Content-Type": "application/json"}
         if internal_secret:
             headers["X-Internal-Api-Secret"] = internal_secret
 
+        # Strategy 1: Use BackendClient if available and functional
+        if self.backend_client is not None:
+            try:
+                if hasattr(self.backend_client, "patch"):
+                    response = self.backend_client.patch(
+                        endpoint,
+                        json=payload,
+                        headers=headers,
+                    )
+                    if hasattr(response, "status_code"):
+                        LOGGER.info(f"Backend response status: {response.status_code}")
+                        return response.status_code == 200
+                    return True
+
+                if hasattr(self.backend_client, "post"):
+                    response = self.backend_client.post(
+                        endpoint,
+                        json=payload,
+                        headers=headers,
+                    )
+                    if hasattr(response, "status_code"):
+                        LOGGER.info(f"Backend response status: {response.status_code}")
+                        return response.status_code == 200
+                    return True
+
+            except Exception as exc:
+                LOGGER.warning("BackendClient failed, trying direct HTTP: %s", exc)
+
+        # Strategy 2: Direct HTTP fallback with INTERNAL_API_SECRET
+        api_base_url = os.environ.get("API_BASE_URL", "http://localhost:8000/v1")
+        url = (
+            f"{api_base_url.rstrip('/')}{endpoint}"
+            if endpoint.startswith('/')
+            else f"{api_base_url}/{endpoint}"
+        )
+
         try:
-            # Use the backend client's PATCH method
-            if hasattr(self.backend_client, "patch"):
-                response = self.backend_client.patch(
-                    endpoint,
-                    json=payload,
-                    headers=headers,
-                )
-
-                # Check response status
-                if hasattr(response, "status_code"):
-                    LOGGER.info(f"Backend response status: {response.status_code}")
-                    return response.status_code == 200
+            import requests as sync_requests
+            response = sync_requests.patch(url, json=payload, headers=headers, timeout=30)
+            LOGGER.info("Direct HTTP result: %s", response.status_code)
+            if response.status_code == 200:
                 return True
+            LOGGER.error(
+                "Direct HTTP failed: %s %s",
+                response.status_code,
+                response.text[:200],
+            )
+        except Exception as exc:
+            LOGGER.error("Direct HTTP delivery failed: %s", exc)
 
-            # Fallback: try POST method
-            elif hasattr(self.backend_client, "post"):
-                response = self.backend_client.post(
-                    endpoint,
-                    json=payload,
-                    headers=headers,
-                )
-
-                if hasattr(response, "status_code"):
-                    LOGGER.info(f"Backend response status: {response.status_code}")
-                    return response.status_code == 200
-                return True
-
-            else:
-                LOGGER.warning("Backend client has no patch/post method")
-                return False
-
-        except Exception as e:
-            LOGGER.error(f"Failed to store audit results: {e}")
-            return False
+        return False
 
     def start_weekly_updates(self) -> None:
         """Start weekly updates for all dynamic data.
