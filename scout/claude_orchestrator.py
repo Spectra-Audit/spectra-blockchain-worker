@@ -213,6 +213,20 @@ class ClaudeCodeOrchestrator:
                     + base_context[end_idx:]
                 )
 
+        # Inject category weight adjustments
+        category_weights_context = self.self_improver.format_weight_adjustments_for_prompt()
+        if "<!-- CATEGORY_WEIGHTS_START -->" in base_context:
+            cw_start_marker = "<!-- CATEGORY_WEIGHTS_START -->"
+            cw_end_marker = "<!-- CATEGORY_WEIGHTS_END -->"
+            cw_start_idx = base_context.find(cw_start_marker)
+            cw_end_idx = base_context.find(cw_end_marker)
+            if cw_start_idx >= 0 and cw_end_idx > cw_start_idx:
+                base_context = (
+                    base_context[:cw_start_idx + len(cw_start_marker)]
+                    + "\n" + category_weights_context + "\n"
+                    + base_context[cw_end_idx:]
+                )
+
         LOGGER.info(
             "[KNOWLEDGE] Context loaded: %d chars, %d lessons",
             len(base_context),

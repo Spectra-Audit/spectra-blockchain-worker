@@ -149,3 +149,7 @@ When analyzing multiple contracts from the same project:
 <!-- LESSONS_START -->
 <!-- Initial lessons will be populated after first audits -->
 <!-- LESSONS_END -->
+
+## Category Attention Weights (Auto-Adjusted)
+<!-- CATEGORY_WEIGHTS_START -->
+<!-- CATEGORY_WEIGHTS_END -->

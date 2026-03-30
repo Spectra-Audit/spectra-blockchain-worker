@@ -311,6 +311,53 @@ if HAS_FASTAPI:
         started_at: Optional[str] = None
         completed_at: Optional[str] = None
 
+    class CompareAuditRequest(BaseModel):
+        """Request to compare AI audit findings against human/external findings."""
+
+        project_id: str = Field(..., description="Project UUID")
+        ai_findings: List[Dict[str, Any]] = Field(
+            ..., description="Findings from the Spectra AI audit"
+        )
+        human_findings: List[Dict[str, Any]] = Field(
+            ..., description="Findings from an external/human audit"
+        )
+        contract_address: str = Field(
+            default="", description="Contract address being audited"
+        )
+
+        @validator("project_id")
+        def validate_project_id(cls, v: str) -> str:
+            """Validate project ID is not empty."""
+            if not v or not v.strip():
+                raise ValueError("Project ID cannot be empty")
+            return v
+
+        class Config:
+            """Pydantic config."""
+
+            json_schema_extra = {
+                "example": {
+                    "project_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "ai_findings": [
+                        {
+                            "severity": "high",
+                            "category": "reentrancy",
+                            "location": "withdraw()",
+                            "description": "Reentrancy vulnerability in withdraw function",
+                        }
+                    ],
+                    "human_findings": [
+                        {
+                            "severity": "critical",
+                            "category": "reentrancy",
+                            "location": "withdraw()",
+                            "description": "Critical reentrancy allowing fund drain",
+                        }
+                    ],
+                    "contract_address": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+                }
+            }
+
     # Create FastAPI app
     app = FastAPI(
         title="Spectra Unified Audit API",
@@ -888,6 +935,71 @@ if HAS_FASTAPI:
             "message": f"Contract audit queued for project {request.project_id}",
             "project_id": request.project_id,
         }
+
+    @app.post(
+        "/audit/compare",
+        response_model=Dict[str, Any],
+        status_code=status.HTTP_200_OK,
+        responses={
+            200: {"description": "Comparison completed successfully"},
+            400: {"description": "Invalid payload"},
+            500: {"description": "Comparison failed"},
+        },
+    )
+    async def compare_audits(request: CompareAuditRequest):
+        """Compare AI audit findings against human/external findings and learn.
+
+        Uses the AuditComparisonEngine for sophisticated matching, then feeds
+        results into AuditSelfImprover for lesson generation and category
+        accuracy tracking.
+
+        Args:
+            request: CompareAuditRequest with AI and human findings
+
+        Returns:
+            ComparisonResult with matched pairs, false positives, missed
+            findings, severity mismatches, category accuracy, plus lesson
+            generation stats.
+        """
+        try:
+            from .audit_self_improver import AuditSelfImprover
+
+            LOGGER.info(
+                "Audit comparison requested for project %s "
+                "(%d AI findings vs %d human findings)",
+                request.project_id[:8],
+                len(request.ai_findings),
+                len(request.human_findings),
+            )
+
+            improver = AuditSelfImprover()
+            result = improver.compare_and_learn(
+                ai_findings=request.ai_findings,
+                human_findings=request.human_findings,
+                contract_address=request.contract_address,
+            )
+
+            category_accuracy = improver.get_category_accuracy()
+
+            return {
+                "project_id": request.project_id,
+                "comparison": result["comparison"],
+                "lessons_added": result["lessons_added"],
+                "total_lessons": result["total_lessons"],
+                "category_accuracy": category_accuracy,
+            }
+
+        except Exception as e:
+            LOGGER.error(
+                "Audit comparison failed for project %s: %s",
+                request.project_id[:8],
+                e,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to compare audits: {str(e)}",
+            )
 
     @app.get("/stats")
     async def get_stats():
