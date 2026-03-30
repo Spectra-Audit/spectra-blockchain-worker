@@ -245,46 +245,6 @@ class ScoutApp:
             except Exception as e:
                 LOGGER.warning(f"Failed to initialize Token Holder Scout: {e}")
 
-        # Initialize Audit Orchestrator if TokenHolderScout exists and backend client is available
-        audit_orchestrator = None
-        if token_holder_scout and backend_client:
-            try:
-                from .audit_orchestrator import create_audit_orchestrator
-
-                audit_orchestrator = create_audit_orchestrator(
-                    token_holder_scout=token_holder_scout,
-                    tokenomics_analyzer_scout=tokenomics_analyzer_scout,
-                    liquidity_analyzer_scout=liquidity_analyzer_scout,
-                    contract_audit_scout=contract_audit_scout,
-                    backend_client=backend_client,
-                    database=database,
-                )
-
-                # Start weekly updates for all dynamic data
-                if os.environ.get("ENABLE_AUDIT_ORCHESTRATOR", "true").lower() == "true":
-                    audit_orchestrator.start_weekly_updates()
-                    LOGGER.info("Audit Orchestrator started with weekly dynamic data updates (all scouts)")
-
-                # Register orchestrator with unified API server if enabled
-                if os.environ.get("ENABLE_UNIFIED_API", "").lower() == "true":
-                    try:
-                        from .unified_api import set_orchestrator
-                        set_orchestrator(audit_orchestrator)
-                        LOGGER.info("Audit orchestrator registered with unified API server")
-                    except ImportError:
-                        LOGGER.warning("FastAPI not available, unified API server not registered")
-                else:
-                    # Fallback to old webhook server for backwards compatibility
-                    try:
-                        from .payment_webhook import set_orchestrator
-                        set_orchestrator(audit_orchestrator)
-                        LOGGER.info("Audit orchestrator registered with legacy webhook server")
-                    except ImportError:
-                        LOGGER.debug("FastAPI not available, webhook server not registered")
-
-            except Exception as e:
-                LOGGER.warning(f"Failed to initialize Audit Orchestrator: {e}")
-
         # Initialize Liquidity Analyzer Scout if enabled
         liquidity_analyzer_scout = None
         if os.environ.get("ENABLE_LIQUIDITY_ANALYZER", "").lower() == "true":
@@ -335,23 +295,45 @@ class ScoutApp:
             except Exception as e:
                 LOGGER.warning(f"Failed to initialize Contract Auditor Scout: {e}")
 
-        # Update Audit Orchestrator to include all new scouts
-        if audit_orchestrator:
-            scouts_updated = []
-            if tokenomics_analyzer_scout and not audit_orchestrator.tokenomics_analyzer_scout:
-                audit_orchestrator.tokenomics_analyzer_scout = tokenomics_analyzer_scout
-                scouts_updated.append("Tokenomics Analyzer")
+        # Initialize Audit Orchestrator AFTER all scouts are created
+        audit_orchestrator = None
+        if token_holder_scout and backend_client:
+            try:
+                from .audit_orchestrator import create_audit_orchestrator
 
-            if liquidity_analyzer_scout and not audit_orchestrator.liquidity_analyzer_scout:
-                audit_orchestrator.liquidity_analyzer_scout = liquidity_analyzer_scout
-                scouts_updated.append("Liquidity Analyzer")
+                audit_orchestrator = create_audit_orchestrator(
+                    token_holder_scout=token_holder_scout,
+                    tokenomics_analyzer_scout=tokenomics_analyzer_scout,
+                    liquidity_analyzer_scout=liquidity_analyzer_scout,
+                    contract_audit_scout=contract_audit_scout,
+                    backend_client=backend_client,
+                    database=database,
+                )
 
-            if contract_audit_scout and not audit_orchestrator.contract_audit_scout:
-                audit_orchestrator.contract_audit_scout = contract_audit_scout
-                scouts_updated.append("Contract Auditor")
+                # Start weekly updates for all dynamic data
+                if os.environ.get("ENABLE_AUDIT_ORCHESTRATOR", "true").lower() == "true":
+                    audit_orchestrator.start_weekly_updates()
+                    LOGGER.info("Audit Orchestrator started with weekly dynamic data updates (all scouts)")
 
-            if scouts_updated:
-                LOGGER.info(f"Audit Orchestrator updated with: {', '.join(scouts_updated)}")
+                # Register orchestrator with unified API server if enabled
+                if os.environ.get("ENABLE_UNIFIED_API", "").lower() == "true":
+                    try:
+                        from .unified_api import set_orchestrator
+                        set_orchestrator(audit_orchestrator)
+                        LOGGER.info("Audit orchestrator registered with unified API server")
+                    except ImportError:
+                        LOGGER.warning("FastAPI not available, unified API server not registered")
+                else:
+                    # Fallback to old webhook server for backwards compatibility
+                    try:
+                        from .payment_webhook import set_orchestrator
+                        set_orchestrator(audit_orchestrator)
+                        LOGGER.info("Audit orchestrator registered with legacy webhook server")
+                    except ImportError:
+                        LOGGER.debug("FastAPI not available, webhook server not registered")
+
+            except Exception as e:
+                LOGGER.warning(f"Failed to initialize Audit Orchestrator: {e}")
 
         # Initialize Unified Audit Service if enabled (NEW)
         unified_audit_service = None

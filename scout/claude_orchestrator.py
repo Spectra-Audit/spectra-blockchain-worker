@@ -96,11 +96,11 @@ class ClaudeCodeOrchestrator:
         for agent_name, config in self.agents_config.items():
             LOGGER.info("  - %s: %s", agent_name, config.get("description", "No description"))
 
-        # Step 3: Load knowledge context
-        self.knowledge_context = self._load_knowledge_context()
-
-        # Step 4: Initialize self-improver
+        # Step 3: Initialize self-improver (must be before loading knowledge context)
         self.self_improver = AuditSelfImprover()
+
+        # Step 4: Load knowledge context (uses self.self_improver)
+        self.knowledge_context = self._load_knowledge_context()
 
         # Step 5: Check GLM API configuration
         glm_api_key = os.getenv("GLM_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")
