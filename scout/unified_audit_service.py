@@ -354,6 +354,7 @@ class UnifiedAuditService:
             description=d.get("description", ""),
             location=d.get("location"),
             recommendation=d.get("recommendation", ""),
+            confidence=d.get("confidence", "medium"),
         )
 
     async def _audit_unverified_contract(
