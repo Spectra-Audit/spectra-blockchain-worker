@@ -299,18 +299,14 @@ class ClaudeCodeOrchestrator:
         """
         prompt_template = agent_config.get("prompt", "")
 
-        # Build the full prompt by injecting knowledge context and code
-        try:
-            prompt = prompt_template.format(
-                knowledge_context=self.knowledge_context,
-                code=code,
-            )
-        except (KeyError, IndexError) as exc:
-            LOGGER.warning("[AUDIT] Prompt template formatting error: %s", exc)
-            # Fallback: simple string replacement
-            prompt = prompt_template
-            prompt = prompt.replace("{knowledge_context}", self.knowledge_context)
-            prompt = prompt.replace("{code}", code)
+        # Build the full prompt by injecting knowledge context and code.
+        # NOTE: We intentionally use str.replace() instead of str.format()
+        # because the injected content (Solidity source code, knowledge base)
+        # frequently contains curly braces like {0}, {1}, mapping types, etc.
+        # that Python's str.format() would misinterpret as positional format
+        # markers, causing "Replacement index N out of range" errors.
+        prompt = prompt_template.replace("{knowledge_context}", self.knowledge_context)
+        prompt = prompt.replace("{code}", code)
 
         # Write code to temp file for reference
         suffix = '.sol' if input_type == "SOURCE_CODE" else '.txt'
