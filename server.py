@@ -157,195 +157,208 @@ def _verify_payment_from_receipt(w3, backend_client, receipt, expected_creator):
     logger.debug(f"No matching Paid event found in receipt {receipt.transactionHash.hex()}")
 
 
+def _do_background_initialization():
+    """Perform all heavy initialization in the background after the server starts.
+
+    This runs in a daemon thread so the FastAPI server can start accepting
+    connections immediately.  Railway's health check (/health) will succeed
+    right away while the orchestrator, scouts, and backend client are being
+    set up.  The /audit/trigger endpoint gracefully returns 503 until the
+    orchestrator is registered.
+    """
+    import threading
+
+    def _init():
+        try:
+            # ---- FastAPI / uvicorn are guaranteed available by this point ----
+            from web3 import Web3  # noqa: F811 (already imported at top level)
+
+            # Setup Web3
+            rpc_url = os.environ.get("RPC_HTTP_URL", "https://eth.llamarpc.com")
+            logger.info(f"[bg-init] Connecting to RPC: {rpc_url}")
+            w3 = Web3(Web3.HTTPProvider(rpc_url))
+            if not w3.is_connected():
+                logger.warning("[bg-init] Failed to connect to RPC, continuing anyway...")
+
+            # Create database manager
+            from scout.database_manager import DatabaseManager
+            db_path = os.environ.get("DB_PATH", "/app/data/scout.db")
+            database = DatabaseManager(db_path=db_path)
+            logger.info(f"[bg-init] Database initialized: {db_path}")
+
+            # Create backend client (optional)
+            backend_client = None
+            api_base_url = os.environ.get("API_BASE_URL")
+            if api_base_url and not api_base_url.startswith("{{"):
+                try:
+                    from scout.backend_client import BackendClient
+                    from scout.siwe_authenticator import SiweAuthenticator
+                    from scout.auth_wallet import load_or_create_admin_wallet
+
+                    os.environ["SCOUT_SKIP_WALLET_PROMPT"] = "1"
+
+                    admin_wallet = load_or_create_admin_wallet(database)
+                    authenticator = SiweAuthenticator(api_base_url, admin_wallet, database)
+
+                    def token_provider(force_refresh: bool = False) -> tuple[str, str]:
+                        return authenticator.get_tokens()
+
+                    backend_client = BackendClient(
+                        api_base_url,
+                        token_provider=token_provider
+                    )
+                    logger.info(f"[bg-init] Backend client configured: {api_base_url}")
+                except Exception as e:
+                    logger.warning(f"[bg-init] Failed to initialize backend client: {e}")
+                    logger.info("[bg-init] Continuing without backend client")
+                    backend_client = None
+            else:
+                logger.info("[bg-init] Running without backend client - audits will respond via API only")
+
+            # Import after Web3 check
+            from scout.audit_orchestrator import create_audit_orchestrator
+            from scout.unified_api import set_orchestrator
+            from scout.unified_audit_service import create_unified_audit_service
+            from scout.main import ScoutApp
+
+            # Create ScoutApp
+            logger.info("[bg-init] Creating ScoutApp with blockchain monitoring scouts...")
+            scout_app = ScoutApp.from_env()
+            logger.info("[bg-init] ScoutApp created successfully")
+
+            # Update last_block if too far behind
+            try:
+                current_block = w3.eth.block_number
+                target_block = current_block - 2000
+
+                featured_last_block_str = scout_app.database.get_meta("featured_last_block")
+                if featured_last_block_str:
+                    featured_last_block = int(featured_last_block_str)
+                    blocks_behind = current_block - featured_last_block
+                    if blocks_behind > 10000:
+                        logger.warning(
+                            f"[bg-init] FeaturedScout is {blocks_behind} blocks behind. "
+                            f"Skipping to block {target_block}."
+                        )
+                        scout_app.database.set_meta("featured_last_block", str(target_block))
+
+                pro_last_block_str = scout_app.database.get_meta("pro_last_block")
+                if pro_last_block_str:
+                    pro_last_block = int(pro_last_block_str)
+                    blocks_behind = current_block - pro_last_block
+                    if blocks_behind > 10000:
+                        logger.warning(
+                            f"[bg-init] ProScout is {blocks_behind} blocks behind. "
+                            f"Skipping to block {target_block}."
+                        )
+                        scout_app.database.set_meta("pro_last_block", str(target_block))
+            except Exception as e:
+                logger.warning(f"[bg-init] Failed to check/update scout last_block values: {e}")
+
+            # Check for missed payments
+            if backend_client:
+                try:
+                    logger.info("[bg-init] Checking for pending submissions...")
+                    _check_and_verify_missed_payments(w3, backend_client, scout_app.database)
+                except Exception as e:
+                    logger.warning(f"[bg-init] Failed to check for missed payments: {e}")
+
+            # Start scouts
+            logger.info("[bg-init] Starting blockchain monitoring scouts...")
+            scout_app.start()
+            logger.info("[bg-init] Scouts started - FeaturedScout will monitor for Paid events")
+
+            # Get or create audit orchestrator
+            if hasattr(scout_app, 'audit_orchestrator') and scout_app.audit_orchestrator:
+                orchestrator = scout_app.audit_orchestrator
+                logger.info("[bg-init] Using ScoutApp's audit orchestrator")
+            else:
+                logger.info("[bg-init] Creating unified audit service...")
+                unified_audit_service = create_unified_audit_service(
+                    database=scout_app.database,
+                    w3=w3,
+                    backend_client=scout_app.backend_client,
+                    token_holder_scout=None,
+                    liquidity_analyzer_scout=None,
+                    tokenomics_analyzer_scout=None,
+                )
+
+                logger.info("[bg-init] Creating audit orchestrator...")
+                orchestrator = create_audit_orchestrator(
+                    database=scout_app.database,
+                    backend_client=scout_app.backend_client,
+                    w3=w3,
+                    token_holder_scout=None,
+                    tokenomics_analyzer_scout=None,
+                    liquidity_analyzer_scout=None,
+                    unified_audit_service=unified_audit_service,
+                )
+
+            # Register with unified API -- now /audit/trigger will work
+            set_orchestrator(orchestrator)
+            logger.info("[bg-init] Audit orchestrator registered - service is ready")
+
+            # Store scout_app reference for shutdown
+            global _scout_app_ref
+            _scout_app_ref = scout_app
+
+        except Exception as e:
+            logger.exception(f"[bg-init] Background initialization failed: {e}")
+            logger.error("[bg-init] Service will remain in 503 (not ready) state")
+
+    t = threading.Thread(target=_init, name="bg-init", daemon=True)
+    t.start()
+    return t
+
+
+# Module-level reference so signal handlers can shut down scouts
+_scout_app_ref = None
+
+
 def main() -> int:
     """Main entry point for Railway deployment."""
 
     try:
-        # Check for required dependencies
+        # Check for required dependencies early
         try:
-            from web3 import Web3
+            from web3 import Web3  # noqa: F401
         except ImportError:
             logger.error("web3 required: pip install web3")
             return 1
 
         try:
-            from fastapi import FastAPI
+            from fastapi import FastAPI  # noqa: F401
         except ImportError:
             logger.error("FastAPI required: pip install fastapi uvicorn")
             return 1
 
-        # Setup Web3
-        rpc_url = os.environ.get("RPC_HTTP_URL", "https://eth.llamarpc.com")
-        logger.info(f"Connecting to RPC: {rpc_url}")
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-        if not w3.is_connected():
-            logger.warning("Failed to connect to RPC, continuing anyway...")
+        # Register a FastAPI startup event so background init runs after
+        # uvicorn binds the port -- Railway health checks will pass immediately.
+        from scout.unified_api import app as fastapi_app
 
-        # Create database manager for unified audit service
-        from scout.database_manager import DatabaseManager
-        db_path = os.environ.get("DB_PATH", "/app/data/scout.db")
-        database = DatabaseManager(db_path=db_path)
-        logger.info(f"Database initialized: {db_path}")
-
-        # Create backend client (optional - for sending results)
-        backend_client = None
-        api_base_url = os.environ.get("API_BASE_URL")
-        # Skip Railway service references - they must be hardcoded
-        if api_base_url and not api_base_url.startswith("{{"):
-            try:
-                from scout.backend_client import BackendClient
-                from scout.siwe_authenticator import SiweAuthenticator
-                from scout.auth_wallet import load_or_create_admin_wallet
-
-                # Set skip prompt for Railway (non-interactive)
-                os.environ["SCOUT_SKIP_WALLET_PROMPT"] = "1"
-
-                admin_wallet = load_or_create_admin_wallet(database)
-                authenticator = SiweAuthenticator(api_base_url, admin_wallet, database)
-
-                # Create token provider function for BackendClient
-                def token_provider(force_refresh: bool = False) -> tuple[str, str]:
-                    """Get access and refresh tokens from authenticator."""
-                    return authenticator.get_tokens()
-
-                backend_client = BackendClient(
-                    api_base_url,
-                    token_provider=token_provider
-                )
-                logger.info(f"Backend client configured: {api_base_url}")
-            except Exception as e:
-                logger.warning(f"Failed to initialize backend client: {e}")
-                logger.info("Continuing without backend client - audits will run but won't send results")
-                backend_client = None
-        else:
-            if api_base_url:
-                logger.debug(f"API_BASE_URL contains Railway service reference, skipping: {api_base_url[:50]}...")
-            logger.info("Running without backend client - audits will respond via API only")
-
-        # Import after Web3 check
-        from scout.audit_orchestrator import create_audit_orchestrator
-        from scout.unified_api import set_orchestrator, run_unified_api
-        from scout.unified_audit_service import create_unified_audit_service
-        from scout.main import ScoutApp
-
-        # Create ScoutApp with all scouts (FeaturedScout, ProScout, etc.)
-        # This is needed for payment verification via FeaturedScout
-        # ScoutApp.from_env() reads everything from environment variables
-        logger.info("Creating ScoutApp with blockchain monitoring scouts...")
-        scout_app = ScoutApp.from_env()
-        logger.info("ScoutApp created successfully")
-
-        # Fix: Update database last_block if it's too far behind current block
-        # This prevents the worker from spending hours processing historical blocks
-        # But we need to keep a small window to catch recent payments
-        try:
-            current_block = w3.eth.block_number
-
-            # Skip to (current - 2000) blocks if more than 10000 behind
-            # This keeps a ~2-hour window to catch recent pending payments
-            target_block = current_block - 2000
-
-            # Check and update FeaturedScout's last block
-            featured_last_block_str = scout_app.database.get_meta("featured_last_block")
-            if featured_last_block_str:
-                featured_last_block = int(featured_last_block_str)
-                blocks_behind = current_block - featured_last_block
-                if blocks_behind > 10000:  # If more than 10000 blocks behind, skip closer to current
-                    logger.warning(
-                        f"FeaturedScout is {blocks_behind} blocks behind. "
-                        f"Skipping to block {target_block} to catch recent payments."
-                    )
-                    scout_app.database.set_meta("featured_last_block", str(target_block))
-
-            # Check and update ProScout's last block
-            pro_last_block_str = scout_app.database.get_meta("pro_last_block")
-            if pro_last_block_str:
-                pro_last_block = int(pro_last_block_str)
-                blocks_behind = current_block - pro_last_block
-                if blocks_behind > 10000:  # If more than 10000 blocks behind, skip closer to current
-                    logger.warning(
-                        f"ProScout is {blocks_behind} blocks behind. "
-                        f"Skipping to block {target_block} to catch recent events."
-                    )
-                    scout_app.database.set_meta("pro_last_block", str(target_block))
-        except Exception as e:
-            logger.warning(f"Failed to check/update scout last_block values: {e}")
-
-        # Check for missed payments from pending submissions
-        # This handles cases where the worker skipped past blocks containing payments
-        if backend_client:
-            try:
-                logger.info("Checking for pending submissions that may have been missed...")
-                _check_and_verify_missed_payments(w3, backend_client, scout_app.database)
-            except Exception as e:
-                logger.warning(f"Failed to check for missed payments: {e}")
-
-        # Start the scouts in background (FeaturedScout monitors payments, ProScout monitors staking)
-        logger.info("Starting blockchain monitoring scouts...")
-        scout_app.start()
-        logger.info("Scouts started - FeaturedScout will monitor for Paid events")
-
-        # Get the audit orchestrator from ScoutApp (if it has one)
-        # Otherwise create a new one
-        if hasattr(scout_app, 'audit_orchestrator') and scout_app.audit_orchestrator:
-            orchestrator = scout_app.audit_orchestrator
-            logger.info("Using ScoutApp's audit orchestrator")
-        else:
-            # Create unified audit service for code audits
-            logger.info("Creating unified audit service...")
-            unified_audit_service = create_unified_audit_service(
-                database=scout_app.database,
-                w3=w3,
-                backend_client=scout_app.backend_client,
-                token_holder_scout=None,
-                liquidity_analyzer_scout=None,
-                tokenomics_analyzer_scout=None,
-            )
-
-            # Create audit orchestrator with unified audit service
-            # We only need the contract audit capability for Railway
-            logger.info("Creating audit orchestrator...")
-            orchestrator = create_audit_orchestrator(
-                database=scout_app.database,
-                backend_client=scout_app.backend_client,
-                w3=w3,
-                token_holder_scout=None,  # Not needed for triggered audits
-                tokenomics_analyzer_scout=None,
-                liquidity_analyzer_scout=None,
-                unified_audit_service=unified_audit_service,
-            )
-
-        # Register with unified API
-        set_orchestrator(orchestrator)
-        logger.info("Audit orchestrator registered with unified API server")
+        @fastapi_app.on_event("startup")
+        async def _launch_background_init():
+            _do_background_initialization()
 
         # Get port from environment
         port = int(os.environ.get("PORT", os.environ.get("UNIFIED_API_PORT", "8080")))
         host = os.environ.get("UNIFIED_API_HOST", "0.0.0.0")
 
-        logger.info(f"Starting unified API server on {host}:{port}")
+        logger.info(f"Starting unified API server on {host}:{port} (init deferred to background)")
 
-        # Install shutdown hook for scouts
-        import atexit
-        def cleanup():
-            logger.info("Shutting down scouts...")
-            scout_app.shutdown()
-        atexit.register(cleanup)
-
-        # Also handle signals for graceful shutdown
+        # Handle signals for graceful shutdown
         import signal
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, shutting down...")
-            scout_app.shutdown()
+            if _scout_app_ref:
+                _scout_app_ref.shutdown()
             raise SystemExit(0)
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
-        # Run the unified API server (blocking call)
-        try:
-            run_unified_api(host=host, port=port, log_level=log_level)
-        finally:
-            scout_app.shutdown()
+        # Start FastAPI server immediately -- heavy init runs in background
+        from scout.unified_api import run_unified_api
+        run_unified_api(host=host, port=port, log_level=log_level)
 
         return 0
 

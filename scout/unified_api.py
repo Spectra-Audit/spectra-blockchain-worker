@@ -369,6 +369,11 @@ if HAS_FASTAPI:
     async def health_check():
         """Health check endpoint.
 
+        Returns 200 even when the orchestrator is still initializing so that
+        Railway's proxy considers the container healthy and routes traffic.
+        The ``orchestrator_ready`` flag lets callers distinguish between
+        "server is up" and "audit service is fully initialised".
+
         Returns:
             Health status with orchestrator ready flag
         """
