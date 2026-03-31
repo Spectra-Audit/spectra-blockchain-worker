@@ -23,6 +23,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -1335,7 +1336,12 @@ if HAS_FASTAPI:
         chain_id: int,
         force_full: bool,
     ) -> None:
-        """Run audit task in background.
+        """Run audit task in a thread so the event loop stays responsive.
+
+        The audit pipeline calls synchronous code (BackendClient via
+        ``requests``, SiweAuthenticator handshake, Web3 calls) which would
+        block uvicorn's async event loop if awaited directly.  We offload
+        the entire run to a thread-pool executor instead.
 
         Args:
             project_id: Project UUID
@@ -1343,16 +1349,23 @@ if HAS_FASTAPI:
             chain_id: Chain ID
             force_full: Whether to force full audit including static data
         """
+        import functools
+
         try:
             LOGGER.info(
                 f"Starting background audit for {project_id[:8]}... "
                 f"(force_full={force_full})"
             )
 
-            result = await orchestrator.run_full_audit(
-                project_id=project_id,
-                token_address=token_address,
-                chain_id=chain_id,
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    _run_audit_sync,
+                    project_id,
+                    token_address,
+                    chain_id,
+                ),
             )
 
             LOGGER.info(
@@ -1367,13 +1380,18 @@ if HAS_FASTAPI:
         token_address: str,
         chain_id: int,
     ) -> None:
-        """Run contract audit task in background.
+        """Run contract audit task in a thread so the event loop stays responsive.
+
+        Same rationale as ``_run_audit_task``: the contract audit scout and
+        BackendClient use synchronous I/O that must not block uvicorn's loop.
 
         Args:
             project_id: Project UUID
             token_address: Token contract address
             chain_id: Chain ID
         """
+        import functools
+
         try:
             LOGGER.info(f"Starting background contract audit for {project_id[:8]}...")
 
@@ -1382,31 +1400,79 @@ if HAS_FASTAPI:
                 LOGGER.warning(f"ContractAuditScout not available for {project_id[:8]}...")
                 return
 
-            # Run contract audit only
-            result = await orchestrator.contract_audit_scout.audit_contract(
-                token_address=token_address,
-                chain_id=chain_id,
-                force=True,
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                functools.partial(
+                    _run_contract_audit_sync,
+                    project_id,
+                    token_address,
+                    chain_id,
+                ),
             )
-
-            LOGGER.info(
-                f"Contract audit completed for {project_id[:8]}...: "
-                f"score={result.overall_score:.1f}, risk={result.risk_level}"
-            )
-
-            # Store results to backend
-            if orchestrator.backend_client:
-                from datetime import datetime
-                payload = {
-                    "audit_data": {
-                        "contract_audit": result.__dict__,
-                    },
-                    "completed_at": datetime.utcnow().isoformat(),
-                }
-                orchestrator.backend_client.store_audit_results(project_id, payload)
 
         except Exception as e:
             LOGGER.error(f"Contract audit failed for {project_id[:8]}...: {e}", exc_info=True)
+
+
+def _run_audit_sync(
+    project_id: str,
+    token_address: str,
+    chain_id: int,
+) -> Any:
+    """Synchronous wrapper that runs the full audit in a **new** event loop.
+
+    This function is designed to be called via ``run_in_executor`` so the
+    audit runs in a dedicated thread, keeping uvicorn's main event loop
+    free to serve status and health requests.
+
+    A fresh ``asyncio`` event loop is created because the orchestrator's
+    ``run_full_audit`` method is an ``async`` coroutine -- but the
+    underlying work (BackendClient HTTP calls, SIWE handshake, Web3 RPC
+    calls) is all synchronous *blocking* I/O.  Running inside its own
+    loop in its own thread prevents any of those blocking calls from
+    stalling the server's main loop.
+    """
+    coro = orchestrator.run_full_audit(
+        project_id=project_id,
+        token_address=token_address,
+        chain_id=chain_id,
+    )
+    return asyncio.run(coro)
+
+
+def _run_contract_audit_sync(
+    project_id: str,
+    token_address: str,
+    chain_id: int,
+) -> None:
+    """Synchronous wrapper for contract-only audit, run in a worker thread."""
+    if not hasattr(orchestrator, 'contract_audit_scout') or not orchestrator.contract_audit_scout:
+        return
+
+    result = asyncio.run(
+        orchestrator.contract_audit_scout.audit_contract(
+            token_address=token_address,
+            chain_id=chain_id,
+            force=True,
+        )
+    )
+
+    LOGGER.info(
+        f"Contract audit completed for {project_id[:8]}...: "
+        f"score={result.overall_score:.1f}, risk={result.risk_level}"
+    )
+
+    # Store results to backend
+    if orchestrator.backend_client:
+        from datetime import datetime
+        payload = {
+            "audit_data": {
+                "contract_audit": result.__dict__,
+            },
+            "completed_at": datetime.utcnow().isoformat(),
+        }
+        orchestrator.backend_client.store_audit_results(project_id, payload)
 
 
 def run_unified_api(

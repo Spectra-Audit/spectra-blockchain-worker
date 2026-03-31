@@ -102,14 +102,27 @@ class SiweAuthenticator:
 
     # ----------------------------------------------------------------- internals
     def _perform_handshake_locked(self) -> Tuple[str, str]:
+        # Overall deadline so the handshake cannot block indefinitely.
+        # Even in a background thread, a ~90 s cap keeps the worker healthy.
+        deadline = time.monotonic() + 90.0
         last_exc: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
+            if time.monotonic() >= deadline:
+                raise SiweAuthenticationError(
+                    f"SIWE handshake timed out after {attempt - 1} attempts"
+                ) from last_exc
             try:
                 return self._try_handshake_once()
             except SiweAuthenticationError as exc:
                 last_exc = exc
                 if attempt < self._max_retries:
                     backoff = self._retry_backoff * (2 ** (attempt - 1))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise SiweAuthenticationError(
+                            f"SIWE handshake timed out during retry backoff"
+                        ) from last_exc
+                    backoff = min(backoff, remaining)
                     LOGGER.warning(
                         "SIWE handshake attempt %d/%d failed: %s - retrying in %.1fs",
                         attempt, self._max_retries, exc, backoff,
