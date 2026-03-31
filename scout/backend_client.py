@@ -151,7 +151,7 @@ class BackendClient:
             headers["X-Internal-Api-Secret"] = internal_secret
 
         try:
-            response = self.patch(endpoint, json=payload, headers=headers)
+            response = self.patch(endpoint, json=payload, headers=headers, timeout=30)
             if response and response.status_code == 200:
                 LOGGER.info(f"Stored audit results for project {project_id[:8]}...")
                 return True
@@ -196,18 +196,29 @@ class BackendClient:
         raise_for_status: bool,
         should_retry: Optional[Callable[[], bool]] = None,
     ) -> Optional[Response]:
-        # Lazy token bootstrap — authenticate on first actual API call
+        # Lazy token bootstrap -- authenticate on first actual API call.
+        # Retry up to 3 times with short backoff so transient backend
+        # unavailability doesn't permanently kill result storage.
         if not self._bootstrapped:
             with self._lock:
                 if not self._bootstrapped:
-                    try:
-                        self._bootstrap_tokens(force=False)
-                        self._bootstrapped = True
-                        LOGGER.info("Lazy token bootstrap succeeded on first API call")
-                    except Exception as exc:
-                        LOGGER.warning("Lazy token bootstrap failed (will retry): %s", exc)
-                        self._bootstrapped = False
-                        raise
+                    bootstrap_attempts = 3
+                    last_bootstrap_exc: Exception | None = None
+                    for _bs_attempt in range(bootstrap_attempts):
+                        try:
+                            self._bootstrap_tokens(force=False)
+                            self._bootstrapped = True
+                            LOGGER.info("Lazy token bootstrap succeeded on first API call")
+                            break
+                        except Exception as exc:
+                            last_bootstrap_exc = exc
+                            LOGGER.warning(
+                                "Lazy token bootstrap failed (attempt %d/%d): %s",
+                                _bs_attempt + 1, bootstrap_attempts, exc,
+                            )
+                    if not self._bootstrapped and last_bootstrap_exc is not None:
+                        LOGGER.error("All lazy token bootstrap attempts failed")
+                        raise last_bootstrap_exc
 
         delay = self._initial_delay
         token_refreshed = False

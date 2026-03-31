@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Callable, Tuple
 
 import requests
@@ -17,6 +18,10 @@ LOGGER = logging.getLogger(__name__)
 
 ACCESS_TOKEN_META_KEY = "admin_access_token"
 REFRESH_TOKEN_META_KEY = "admin_refresh_token"
+
+# Default retry configuration for the SIWE handshake.
+_SIWE_MAX_RETRIES = 3
+_SIWE_RETRY_BACKOFF = 2.0  # seconds, doubles each attempt
 
 
 class SiweAuthenticationError(RuntimeError):
@@ -33,7 +38,9 @@ class SiweAuthenticator:
         database: DatabaseManager,
         *,
         session_factory: Callable[[], requests.Session] | None = None,
-        timeout: float = 10.0,
+        timeout: float = 15.0,
+        max_retries: int = _SIWE_MAX_RETRIES,
+        retry_backoff: float = _SIWE_RETRY_BACKOFF,
     ) -> None:
         if not base_url:
             raise ValueError("base_url is required")
@@ -41,6 +48,8 @@ class SiweAuthenticator:
         self._wallet = wallet
         self._database = database
         self._timeout = timeout
+        self._max_retries = max(1, max_retries)
+        self._retry_backoff = retry_backoff
         self._session = (session_factory or requests.Session)()
         self._lock = threading.RLock()
         self._access_token = database.get_meta(ACCESS_TOKEN_META_KEY)
@@ -93,6 +102,24 @@ class SiweAuthenticator:
 
     # ----------------------------------------------------------------- internals
     def _perform_handshake_locked(self) -> Tuple[str, str]:
+        last_exc: Exception | None = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                return self._try_handshake_once()
+            except SiweAuthenticationError as exc:
+                last_exc = exc
+                if attempt < self._max_retries:
+                    backoff = self._retry_backoff * (2 ** (attempt - 1))
+                    LOGGER.warning(
+                        "SIWE handshake attempt %d/%d failed: %s - retrying in %.1fs",
+                        attempt, self._max_retries, exc, backoff,
+                    )
+                    time.sleep(backoff)
+        raise SiweAuthenticationError(
+            f"SIWE handshake failed after {self._max_retries} attempts"
+        ) from last_exc
+
+    def _try_handshake_once(self) -> Tuple[str, str]:
         lowercase_address = self._wallet.address.lower()
         nonce_payload = {
             "wallet_address": self._wallet.address,
