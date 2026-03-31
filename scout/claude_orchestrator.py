@@ -305,7 +305,7 @@ class ClaudeCodeOrchestrator:
                 knowledge_context=self.knowledge_context,
                 code=code,
             )
-        except KeyError as exc:
+        except (KeyError, IndexError) as exc:
             LOGGER.warning("[AUDIT] Prompt template formatting error: %s", exc)
             # Fallback: simple string replacement
             prompt = prompt_template

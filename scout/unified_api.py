@@ -1001,6 +1001,57 @@ if HAS_FASTAPI:
                 detail=f"Failed to compare audits: {str(e)}",
             )
 
+    @app.get(
+        "/audit/lessons",
+        response_model=Dict[str, Any],
+        responses={
+            200: {"description": "Lessons retrieved successfully"},
+            500: {"description": "Failed to retrieve lessons"},
+        },
+    )
+    async def get_audit_lessons(project_id: Optional[str] = None):
+        """Get accumulated audit lessons, optionally filtered by project.
+
+        Args:
+            project_id: Optional project ID to filter lessons
+
+        Returns:
+            List of lessons with metadata
+        """
+        try:
+            from .audit_self_improver import AuditSelfImprover
+
+            improver = AuditSelfImprover()
+            lessons = improver.lessons
+
+            if project_id:
+                lessons = [
+                    l for l in lessons
+                    if l.get("contract_address") or l.get("project_id") == project_id
+                ]
+
+            LOGGER.info(
+                "Returning %d audit lessons (project_id=%s)",
+                len(lessons),
+                project_id,
+            )
+
+            return {
+                "lessons": lessons,
+                "total_lessons": len(lessons),
+            }
+
+        except Exception as e:
+            LOGGER.error(
+                "Failed to retrieve audit lessons: %s",
+                e,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to retrieve lessons: {str(e)}",
+            )
+
     @app.get("/stats")
     async def get_stats():
         """Get orchestrator statistics.
