@@ -41,12 +41,16 @@ class BackendClient:
         self._refresh_token: Optional[str] = None
         self._session.headers.update({"Accept": "application/json"})
 
+        self._bootstrapped = False
         if admin_token and admin_refresh_token:
             self.update_tokens(admin_token, admin_refresh_token)
+            self._bootstrapped = True
         else:
             if self._token_provider is None:
                 raise ValueError("Authentication tokens or token_provider required")
-            self._bootstrap_tokens(force=False)
+            # Defer authentication — don't block startup if backend is not ready yet.
+            # The first actual API call will trigger lazy bootstrap.
+            LOGGER.info("Backend client created with lazy token bootstrap (will auth on first request)")
         self._max_attempts = max(1, max_attempts)
         self._initial_delay = max(0.0, initial_delay)
         self._max_delay = max(max_delay, self._initial_delay)
@@ -192,6 +196,19 @@ class BackendClient:
         raise_for_status: bool,
         should_retry: Optional[Callable[[], bool]] = None,
     ) -> Optional[Response]:
+        # Lazy token bootstrap — authenticate on first actual API call
+        if not self._bootstrapped:
+            with self._lock:
+                if not self._bootstrapped:
+                    try:
+                        self._bootstrap_tokens(force=False)
+                        self._bootstrapped = True
+                        LOGGER.info("Lazy token bootstrap succeeded on first API call")
+                    except Exception as exc:
+                        LOGGER.warning("Lazy token bootstrap failed (will retry): %s", exc)
+                        self._bootstrapped = False
+                        raise
+
         delay = self._initial_delay
         token_refreshed = False
         for attempt in range(1, self._max_attempts + 1):

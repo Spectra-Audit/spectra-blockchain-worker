@@ -60,6 +60,7 @@ class AgentFinding:
     description: str
     location: Optional[str]  # Function/line reference
     recommendation: str
+    confidence: str = "medium"  # "high", "medium", "low"
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -70,6 +71,7 @@ class AgentFinding:
             "description": self.description,
             "location": self.location,
             "recommendation": self.recommendation,
+            "confidence": self.confidence,
         }
 
 
