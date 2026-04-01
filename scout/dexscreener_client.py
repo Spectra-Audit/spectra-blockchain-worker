@@ -93,14 +93,22 @@ class DexScreenerClient:
     def __init__(self, timeout: float = 30.0):
         self.timeout = timeout
         self._session: Optional[aiohttp.ClientSession] = None
+        self._session_loop_id: Optional[int] = None
         # Rate limiting: max 300 requests per minute = 5 per second
         # We'll use a simple semaphore to limit concurrent requests
         self._rate_limiter = asyncio.Semaphore(5)
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None:
+        loop_id = id(asyncio.get_event_loop())
+        if self._session is None or self._session_loop_id != loop_id:
+            if self._session is not None:
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             self._session = aiohttp.ClientSession(timeout=timeout)
+            self._session_loop_id = loop_id
         return self._session
 
     async def get_token_pairs(

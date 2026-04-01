@@ -83,6 +83,7 @@ class HolderAPIProvider(abc.ABC):
         self.api_key = api_key
         self.timeout = timeout
         self._session: Optional[aiohttp.ClientSession] = None
+        self._session_loop_id: Optional[int] = None
 
     @property
     @abc.abstractmethod
@@ -133,10 +134,28 @@ class HolderAPIProvider(abc.ABC):
         pass
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create HTTP session."""
+        """Get or create HTTP session, handling event-loop binding.
+
+        When the audit runs in a thread via asyncio.run(), a new event loop is
+        created.  aiohttp sessions are bound to the loop where they were
+        created, so we detect loop changes and create a fresh session.
+        """
+        current_loop = asyncio.get_running_loop()
+        loop_id = id(current_loop)
+
+        if self._session is not None and self._session_loop_id != loop_id:
+            # Close stale session from a different loop
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+            self._session = None
+
         if self._session is None:
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             self._session = aiohttp.ClientSession(timeout=timeout)
+            self._session_loop_id = loop_id
+
         return self._session
 
     async def close(self) -> None:

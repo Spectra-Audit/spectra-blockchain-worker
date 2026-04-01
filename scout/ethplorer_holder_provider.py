@@ -19,6 +19,7 @@ API Tiers:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -79,6 +80,7 @@ class EthplorerHolderProvider(HolderAPIProvider):
         super().__init__(api_key=api_key, **kwargs)
         self.base_url: Optional[str] = None
         self._ep_session: Optional[aiohttp.ClientSession] = None
+        self._sessions_loop_id: Optional[int] = None
 
     def _get_base_url(self, chain_id: int) -> str:
         """Get base URL for a given chain.
@@ -107,8 +109,18 @@ class EthplorerHolderProvider(HolderAPIProvider):
             HTTP session with appropriate headers
         """
         # Create a key for this base URL to support multiple sessions
-        if not hasattr(self, '_ep_sessions'):
+        loop_id = id(asyncio.get_event_loop())
+
+        if not hasattr(self, '_ep_sessions') or self._sessions_loop_id != loop_id:
+            # Different event loop — close old sessions and start fresh
+            if hasattr(self, '_ep_sessions') and self._ep_sessions:
+                for s in self._ep_sessions.values():
+                    try:
+                        await s.close()
+                    except Exception:
+                        pass
             self._ep_sessions: Dict[str, aiohttp.ClientSession] = {}
+            self._sessions_loop_id = loop_id
 
         if base_url not in self._ep_sessions:
             timeout = aiohttp.ClientTimeout(total=self.timeout)

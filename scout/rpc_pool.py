@@ -264,13 +264,29 @@ class RpcProvider:
     url: str
     chain_id: int
     _session: Optional[aiohttp.ClientSession] = None
+    _session_loop_id: Optional[int] = None
     failures: int = 0
     max_failures: int = 5
     timeout: float = 30.0
 
     @property
     def session(self) -> aiohttp.ClientSession:
-        """Lazy session creation - only creates when first accessed."""
+        """Lazy session creation - only creates when first accessed.
+
+        Detects event-loop changes (e.g. when audit runs via asyncio.run()
+        in a worker thread) and creates a fresh session bound to the new loop.
+        """
+        try:
+            current_loop = asyncio.get_running_loop()
+            current_loop_id = id(current_loop)
+        except RuntimeError:
+            current_loop_id = None
+
+        if self._session is not None and self._session_loop_id != current_loop_id:
+            # Session was created on a different loop — discard it
+            LOGGER.debug("Discarding stale aiohttp session (loop changed)")
+            self._session = None
+
         if self._session is None:
             timeout = aiohttp.ClientTimeout(total=self.timeout)
             # Create SSL context that's more permissive for certificate issues
@@ -279,13 +295,19 @@ class RpcProvider:
             ssl_context.verify_mode = ssl.CERT_NONE
             connector = aiohttp.TCPConnector(ssl=ssl_context)
             self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+            self._session_loop_id = current_loop_id
         return self._session
 
     async def close(self) -> None:
         """Close the HTTP session."""
-        if self._session:
+        if self._session is None:
+            return
+        try:
             await self._session.close()
-            self._session = None
+        except Exception:
+            pass
+        self._session = None
+        self._session_loop_id = None
 
     def is_healthy(self) -> bool:
         """Check if provider is healthy (below failure threshold)."""
@@ -314,8 +336,7 @@ class RpcProvider:
         }
 
         try:
-            async with self.session.post(
-                self.url,
+            async with self.session.post(                self.url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
             ) as response:

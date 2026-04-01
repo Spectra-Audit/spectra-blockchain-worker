@@ -439,13 +439,8 @@ class BlockExplorerClient:
     ) -> Optional[Dict[str, Any]]:
         """Get verified source code from Etherscan.
 
-        API Endpoint: https://api.etherscan.io/api
-        Parameters:
-        - module=contract
-        - action=getsourcecode
-        - address={contract_address}
-        - chainid={chain_id}
-        - apikey={API_KEY}
+        Uses synchronous requests to avoid aiohttp/httpx event-loop binding
+        issues when called from a background thread via asyncio.run().
 
         Args:
             contract_address: Contract address
@@ -462,54 +457,55 @@ class BlockExplorerClient:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        async with httpx.AsyncClient() as client:
-            params = {
-                "module": "contract",
-                "action": "getsourcecode",
-                "address": contract_address,
-                "chainid": str(chain_id),
-                "apikey": self.api_key or "YourApiKeyToken",
-            }
+        import requests as _requests
 
-            try:
-                response = await client.get(self.ETHERSCAN_API_URL, params=params)
-                data = response.json()
+        params = {
+            "module": "contract",
+            "action": "getsourcecode",
+            "address": contract_address,
+            "chainid": str(chain_id),
+            "apikey": self.api_key or "YourApiKeyToken",
+        }
 
-                result = None
-                if data.get("status") == "1" and data.get("result"):
-                    contract_data = data["result"][0]
-                    if contract_data.get("SourceCode"):
-                        result = {
-                            "source_code": contract_data["SourceCode"],
-                            "abi": contract_data.get("ABI"),
-                            "contract_name": contract_data.get("ContractName"),
-                            "compiler_version": contract_data.get("CompilerVersion"),
-                            "optimization_used": contract_data.get("OptimizationUsed") == "1",
-                            "optimization_runs": int(contract_data.get("Runs", "200")),
-                            "constructor_arguments": contract_data.get("ConstructorArguments"),
-                            "evm_version": contract_data.get("EVMVersion"),
-                            "library": contract_data.get("Library"),
-                            "license_type": contract_data.get("LicenseType"),
-                            "proxy": contract_data.get("Proxy"),
-                            "implementation": contract_data.get("Implementation"),
-                            "swarm_source": contract_data.get("SwarmSource"),
-                        }
-                        LOGGER.info(f"Retrieved verified source code for {contract_address}")
-                    else:
-                        LOGGER.warning(f"Contract {contract_address} has no verified source code")
-                        result = None
+        try:
+            response = _requests.get(self.ETHERSCAN_API_URL, params=params, timeout=30)
+            data = response.json()
+
+            result = None
+            if data.get("status") == "1" and data.get("result"):
+                contract_data = data["result"][0]
+                if contract_data.get("SourceCode"):
+                    result = {
+                        "source_code": contract_data["SourceCode"],
+                        "abi": contract_data.get("ABI"),
+                        "contract_name": contract_data.get("ContractName"),
+                        "compiler_version": contract_data.get("CompilerVersion"),
+                        "optimization_used": contract_data.get("OptimizationUsed") == "1",
+                        "optimization_runs": int(contract_data.get("Runs", "200")),
+                        "constructor_arguments": contract_data.get("ConstructorArguments"),
+                        "evm_version": contract_data.get("EVMVersion"),
+                        "library": contract_data.get("Library"),
+                        "license_type": contract_data.get("LicenseType"),
+                        "proxy": contract_data.get("Proxy"),
+                        "implementation": contract_data.get("Implementation"),
+                        "swarm_source": contract_data.get("SwarmSource"),
+                    }
+                    LOGGER.info(f"Retrieved verified source code for {contract_address}")
                 else:
-                    LOGGER.warning(f"Etherscan API error: {data.get('message')}")
+                    LOGGER.warning(f"Contract {contract_address} has no verified source code")
                     result = None
+            else:
+                LOGGER.warning(f"Etherscan API error: {data.get('message')}")
+                result = None
 
-                # Cache the result (even if None, to avoid retrying)
-                self._cache[cache_key] = result
-                return result
+            # Cache the result (even if None, to avoid retrying)
+            self._cache[cache_key] = result
+            return result
 
-            except Exception as e:
-                LOGGER.error(f"Failed to fetch source code for {contract_address}: {e}")
-                self._cache[cache_key] = None
-                return None
+        except Exception as e:
+            LOGGER.error(f"Failed to fetch source code for {contract_address}: {e}")
+            self._cache[cache_key] = None
+            return None
 
 
 class ContractAuditScout:
