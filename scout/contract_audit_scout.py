@@ -439,8 +439,8 @@ class BlockExplorerClient:
     ) -> Optional[Dict[str, Any]]:
         """Get verified source code from Etherscan.
 
-        Uses synchronous requests to avoid aiohttp/httpx event-loop binding
-        issues when called from a background thread via asyncio.run().
+        Uses synchronous httpx.Client to avoid aiohttp/httpx-async event-loop
+        binding issues when called from a background thread via asyncio.run().
 
         Args:
             contract_address: Contract address
@@ -457,8 +457,6 @@ class BlockExplorerClient:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        import requests as _requests
-
         params = {
             "module": "contract",
             "action": "getsourcecode",
@@ -468,7 +466,8 @@ class BlockExplorerClient:
         }
 
         try:
-            response = _requests.get(self.ETHERSCAN_API_URL, params=params, timeout=30)
+            with httpx.Client(timeout=30.0) as client:
+                response = client.get(self.ETHERSCAN_API_URL, params=params)
             data = response.json()
 
             result = None

@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -389,8 +391,8 @@ class AuditOrchestrator:
         )
 
         try:
-            import requests as sync_requests
-            response = sync_requests.patch(url, json=payload, headers=headers, timeout=30)
+            with httpx.Client(timeout=30.0) as client:
+                response = client.patch(url, json=payload, headers=headers)
             LOGGER.info("Direct HTTP result: %s", response.status_code)
             if response.status_code == 200:
                 return True
