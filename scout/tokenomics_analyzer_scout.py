@@ -1,10 +1,12 @@
-"""Tokenomics analyzer scout for red flag detection.
+"""Tokenomics analyzer scout — health-score model.
 
-Analyzes:
-- Supply mechanics (hard cap, rebasing, minting, burning)
-- Holder analysis (contract holders, staking %)
-- Token utility assessment
-- Vesting & unlock patterns
+Scoring model:
+1. Calculate health_ratio = (dead_address_balance + liquidity_pool_balances) / total_supply * 100
+2. Start from health_ratio as base score
+3. Deduct for red flags (mint, rebase, unlimited supply, centralized mint)
+
+Holder concentration is handled by distribution scoring, NOT here.
+Liquidity ratio and contract holder analysis belong in liquidity scoring.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class TokenomicsMetrics:
-    """Comprehensive tokenomics metrics."""
+    """Tokenomics metrics for health-score model."""
 
     token_address: str
     chain_id: str
@@ -39,29 +41,33 @@ class TokenomicsMetrics:
     max_supply: Optional[int]
     supply_tier: str  # "fixed", "capped", "uncapped", "rebasing"
 
-    # Holder analysis
-    total_holders: int
-    top_10_holder_pct: float
-    contract_holder_pct: float
-    staking_contract_pct: float
-    top_contract_holders: List[Dict[str, Any]]
+    # Health-score inputs
+    dead_address_balance: int = 0       # Balance of 0x...dEaD
+    liquidity_pool_balance: int = 0     # Sum of token balances in known liquidity contracts
 
-    # Concentration metrics
-    gini_coefficient: float
-    nakamoto_coefficient: int  # Holders needed for 51%
+    # Holder analysis (kept for flag generation / recommendations only)
+    total_holders: int = 0
+    top_10_holder_pct: float = 0.0
+    contract_holder_pct: float = 0.0
+    staking_contract_pct: float = 0.0
+    top_contract_holders: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Concentration metrics (kept for flag generation / recommendations only)
+    gini_coefficient: float = 0.0
+    nakamoto_coefficient: int = 0
 
     # Utility assessment
-    utility_flags: List[str]  # ["fees", "staking", "governance", "revenue", "none"]
+    utility_flags: List[str] = field(default_factory=list)
 
     # Vesting risks
-    has_team_vesting: bool
-    vesting_flags: List[str]
+    has_team_vesting: bool = False
+    vesting_flags: List[str] = field(default_factory=list)
 
     # Risk flags
-    flags: List[str]
+    flags: List[str] = field(default_factory=list)
 
     # Timestamp
-    analyzed_at: str
+    analyzed_at: str = ""
 
 
 @dataclass
@@ -311,7 +317,7 @@ class TokenomicsAnalyzerScout:
         contract_features: ContractFeatures,
         holder_data: Optional[Dict[str, Any]],
     ) -> TokenomicsMetrics:
-        """Calculate comprehensive tokenomics metrics."""
+        """Calculate tokenomics metrics using health-score model."""
 
         # Determine supply tier
         if contract_features.has_rebase:
@@ -323,25 +329,27 @@ class TokenomicsAnalyzerScout:
         else:
             supply_tier = "fixed"
 
-        # Process holder data
+        # --- Health-score inputs ---
+        dead_balance = await self._get_dead_address_balance(token_address)
+        liquidity_balance = await self._get_liquidity_pool_balance(
+            token_address, chain_id
+        )
+
+        # Process holder data (for flags / recommendations only, NOT scoring)
         total_holders = 0
         top_10_holder_pct = 0.0
         contract_holder_pct = 0.0
         staking_contract_pct = 0.0
         top_contract_holders = []
-        gini_coefficient = 0.0
-        nakamoto_coefficient = 0
 
         if holder_data and holder_data.get("holders"):
             holders = holder_data["holders"]
             total_holders = holder_data.get("total_holders", len(holders))
 
-            # Calculate top 10 percentage
             total_supply = contract_features.total_supply
             top_10_supply = sum(h.get("balance", 0) for h in holders[:10])
             top_10_holder_pct = (top_10_supply / total_supply * 100) if total_supply > 0 else 0
 
-            # Identify contract holders
             contract_holders = []
             for holder in holders:
                 address = holder.get("address", "")
@@ -355,12 +363,10 @@ class TokenomicsAnalyzerScout:
 
             contract_holder_pct = sum(h["percentage"] for h in contract_holders)
 
-            # Identify staking contracts (by function selectors or known patterns)
             staking_contracts = await self._identify_staking_contracts(
                 token_address, contract_holders
             )
             staking_contract_pct = sum(h["percentage"] for h in staking_contracts)
-
             top_contract_holders = staking_contracts[:10]
 
         # Utility assessment
@@ -376,18 +382,10 @@ class TokenomicsAnalyzerScout:
         flags.extend(utility_flags)
         flags.extend(vesting_flags)
 
-        # Additional analysis flags
-        if staking_contract_pct > 70:
-            flags.append("very_high_staking_ratio")
-
         if staking_contract_pct > 90:
             flags.append("extreme_staking_ratio")
-
-        if top_10_holder_pct > 80:
-            flags.append("extremely_concentrated")
-
-        if contract_holder_pct > 50:
-            flags.append("dominant_contract_holders")
+        elif staking_contract_pct > 70:
+            flags.append("very_high_staking_ratio")
 
         return TokenomicsMetrics(
             token_address=token_address,
@@ -396,19 +394,92 @@ class TokenomicsAnalyzerScout:
             total_supply=contract_features.total_supply,
             max_supply=contract_features.max_supply,
             supply_tier=supply_tier,
+            dead_address_balance=dead_balance,
+            liquidity_pool_balance=liquidity_balance,
             total_holders=total_holders,
             top_10_holder_pct=top_10_holder_pct,
             contract_holder_pct=contract_holder_pct,
             staking_contract_pct=staking_contract_pct,
             top_contract_holders=top_contract_holders,
-            gini_coefficient=gini_coefficient,
-            nakamoto_coefficient=nakamoto_coefficient,
             utility_flags=utility_flags,
             has_team_vesting=len(vesting_flags) > 0,
             vesting_flags=vesting_flags,
             flags=flags,
             analyzed_at=datetime.utcnow().isoformat(),
         )
+
+    async def _get_dead_address_balance(self, token_address: str) -> int:
+        """Get token balance of the dead address (0x0...dEaD).
+
+        Tokens sent to the dead address are effectively burned.
+        """
+        DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD"
+        try:
+            checksummed = Web3.to_checksum_address(token_address)
+            erc20 = self.w3.eth.contract(
+                address=checksummed,
+                abi=[{
+                    "constant": True,
+                    "inputs": [{"name": "_owner", "type": "address"}],
+                    "name": "balanceOf",
+                    "outputs": [{"name": "balance", "type": "uint256"}],
+                    "type": "function",
+                }],
+            )
+            return erc20.functions.balanceOf(
+                Web3.to_checksum_address(DEAD_ADDRESS)
+            ).call()
+        except Exception as e:
+            LOGGER.warning(f"Failed to get dead address balance for {token_address}: {e}")
+            return 0
+
+    async def _get_liquidity_pool_balance(
+        self, token_address: str, chain_id: str
+    ) -> int:
+        """Get total token balance across known liquidity pool contracts.
+
+        Uses DexScreener pair data to identify LP contract addresses, then
+        queries balanceOf for each.
+        """
+        try:
+            from scout.dexscreener_client import DexScreenerClient
+            client = DexScreenerClient()
+            pairs = await client.get_token_pairs(chain_id, token_address, fetch_detailed=False)
+            if not pairs:
+                return 0
+
+            checksummed = Web3.to_checksum_address(token_address)
+            erc20 = self.w3.eth.contract(
+                address=checksummed,
+                abi=[{
+                    "constant": True,
+                    "inputs": [{"name": "_owner", "type": "address"}],
+                    "name": "balanceOf",
+                    "outputs": [{"name": "balance", "type": "uint256"}],
+                    "type": "function",
+                }],
+            )
+
+            total = 0
+            seen = set()
+            for pair in pairs:
+                addr = pair.pair_address
+                if not addr or addr in seen:
+                    continue
+                seen.add(addr)
+                try:
+                    balance = erc20.functions.balanceOf(
+                        Web3.to_checksum_address(addr)
+                    ).call()
+                    total += balance
+                except Exception:
+                    continue
+
+            await client.close()
+            return total
+        except Exception as e:
+            LOGGER.warning(f"Failed to get liquidity pool balances for {token_address}: {e}")
+            return 0
 
     async def _identify_staking_contracts(
         self,
@@ -614,93 +685,69 @@ class TokenomicsAnalyzerScout:
         return candidates
 
     def _calculate_score(self, metrics: TokenomicsMetrics) -> float:
-        """Calculate overall tokenomics score (0-100).
+        """Calculate tokenomics score using health-score model (0-100).
 
-        Scoring:
-        - Supply mechanics: 0-30 points
-        - Holder distribution: 0-30 points
-        - Utility clarity: 0-20 points
-        - Vesting safety: 0-20 points
+        Model:
+        1. health_ratio = (dead_address_balance + liquidity_pool_balances) / total_supply * 100
+        2. Start score from health_ratio
+        3. Deduct for supply red flags (mint, rebase, unlimited)
+        4. Clamp to [0, 100]
 
-        Penalties for critical red flags.
+        Holder concentration is NOT scored here — that's distribution's job.
         """
-        score = 0.0
+        # --- Rebase token: immediate zero ---
+        if metrics.contract_features.has_rebase:
+            return 0.0
 
-        # Supply mechanics (0-30)
-        supply_scores = {
-            "fixed": 30,
-            "capped": 25,
-            "uncapped": 5,
-            "rebasing": 0,  # Critical red flag
-        }
-        score += supply_scores.get(metrics.supply_tier, 10)
-
-        # Holder distribution (0-30)
-        # Penalize heavy concentration
-        if metrics.top_10_holder_pct < 30:
-            score += 30
-        elif metrics.top_10_holder_pct < 50:
-            score += 20
-        elif metrics.top_10_holder_pct < 70:
-            score += 10
+        # --- Step 1: Calculate health ratio ---
+        total_supply = metrics.total_supply
+        if total_supply > 0:
+            health_ratio = (
+                metrics.dead_address_balance + metrics.liquidity_pool_balance
+            ) / total_supply * 100
         else:
-            score += 0
+            health_ratio = 0.0
 
-        # Penalize high staking ratio
-        if metrics.staking_contract_pct < 50:
-            score += 0  # No penalty
-        elif metrics.staking_contract_pct < 70:
-            score -= 5
-        elif metrics.staking_contract_pct < 90:
-            score -= 15
-        else:
-            score -= 25
+        # Start from the health ratio (capped at 100)
+        score = min(health_ratio, 100.0)
 
-        # Utility clarity (0-20)
-        if "unclear_utility" not in metrics.flags:
-            score += 20
-        elif "rebasing_stablecoin" not in metrics.flags:
-            score += 10
-        else:
-            score += 0
+        # --- Step 2: Deduct for supply red flags ---
+        deductions = 0.0
 
-        # Vesting safety (0-20)
-        if not metrics.vesting_flags:
-            score += 20
-        elif "potential_cliff_risk" in str(metrics.vesting_flags):
-            score += 10
-        else:
-            score += 15
+        has_mint = metrics.contract_features.has_mint
+        has_max_supply = metrics.contract_features.has_max_supply
+        has_owner = metrics.contract_features.owner is not None
 
-        # Critical red flag penalties
-        if "REBASE_TOKEN_CRITICAL" in metrics.flags:
-            score -= 50
+        # Mint function present
+        if has_mint and not has_max_supply:
+            # Unlimited minting — can inflate supply arbitrarily
+            deductions += 40
+        elif has_mint and has_max_supply:
+            # Capped mint — less risky but still a concern
+            deductions += 20
 
+        # Centralized minting (owner-controlled)
+        if has_mint and has_owner:
+            deductions += 10
+
+        # Flag-based deductions from _calculate_metrics
         if "unlimited_minting" in metrics.flags:
-            score -= 30
-
+            deductions += 30
         if "controlled_minting" in metrics.flags:
-            score -= 20
-
-        if "tiny_burn_relative_to_mint" in metrics.flags:
-            score -= 15
-
+            deductions += 10
         if "inflationary_no_burn" in metrics.flags:
-            score -= 10
+            deductions += 10
+        if "tiny_burn_relative_to_mint" in metrics.flags:
+            deductions += 15
 
-        if "extreme_staking_ratio" in metrics.flags:
-            score -= 20
+        score -= deductions
 
-        if "extremely_concentrated" in metrics.flags:
-            score -= 15
-
-        return max(0, min(100, score))
+        return max(0.0, min(100.0, score))
 
     def _determine_risk_level(self, score: float, metrics: TokenomicsMetrics) -> str:
-        """Determine risk level from score and metrics."""
+        """Determine risk level from score."""
 
-        # Critical red flags override score
-        if "REBASE_TOKEN_CRITICAL" in metrics.flags:
+        if metrics.contract_features.has_rebase:
             return "critical"
 
         if score >= 70:
@@ -717,38 +764,45 @@ class TokenomicsAnalyzerScout:
         metrics: TokenomicsMetrics,
         score: float,
     ) -> List[str]:
-        """Generate actionable recommendations."""
+        """Generate actionable recommendations based on health-score model."""
 
         recommendations = []
 
-        if metrics.supply_tier == "rebasing":
-            recommendations.append("CRITICAL: Rebasing tokens have automatic supply changes - high risk")
+        # Health ratio insight
+        total_supply = metrics.total_supply
+        if total_supply > 0:
+            health_ratio = (metrics.dead_address_balance + metrics.liquidity_pool_balance) / total_supply * 100
+            recommendations.append(
+                f"Health ratio: {health_ratio:.1f}% "
+                f"(burned: {metrics.dead_address_balance / total_supply * 100:.1f}%, "
+                f"in LPs: {metrics.liquidity_pool_balance / total_supply * 100:.1f}%)"
+            )
+
+        # Rebase warning
+        if metrics.contract_features.has_rebase:
+            recommendations.append("CRITICAL: Rebasing token — score forced to 0")
+
+        # Mint warnings
+        if metrics.contract_features.has_mint:
+            if metrics.contract_features.has_max_supply:
+                recommendations.append("Mint function present with supply cap — moderate risk")
+            else:
+                recommendations.append("Mint function with NO supply cap — unlimited inflation risk")
+
+        if metrics.contract_features.has_mint and metrics.contract_features.owner:
+            recommendations.append("Mint controlled by contract owner — centralization risk")
 
         if "unlimited_minting" in metrics.flags:
-            recommendations.append("Unlimited minting function detected - supply inflation risk")
+            recommendations.append("Unlimited minting detected — severe inflation risk")
 
-        if "controlled_minting" in metrics.flags:
-            recommendations.append("Minting controlled by owner - centralization risk")
+        if "inflationary_no_burn" in metrics.flags:
+            recommendations.append("Inflationary token with no burn mechanism")
 
-        if metrics.staking_contract_pct > 70:
-            recommendations.append(f"Very high staking ratio ({metrics.staking_contract_pct:.1f}%) - low float availability")
+        if "tiny_burn_relative_to_mint" in metrics.flags:
+            recommendations.append("Burn rate negligible relative to mint rate")
 
-        if metrics.top_10_holder_pct > 70:
-            recommendations.append(f"Extremely concentrated holdings (top 10: {metrics.top_10_holder_pct:.1f}%)")
-
-        if "unclear_utility" in metrics.utility_flags:
-            recommendations.append("Token utility unclear - may not be needed for protocol")
-
-        if metrics.vesting_flags:
-            recommendations.append("Vesting patterns suggest potential cliff risks - investigate unlock schedule")
-
-        if score >= 70 and not any(
-            f in metrics.flags for f in [
-                "REBASE_TOKEN_CRITICAL", "unlimited_minting",
-                "extreme_staking_ratio", "extremely_concentrated"
-            ]
-        ):
-            recommendations.append("Tokenomics appear healthy - continue monitoring")
+        if score >= 70:
+            recommendations.append("Tokenomics appear healthy — continue monitoring")
 
         if not recommendations:
             recommendations.append("Monitor for changes in tokenomics parameters")
