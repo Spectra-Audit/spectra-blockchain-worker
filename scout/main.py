@@ -295,7 +295,30 @@ class ScoutApp:
             except Exception as e:
                 LOGGER.warning(f"Failed to initialize Contract Auditor Scout: {e}")
 
-        # Initialize Audit Orchestrator AFTER all scouts are created
+        # Initialize Unified Audit Service FIRST (needed by orchestrator for code audits)
+        unified_audit_service = None
+        if os.environ.get("ENABLE_UNIFIED_AUDIT", "").lower() == "true":
+            try:
+                from .unified_audit_service import create_unified_audit_service
+                from .unified_glm_orchestrator import UnifiedGLMOrchestrator
+
+                # Create unified GLM orchestrator
+                glm_orchestrator = UnifiedGLMOrchestrator()
+
+                unified_audit_service = create_unified_audit_service(
+                    database=database,
+                    w3=w3,
+                    backend_client=backend_client,
+                    token_holder_scout=token_holder_scout,
+                    liquidity_analyzer_scout=liquidity_analyzer_scout,
+                    tokenomics_analyzer_scout=tokenomics_analyzer_scout,
+                )
+                LOGGER.info("Unified Audit Service initialized with GLM orchestrator")
+
+            except Exception as e:
+                LOGGER.warning(f"Failed to initialize Unified Audit Service: {e}")
+
+        # Initialize Audit Orchestrator AFTER all scouts and unified_audit_service are created
         audit_orchestrator = None
         if token_holder_scout and backend_client:
             try:
@@ -306,6 +329,7 @@ class ScoutApp:
                     tokenomics_analyzer_scout=tokenomics_analyzer_scout,
                     liquidity_analyzer_scout=liquidity_analyzer_scout,
                     contract_audit_scout=contract_audit_scout,
+                    unified_audit_service=unified_audit_service,
                     backend_client=backend_client,
                     database=database,
                 )
@@ -334,29 +358,6 @@ class ScoutApp:
 
             except Exception as e:
                 LOGGER.warning(f"Failed to initialize Audit Orchestrator: {e}")
-
-        # Initialize Unified Audit Service if enabled (NEW)
-        unified_audit_service = None
-        if os.environ.get("ENABLE_UNIFIED_AUDIT", "").lower() == "true":
-            try:
-                from .unified_audit_service import create_unified_audit_service
-                from .unified_glm_orchestrator import UnifiedGLMOrchestrator
-
-                # Create unified GLM orchestrator
-                glm_orchestrator = UnifiedGLMOrchestrator()
-
-                unified_audit_service = create_unified_audit_service(
-                    database=database,
-                    w3=w3,
-                    backend_client=backend_client,
-                    token_holder_scout=token_holder_scout,
-                    liquidity_analyzer_scout=liquidity_analyzer_scout,
-                    tokenomics_analyzer_scout=tokenomics_analyzer_scout,
-                )
-                LOGGER.info("Unified Audit Service initialized with GLM orchestrator")
-
-            except Exception as e:
-                LOGGER.warning(f"Failed to initialize Unified Audit Service: {e}")
 
         return cls(
             database=database,

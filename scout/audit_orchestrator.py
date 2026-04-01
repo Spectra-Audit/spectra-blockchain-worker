@@ -16,6 +16,27 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+import dataclasses
+
+
+def _serialize_for_json(obj: Any) -> Any:
+    """Recursively convert dataclass instances and other non-JSON types to dicts."""
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return {k: _serialize_for_json(v) for k, v in dataclasses.asdict(obj).items()}
+    if isinstance(obj, dict):
+        return {k: _serialize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_serialize_for_json(item) for item in obj]
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, (int, float, str, bool)) or obj is None:
+        return obj
+    # Fallback: try __dict__ for objects that aren't standard types
+    if hasattr(obj, "__dict__"):
+        return _serialize_for_json(obj.__dict__)
+    return str(obj)
+
+
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -280,11 +301,11 @@ class AuditOrchestrator:
                 elif result:
                     # Convert dataclass/result objects to dict for storage
                     if hasattr(result, "__dict__"):
-                        results[key] = result.__dict__
+                        results[key] = _serialize_for_json(result.__dict__)
                     elif hasattr(result, "to_dict"):
-                        results[key] = result.to_dict()
+                        results[key] = _serialize_for_json(result.to_dict())
                     else:
-                        results[key] = result
+                        results[key] = _serialize_for_json(result)
 
         # Mark collection timestamp
         results["collected_at"] = datetime.utcnow().isoformat()
@@ -637,11 +658,11 @@ class AuditOrchestrator:
                 elif result:
                     # Convert dataclass/result objects to dict for storage
                     if hasattr(result, "__dict__"):
-                        results[key] = result.__dict__
+                        results[key] = _serialize_for_json(result.__dict__)
                     elif hasattr(result, "to_dict"):
-                        results[key] = result.to_dict()
+                        results[key] = _serialize_for_json(result.to_dict())
                     else:
-                        results[key] = result
+                        results[key] = _serialize_for_json(result)
 
         # Mark collection timestamp
         results["collected_at"] = datetime.utcnow().isoformat()
