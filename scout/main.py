@@ -106,6 +106,22 @@ class ScoutApp:
         except Exception as e:
             LOGGER.warning(f"Failed to initialize RPC Manager: {e}")
 
+        # Initialize Web3 instance and RPC HTTP URLs for scouts that need them
+        w3 = None
+        rpc_http_urls = []
+        try:
+            rpc_url = os.environ.get("RPC_HTTP_URL", "").strip()
+            rpc_urls_env = os.environ.get("RPC_HTTP_URLS", "").strip()
+            if rpc_urls_env:
+                rpc_http_urls = [url.strip() for url in rpc_urls_env.split(",") if url.strip()]
+            elif rpc_url:
+                rpc_http_urls = [rpc_url]
+            if rpc_http_urls:
+                w3 = Web3(Web3.HTTPProvider(rpc_http_urls[0]))
+                LOGGER.info(f"Web3 initialized with RPC: {rpc_http_urls[0][:30]}...")
+        except Exception as e:
+            LOGGER.warning(f"Failed to initialize Web3: {e}")
+
         shared_pool = WebSocketProviderPool(provider_resolver=resolve_ws_provider_class)
         pro_scout = ProScout.from_env(
             database=database,
@@ -332,6 +348,7 @@ class ScoutApp:
                     unified_audit_service=unified_audit_service,
                     backend_client=backend_client,
                     database=database,
+                    w3=w3,
                 )
 
                 # Start weekly updates for all dynamic data

@@ -192,7 +192,17 @@ class AuditOrchestrator:
             result.completed_at = datetime.utcnow()
 
             # Store results to backend
-            await self._store_audit_results(project_id, results)
+            store_ok = await self._store_audit_results(project_id, results)
+            if store_ok:
+                LOGGER.info(
+                    f"Audit results PATCH succeeded for {project_id[:8]}... "
+                    f"(keys: {list(results.keys())})"
+                )
+            else:
+                LOGGER.error(
+                    f"Audit results PATCH FAILED for {project_id[:8]}... "
+                    f"(keys: {list(results.keys())})"
+                )
 
             LOGGER.info(
                 f"Completed full audit for {project_id[:8]}...",
