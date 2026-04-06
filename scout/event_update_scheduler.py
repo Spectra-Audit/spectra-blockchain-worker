@@ -107,9 +107,10 @@ class EventUpdateScheduler:
         async def update():
             await self._update_token(token_address, chain_id)
 
-        # Schedule the job
+        # Schedule the job — APScheduler runs in a plain thread with no event loop,
+        # so we need asyncio.run() to create a fresh loop for the coroutine.
         self.scheduler.add_job(
-            lambda: asyncio.create_task(update()),
+            lambda: asyncio.run(update()),
             trigger=IntervalTrigger(hours=interval_hours),
             id=job_id,
             name=f"Update {token_address} on chain {chain_id}",

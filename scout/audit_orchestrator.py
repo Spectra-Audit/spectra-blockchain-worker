@@ -152,14 +152,19 @@ class AuditOrchestrator:
         token_address: str,
         chain_id: int,
         payment_id: Optional[str] = None,
+        token_addresses: Optional[List[str]] = None,
     ) -> AuditResult:
         """Run full-spectrum audit for a project.
 
+        Supports multi-token projects: when token_addresses is provided,
+        runs all scouts for each token and aggregates results.
+
         Args:
             project_id: Backend project identifier
-            token_address: Token contract address
+            token_address: Primary token contract address
             chain_id: Chain ID
             payment_id: Optional payment identifier
+            token_addresses: All token addresses for multi-token projects
 
         Returns:
             AuditResult with aggregated results
@@ -171,7 +176,8 @@ class AuditOrchestrator:
             payment_id=payment_id or "",
         )
 
-        LOGGER.info(f"Starting full audit: {request}")
+        addresses = token_addresses or [token_address]
+        LOGGER.info(f"Starting full audit: {request} ({len(addresses)} tokens)")
 
         result = AuditResult(
             project_id=project_id,
@@ -181,11 +187,18 @@ class AuditOrchestrator:
         self._running_audits[project_id] = result
 
         try:
-            # Collect all audit data in parallel
-            results = await self._collect_all_audit_data(
-                token_address=token_address,
-                chain_id=chain_id,
-            )
+            if len(addresses) > 1:
+                # Multi-token: run audits for each token and aggregate
+                results = await self._collect_multi_token_audit_data(
+                    token_addresses=addresses,
+                    chain_id=chain_id,
+                )
+            else:
+                # Single token: original path
+                results = await self._collect_all_audit_data(
+                    token_address=token_address,
+                    chain_id=chain_id,
+                )
 
             result.data = results
             result.status = "completed"
@@ -321,6 +334,98 @@ class AuditOrchestrator:
         results["collected_at"] = datetime.utcnow().isoformat()
 
         return results
+
+    async def _collect_multi_token_audit_data(
+        self,
+        token_addresses: List[str],
+        chain_id: int,
+    ) -> Dict[str, Any]:
+        """Collect audit data for multiple tokens and aggregate.
+
+        Runs all scouts for each token in parallel, then aggregates
+        per-token holder/pair data with token_address populated.
+
+        Args:
+            token_addresses: List of token contract addresses
+            chain_id: Chain ID
+
+        Returns:
+            Dictionary with aggregated multi-token audit data
+        """
+        import asyncio as _asyncio
+
+        # Run audits for each token in parallel
+        per_token_tasks = []
+        for addr in token_addresses:
+            per_token_tasks.append(
+                self._collect_all_audit_data(
+                    token_address=addr,
+                    chain_id=chain_id,
+                )
+            )
+
+        per_token_results = await _asyncio.gather(
+            *per_token_tasks,
+            return_exceptions=True,
+        )
+
+        # Aggregate results across tokens
+        aggregated: Dict[str, Any] = {}
+        per_token_holders: Dict[str, Any] = {}
+        all_pairs: list = []
+        all_findings: list = []
+
+        for addr, token_result in zip(token_addresses, per_token_results):
+            if isinstance(token_result, Exception):
+                LOGGER.error(f"Failed to collect data for token {addr[:10]}...: {token_result}")
+                continue
+
+            # Collect per-token holder data with token_address
+            token_dist = token_result.get("token_distribution", {})
+            if isinstance(token_dist, dict):
+                holders_raw = token_dist.get("top_holders") or token_dist.get("holders") or []
+                holder_count = token_dist.get("holder_count") or token_dist.get("total_holders")
+                dist_score = token_dist.get("score")
+                per_token_holders[addr] = {
+                    "holders": holders_raw,
+                    "score": dist_score,
+                    "holder_count": holder_count,
+                }
+
+            # Collect liquidity pairs with token_address
+            liq_data = token_result.get("liquidity", {})
+            if isinstance(liq_data, dict):
+                pairs = liq_data.get("pairs") or []
+                for p in pairs:
+                    if isinstance(p, dict):
+                        p["token_address"] = addr
+                    all_pairs.append(p)
+
+            # Collect code audit findings
+            code_data = token_result.get("code_audit", {})
+            if isinstance(code_data, dict):
+                findings = code_data.get("findings") or code_data.get("ai_audit_findings") or []
+                all_findings.extend(findings)
+                if "contract_audit" not in aggregated:
+                    aggregated["contract_audit"] = code_data
+
+            # Collect tokenomics per-token
+            tok_data = token_result.get("tokenomics", {})
+            if isinstance(tok_data, dict):
+                if "per_token_tokenomics" not in aggregated:
+                    aggregated["per_token_tokenomics"] = {}
+                aggregated["per_token_tokenomics"][addr] = tok_data
+
+        # Build aggregated output
+        aggregated["per_token_holders"] = per_token_holders
+        aggregated["liquidity"] = {"pairs": all_pairs}
+        if all_findings:
+            aggregated.setdefault("contract_audit", {})["findings"] = all_findings
+
+        aggregated["token_count"] = len(token_addresses)
+        aggregated["collected_at"] = datetime.utcnow().isoformat()
+
+        return aggregated
 
     async def _store_audit_results(
         self,
@@ -473,13 +578,22 @@ class AuditOrchestrator:
 
     def _update_all_dynamic_data_job(self) -> None:
         """Job wrapper for updating all dynamic data (runs in scheduler thread)."""
-        # Run the async update in the event loop
-        asyncio.create_task(self._update_all_dynamic_data())
+        # APScheduler runs jobs in a plain thread with no event loop.
+        # Use asyncio.run() to create a fresh loop for the coroutine.
+        try:
+            asyncio.run(self._update_all_dynamic_data())
+        except RuntimeError:
+            # If there's already a loop (unlikely in scheduler thread), fall back
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._update_all_dynamic_data())
 
     def _update_dynamic_data_job(self) -> None:
         """Job wrapper for updating dynamic data (runs in scheduler thread)."""
-        # Run the async update in the event loop
-        asyncio.create_task(self._update_dynamic_data())
+        try:
+            asyncio.run(self._update_dynamic_data())
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._update_dynamic_data())
 
     async def _update_dynamic_data(self) -> None:
         """Update dynamic data for all tracked projects.
