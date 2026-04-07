@@ -1533,17 +1533,22 @@ if HAS_FASTAPI:
 
     @app.get("/tvl/{chain_id}")
     async def get_tvl(chain_id: int, token_addresses: str = "") -> dict:
-        """Get TVL (token balances) for contracts on a given chain.
+        """Get totalSupply for token contracts on a given chain.
 
-        Uses ParallelRpcPool.batch_balance_of_calls() to fetch ERC-20 balances
-        for the token itself held by each smart contract.
+        Uses raw ``eth_call`` to invoke ``totalSupply()`` (selector
+        ``0x18160ddd``) on each token contract address.  Returns the raw
+        on-chain total supply as an integer (in token wei units), *not* a
+        USD-denominated value.
+
+        Note: For USD-denominated TVL the backend should prefer DexScreener
+        ``pair.liquidity.usd`` aggregation instead of this endpoint.
 
         Args:
             chain_id: Blockchain chain ID (e.g., 1 for Ethereum)
             token_addresses: Comma-separated list of token contract addresses
 
         Returns:
-            Dict mapping each token address to its total supply balance (as string).
+            Dict mapping each token address to its total supply (as string).
         """
         if not token_addresses:
             return {"tvl": {}}
@@ -1552,25 +1557,57 @@ if HAS_FASTAPI:
         if not addresses:
             return {"tvl": {}}
 
+        pool = ParallelRpcPool(chain_id)
         try:
-            pool = ParallelRpcPool(chain_id)
-            results = await pool.batch_balance_of_calls(
-                token_address=addresses[0] if addresses else "",
-                holder_addresses=addresses,
-                block_number="latest",
-            )
+            providers = pool.get_healthy_providers()
+            if not providers:
+                return {"tvl": {}, "error": "No healthy RPC providers"}
 
-            # For TVL we want the total supply of each token, so we return
-            # the balance of the token contract holding its own tokens
+            # totalSupply() function selector: keccak256("totalSupply()")[:4] = 0x18160ddd
+            TOTALSUPPLY_SELECTOR = "0x18160ddd"
+
+            async def _fetch_total_supply(provider, token_addr: str) -> tuple:
+                """Call totalSupply() on a single token contract via eth_call."""
+                try:
+                    result = await provider.make_request(
+                        "eth_call",
+                        [
+                            {
+                                "to": token_addr,
+                                "data": TOTALSUPPLY_SELECTOR,
+                            },
+                            "latest",
+                        ],
+                    )
+                    if result and isinstance(result, str) and result != "0x":
+                        return (token_addr, int(result, 16))
+                    return (token_addr, 0)
+                except Exception as exc:
+                    LOGGER.debug(f"totalSupply call failed for {token_addr}: {exc}")
+                    return (token_addr, None)
+
+            # Dispatch in parallel, spreading across healthy providers
+            tasks = [
+                _fetch_total_supply(providers[i % len(providers)], addr)
+                for i, addr in enumerate(addresses)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
             tvl = {}
-            for addr in addresses:
-                balance = results.get(addr)
-                if balance is not None:
-                    tvl[addr] = str(balance)
+            for r in results:
+                if isinstance(r, Exception):
+                    LOGGER.warning(f"totalSupply task failed: {r}")
+                    continue
+                addr, supply = r
+                if supply is not None:
+                    tvl[addr] = str(supply)
+
             return {"tvl": tvl, "chain_id": chain_id}
         except Exception as e:
             LOGGER.error(f"Failed to fetch TVL for chain {chain_id}: {e}")
             return {"tvl": {}, "error": str(e)}
+        finally:
+            await pool.close()
 
 
 # CLI entry point
