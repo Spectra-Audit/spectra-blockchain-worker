@@ -457,11 +457,20 @@ class AuditOrchestrator:
                 backend_client=self.backend_client,
             )
             if summary:
-                await self._store_executive_summary(project_id, summary)
+                LOGGER.info(
+                    "Summary generated for %s, attempting to store (keys: %s)",
+                    project_id[:8], list(summary.keys()),
+                )
+                store_ok = await self._store_executive_summary(project_id, summary)
+                LOGGER.info(
+                    "Summary store result for %s: %s", project_id[:8], store_ok,
+                )
+            else:
+                LOGGER.warning("Summary generation returned empty for %s", project_id[:8])
         except Exception as exc:
             LOGGER.warning(
                 "Executive summary generation failed for %s: %s",
-                project_id[:8], exc,
+                project_id[:8], exc, exc_info=True,
             )
 
     async def _store_executive_summary(
@@ -493,16 +502,31 @@ class AuditOrchestrator:
 
         try:
             if self.backend_client is not None and hasattr(self.backend_client, "patch"):
-                response = self.backend_client.patch(
-                    endpoint, json=payload, headers=headers,
+                LOGGER.info(
+                    "Storing executive summary for %s via backend_client",
+                    project_id[:8],
                 )
-                if hasattr(response, "status_code") and response.status_code == 200:
+                response = self.backend_client.patch(
+                    endpoint, json=payload, headers=headers, timeout=30,
+                )
+                if hasattr(response, "status_code"):
                     LOGGER.info(
-                        "Executive summary stored for %s", project_id[:8],
+                        "Executive summary PATCH for %s: HTTP %d",
+                        project_id[:8], response.status_code,
                     )
-                    return True
+                    if response.status_code == 200:
+                        return True
+                else:
+                    LOGGER.warning(
+                        "backend_client.patch returned non-response: %s",
+                        type(response),
+                    )
 
             # Direct HTTP fallback
+            LOGGER.info(
+                "Storing executive summary for %s via direct HTTP (fallback)",
+                project_id[:8],
+            )
             api_base_url = os.environ.get("API_BASE_URL", "http://localhost:8000/v1")
             url = (
                 f"{api_base_url.rstrip('/')}{endpoint}"
@@ -511,6 +535,10 @@ class AuditOrchestrator:
             )
             with httpx.Client(timeout=30.0) as client:
                 response = client.patch(url, json=payload, headers=headers)
+            LOGGER.info(
+                "Direct HTTP PATCH for %s: HTTP %d",
+                project_id[:8], response.status_code,
+            )
             return response.status_code == 200
 
         except Exception as exc:
