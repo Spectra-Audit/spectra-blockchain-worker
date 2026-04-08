@@ -1539,7 +1539,6 @@ if HAS_FASTAPI:
         SummaryOrchestrator to run the AI agent and persists results
         back to the backend.
         """
-        nonlocal orchestrator
         if orchestrator is None:
             raise HTTPException(status_code=503, detail="Orchestrator not ready")
 
