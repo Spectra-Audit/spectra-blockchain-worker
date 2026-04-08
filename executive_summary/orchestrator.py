@@ -344,6 +344,12 @@ class SummaryOrchestrator:
         2. JSON wrapped in markdown code blocks (```json ... ```)
         3. JSON with leading/trailing explanatory text
         4. JSON with unbalanced text containing extra braces
+
+        Strategy order:
+        1. Direct JSON parse
+        2. Strip markdown fences then balanced-brace extraction
+        3. Balanced-brace extraction on raw output
+        4. Each strategy has a JSON repair fallback
         """
         if not output or not output.strip():
             return {}
@@ -356,55 +362,30 @@ class SummaryOrchestrator:
         except json.JSONDecodeError as e:
             LOGGER.debug("Strategy 1 failed: %s", e)
 
-        # Strategy 2: Extract from markdown code blocks
-        json_from_md = self._extract_json_from_markdown(output)
-        if json_from_md:
-            try:
-                parsed = json.loads(json_from_md)
-                LOGGER.info("Parsed summary via Strategy 2 (markdown extraction)")
-                return self._normalize_parsed(parsed)
-            except json.JSONDecodeError as e:
-                LOGGER.debug(
-                    "Strategy 2 found markdown block but JSON decode failed: %s "
-                    "(extracted length: %d, first 300: %s)",
-                    e, len(json_from_md), json_from_md[:300],
-                )
-                # Try repairing the extracted JSON
-                repaired = self._try_repair_json(json_from_md)
-                if repaired:
-                    try:
-                        parsed = json.loads(repaired)
-                        LOGGER.info("Parsed summary via Strategy 2 + JSON repair")
-                        return self._normalize_parsed(parsed)
-                    except json.JSONDecodeError:
-                        LOGGER.debug("Strategy 2 repair also failed")
-        else:
-            LOGGER.debug("Strategy 2: no markdown code blocks found")
+        # Strategy 2: Strip markdown fences, then balanced-brace extract
+        stripped = self._strip_markdown_fences(output)
+        if stripped != output.strip():
+            json_candidate = self._extract_json_balanced(stripped)
+            if json_candidate:
+                result = self._try_parse_json(json_candidate, "Strategy 2 (strip fences + balanced braces)")
+                if result:
+                    return result
 
-        # Strategy 3: Balanced-brace extraction
+        # Strategy 3: Balanced-brace extraction on raw output
         json_from_braces = self._extract_json_balanced(output)
         if json_from_braces:
-            try:
-                parsed = json.loads(json_from_braces)
-                LOGGER.info("Parsed summary via Strategy 3 (balanced braces)")
-                return self._normalize_parsed(parsed)
-            except json.JSONDecodeError as e:
-                LOGGER.debug(
-                    "Strategy 3 found balanced JSON but decode failed: %s "
-                    "(extracted length: %d, first 300: %s)",
-                    e, len(json_from_braces), json_from_braces[:300],
-                )
-                # Try repairing the extracted JSON
-                repaired = self._try_repair_json(json_from_braces)
-                if repaired:
-                    try:
-                        parsed = json.loads(repaired)
-                        LOGGER.info("Parsed summary via Strategy 3 + JSON repair")
-                        return self._normalize_parsed(parsed)
-                    except json.JSONDecodeError:
-                        LOGGER.debug("Strategy 3 repair also failed")
+            result = self._try_parse_json(json_from_braces, "Strategy 3 (balanced braces)")
+            if result:
+                return result
         else:
             LOGGER.debug("Strategy 3: no balanced JSON object found")
+
+        # Strategy 4: Aggressive — strip everything before first { and after last }
+        json_aggressive = self._extract_json_aggressive(output)
+        if json_aggressive:
+            result = self._try_parse_json(json_aggressive, "Strategy 4 (aggressive extraction)")
+            if result:
+                return result
 
         LOGGER.warning(
             "Failed to parse executive summary output as JSON "
@@ -416,52 +397,62 @@ class SummaryOrchestrator:
         return {}
 
     @staticmethod
-    def _extract_json_from_markdown(text: str) -> Optional[str]:
-        """Extract JSON content from markdown code blocks.
+    def _strip_markdown_fences(text: str) -> str:
+        """Remove markdown code fences and surrounding prose from text.
 
-        Handles:
-        - ```json\n{...}\n```
-        - ```\n{...}\n```
-        - Multiple code blocks (returns the first valid JSON one)
-        - Missing closing ``` (uses brace balancing as fallback)
+        Handles GLM-style output: optional prose, then ```json, then JSON,
+        then ```, then optional prose.
         """
-        # Match ```json or ``` followed by content until closing ```
-        pattern = r"```(?:json)?\s*\n?(.*?)\n?\s*```"
-        matches = re.findall(pattern, text, re.DOTALL)
-        for match in matches:
-            candidate = match.strip()
-            if candidate.startswith("{") and candidate.endswith("}"):
-                return candidate
+        stripped = text.strip()
+        # Remove leading fence: anything up to and including ```json or ```
+        # This handles cases where there's prose before the fence
+        stripped = re.sub(r"^.*?```(?:json)?\s*\n?", "", stripped, count=1, flags=re.DOTALL)
+        # Remove trailing fence
+        stripped = re.sub(r"\n?\s*```\s*.*$", "", stripped, count=1, flags=re.DOTALL)
+        return stripped
 
-        # Fallback: opening ``` found but no closing ``` — extract to end
-        opener = re.search(r"```(?:json)?\s*\n", text)
-        if opener:
-            remainder = text[opener.end():]
-            # Find the first { and extract balanced JSON
-            start = remainder.find("{")
-            if start >= 0:
-                depth = 0
-                in_string = False
-                escape_next = False
-                for i in range(start, len(remainder)):
-                    ch = remainder[i]
-                    if escape_next:
-                        escape_next = False
-                        continue
-                    if ch == "\\" and in_string:
-                        escape_next = True
-                        continue
-                    if ch == '"' and not escape_next:
-                        in_string = not in_string
-                        continue
-                    if in_string:
-                        continue
-                    if ch == "{":
-                        depth += 1
-                    elif ch == "}":
-                        depth -= 1
-                        if depth == 0:
-                            return remainder[start : i + 1]
+    def _try_parse_json(self, text: str, label: str) -> Optional[Dict[str, Any]]:
+        """Try to parse text as JSON, with repair fallback.
+
+        Args:
+            text: Candidate JSON string
+            label: Label for logging which strategy produced this candidate
+
+        Returns:
+            Parsed + normalized dict, or None if parsing fails
+        """
+        try:
+            parsed = json.loads(text)
+            LOGGER.info("Parsed summary via %s", label)
+            return self._normalize_parsed(parsed)
+        except json.JSONDecodeError as e:
+            LOGGER.debug(
+                "%s: JSON decode failed: %s (length: %d, first 300: %s)",
+                label, e, len(text), text[:300],
+            )
+            # Try repair
+            repaired = self._try_repair_json(text)
+            if repaired and repaired != text:
+                try:
+                    parsed = json.loads(repaired)
+                    LOGGER.info("Parsed summary via %s + repair", label)
+                    return self._normalize_parsed(parsed)
+                except json.JSONDecodeError:
+                    LOGGER.debug("%s: repair also failed", label)
+        return None
+
+    @staticmethod
+    def _extract_json_aggressive(text: str) -> Optional[str]:
+        """Extract JSON by finding first { and last } — no brace balancing.
+
+        This is the last-resort strategy when balanced extraction fails,
+        possibly because the AI output has unusual escape sequences or
+        characters that confuse the brace counter.
+        """
+        first = text.find("{")
+        last = text.rfind("}")
+        if first >= 0 and last > first:
+            return text[first : last + 1]
         return None
 
     @staticmethod
