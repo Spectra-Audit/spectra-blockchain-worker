@@ -1531,6 +1531,35 @@ def run_unified_api(
 if HAS_FASTAPI:
     from .rpc_pool import ParallelRpcPool
 
+    @app.post("/api/v1/generate-summary")
+    async def generate_executive_summary(request: Request):
+        """Generate an executive summary for a project.
+
+        Called by the Celery metrics refresh pipeline. Uses the
+        SummaryOrchestrator to run the AI agent and persists results
+        back to the backend.
+        """
+        nonlocal orchestrator
+        if orchestrator is None:
+            raise HTTPException(status_code=503, detail="Orchestrator not ready")
+
+        body = await request.json()
+        project_id = body.get("project_id")
+        audit_data = body.get("audit_data", {})
+
+        if not project_id:
+            raise HTTPException(status_code=400, detail="project_id required")
+
+        try:
+            summary = await orchestrator._generate_and_store_summary(
+                project_id=project_id,
+                audit_data=audit_data,
+            )
+            return {"ok": True, "project_id": project_id}
+        except Exception as exc:
+            LOGGER.error("generate-summary failed for %s: %s", project_id[:8], exc)
+            raise HTTPException(status_code=500, detail=str(exc))
+
     @app.get("/tvl/{chain_id}")
     async def get_tvl(chain_id: int, token_addresses: str = "") -> dict:
         """Get totalSupply for token contracts on a given chain.
