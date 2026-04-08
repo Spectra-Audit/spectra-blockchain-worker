@@ -1490,6 +1490,15 @@ def _run_contract_audit_sync(
         orchestrator.backend_client.store_audit_results(project_id, payload)
 
 
+def _run_summary_sync(project_id: str, audit_data: dict) -> None:
+    """Synchronous wrapper for executive summary generation, run in a worker thread."""
+    coro = orchestrator._generate_and_store_summary(
+        project_id=project_id,
+        audit_data=audit_data,
+    )
+    asyncio.run(coro)
+
+
 def run_unified_api(
     host: Optional[str] = None,
     port: Optional[int] = None,
@@ -1531,13 +1540,32 @@ def run_unified_api(
 if HAS_FASTAPI:
     from .rpc_pool import ParallelRpcPool
 
-    @app.post("/api/v1/generate-summary")
-    async def generate_executive_summary(request: Request):
-        """Generate an executive summary for a project.
+    async def _run_summary_task(project_id: str, audit_data: dict) -> None:
+        """Run executive summary generation in a background thread."""
+        import functools
 
-        Called by the Celery metrics refresh pipeline. Uses the
-        SummaryOrchestrator to run the AI agent and persists results
-        back to the backend.
+        try:
+            LOGGER.info("Background executive summary started for %s", project_id[:8])
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                functools.partial(
+                    _run_summary_sync,
+                    project_id,
+                    audit_data,
+                ),
+            )
+            LOGGER.info("Background executive summary completed for %s", project_id[:8])
+        except Exception as e:
+            LOGGER.error("Background executive summary failed for %s: %s", project_id[:8], e, exc_info=True)
+
+    @app.post("/api/v1/generate-summary", status_code=status.HTTP_202_ACCEPTED)
+    async def generate_executive_summary(request: Request, background_tasks: BackgroundTasks):
+        """Queue executive summary generation for a project.
+
+        Returns 202 Accepted immediately and processes in the background.
+        The SummaryOrchestrator runs the AI agent and persists results
+        back to the backend autonomously.
         """
         if orchestrator is None:
             raise HTTPException(status_code=503, detail="Orchestrator not ready")
@@ -1549,15 +1577,10 @@ if HAS_FASTAPI:
         if not project_id:
             raise HTTPException(status_code=400, detail="project_id required")
 
-        try:
-            summary = await orchestrator._generate_and_store_summary(
-                project_id=project_id,
-                audit_data=audit_data,
-            )
-            return {"ok": True, "project_id": project_id}
-        except Exception as exc:
-            LOGGER.error("generate-summary failed for %s: %s", project_id[:8], exc)
-            raise HTTPException(status_code=500, detail=str(exc))
+        LOGGER.info("Executive summary queued for %s", project_id[:8])
+        background_tasks.add_task(_run_summary_task, project_id, audit_data)
+
+        return {"status": "queued", "project_id": project_id}
 
     @app.get("/tvl/{chain_id}")
     async def get_tvl(chain_id: int, token_addresses: str = "") -> dict:
