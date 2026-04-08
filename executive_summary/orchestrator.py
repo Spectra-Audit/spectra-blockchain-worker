@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from typing import Any, Dict, Optional
 
@@ -336,29 +337,117 @@ class SummaryOrchestrator:
     # ------------------------------------------------------------------
 
     def _parse_output(self, output: str) -> Dict[str, Any]:
-        """Parse the agent output into a structured dict."""
+        """Parse the agent output into a structured dict.
+
+        Handles common AI model output patterns:
+        1. Raw JSON (ideal case)
+        2. JSON wrapped in markdown code blocks (```json ... ```)
+        3. JSON with leading/trailing explanatory text
+        4. JSON with unbalanced text containing extra braces
+        """
         if not output or not output.strip():
             return {}
 
-        # Try direct JSON parse
+        # Strategy 1: Direct JSON parse
         try:
             parsed = json.loads(output.strip())
             return self._normalize_parsed(parsed)
         except json.JSONDecodeError:
             pass
 
-        # Try to extract JSON from the output
-        try:
-            start = output.find("{")
-            end = output.rfind("}") + 1
-            if start >= 0 and end > start:
-                parsed = json.loads(output[start:end])
+        # Strategy 2: Extract from markdown code blocks
+        json_from_md = self._extract_json_from_markdown(output)
+        if json_from_md:
+            try:
+                parsed = json.loads(json_from_md)
                 return self._normalize_parsed(parsed)
-        except (json.JSONDecodeError, Exception):
-            pass
+            except json.JSONDecodeError:
+                pass
 
-        LOGGER.warning("Failed to parse executive summary output as JSON")
+        # Strategy 3: Balanced-brace extraction
+        json_from_braces = self._extract_json_balanced(output)
+        if json_from_braces:
+            try:
+                parsed = json.loads(json_from_braces)
+                return self._normalize_parsed(parsed)
+            except json.JSONDecodeError:
+                pass
+
+        LOGGER.warning(
+            "Failed to parse executive summary output as JSON "
+            "(output length: %d, first 200 chars: %s)",
+            len(output),
+            output[:200],
+        )
         return {}
+
+    @staticmethod
+    def _extract_json_from_markdown(text: str) -> Optional[str]:
+        """Extract JSON content from markdown code blocks.
+
+        Handles:
+        - ```json\n{...}\n```
+        - ```\n{...}\n```
+        - Multiple code blocks (returns the first valid JSON one)
+        """
+        # Match ```json or ``` followed by content until closing ```
+        pattern = r"```(?:json)?\s*\n?(.*?)\n?\s*```"
+        matches = re.findall(pattern, text, re.DOTALL)
+        for match in matches:
+            candidate = match.strip()
+            if candidate.startswith("{") and candidate.endswith("}"):
+                return candidate
+        return None
+
+    @staticmethod
+    def _extract_json_balanced(text: str) -> Optional[str]:
+        """Extract the first complete JSON object using brace counting.
+
+        More robust than simple find/rfind because it tracks brace depth
+        to avoid cutting off early on internal braces or including text
+        after the closing brace.
+        """
+        start = text.find("{")
+        if start < 0:
+            return None
+
+        depth = 0
+        in_string = False
+        escape_next = False
+        i = start
+
+        while i < len(text):
+            char = text[i]
+
+            if escape_next:
+                escape_next = False
+                i += 1
+                continue
+
+            if char == "\\":
+                escape_next = True
+                i += 1
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                i += 1
+                continue
+
+            if in_string:
+                i += 1
+                continue
+
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+
+            i += 1
+
+        return None
 
     @staticmethod
     def _normalize_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
