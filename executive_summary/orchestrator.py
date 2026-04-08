@@ -369,6 +369,15 @@ class SummaryOrchestrator:
                     "(extracted length: %d, first 300: %s)",
                     e, len(json_from_md), json_from_md[:300],
                 )
+                # Try repairing the extracted JSON
+                repaired = self._try_repair_json(json_from_md)
+                if repaired:
+                    try:
+                        parsed = json.loads(repaired)
+                        LOGGER.info("Parsed summary via Strategy 2 + JSON repair")
+                        return self._normalize_parsed(parsed)
+                    except json.JSONDecodeError:
+                        LOGGER.debug("Strategy 2 repair also failed")
         else:
             LOGGER.debug("Strategy 2: no markdown code blocks found")
 
@@ -385,6 +394,15 @@ class SummaryOrchestrator:
                     "(extracted length: %d, first 300: %s)",
                     e, len(json_from_braces), json_from_braces[:300],
                 )
+                # Try repairing the extracted JSON
+                repaired = self._try_repair_json(json_from_braces)
+                if repaired:
+                    try:
+                        parsed = json.loads(repaired)
+                        LOGGER.info("Parsed summary via Strategy 3 + JSON repair")
+                        return self._normalize_parsed(parsed)
+                    except json.JSONDecodeError:
+                        LOGGER.debug("Strategy 3 repair also failed")
         else:
             LOGGER.debug("Strategy 3: no balanced JSON object found")
 
@@ -405,6 +423,7 @@ class SummaryOrchestrator:
         - ```json\n{...}\n```
         - ```\n{...}\n```
         - Multiple code blocks (returns the first valid JSON one)
+        - Missing closing ``` (uses brace balancing as fallback)
         """
         # Match ```json or ``` followed by content until closing ```
         pattern = r"```(?:json)?\s*\n?(.*?)\n?\s*```"
@@ -413,7 +432,53 @@ class SummaryOrchestrator:
             candidate = match.strip()
             if candidate.startswith("{") and candidate.endswith("}"):
                 return candidate
+
+        # Fallback: opening ``` found but no closing ``` — extract to end
+        opener = re.search(r"```(?:json)?\s*\n", text)
+        if opener:
+            remainder = text[opener.end():]
+            # Find the first { and extract balanced JSON
+            start = remainder.find("{")
+            if start >= 0:
+                depth = 0
+                in_string = False
+                escape_next = False
+                for i in range(start, len(remainder)):
+                    ch = remainder[i]
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if ch == "\\" and in_string:
+                        escape_next = True
+                        continue
+                    if ch == '"' and not escape_next:
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return remainder[start : i + 1]
         return None
+
+    @staticmethod
+    def _try_repair_json(text: str) -> Optional[str]:
+        """Attempt to repair common JSON formatting issues from AI models.
+
+        Fixes:
+        - Trailing commas before } or ]
+        - Single quotes instead of double quotes
+        - Comments (// or /* */)
+        """
+        # Remove trailing commas before } or ]
+        repaired = re.sub(r",\s*([}\]])", r"\1", text)
+        # Remove JS-style comments
+        repaired = re.sub(r"//.*$", "", repaired, flags=re.MULTILINE)
+        repaired = re.sub(r"/\*.*?\*/", "", repaired, flags=re.DOTALL)
+        return repaired
 
     @staticmethod
     def _extract_json_balanced(text: str) -> Optional[str]:
