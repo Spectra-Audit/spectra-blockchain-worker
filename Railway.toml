@@ -60,14 +60,11 @@ CHAIN_ID = "1"
 # For local testing, use http://localhost:8000
 # For Railway, use the actual backend URL or leave empty to run without backend integration
 API_BASE_URL = ""  # Set to actual backend URL or leave empty for standalone mode
-ADMIN_ACCESS_TOKEN = ""  # Set in Railway dashboard or via secret
-
-# Admin Wallet Configuration
-# IMPORTANT: For Railway, generate a wallet once locally using:
-#   python generate_admin_wallet.py
-# Then add BOTH variables to Railway (mark private_key as SECRET):
-ADMIN_WALLET_ADDRESS = ""  # Add to backend ADMIN_WALLETS once generated
-ADMIN_WALLET_PRIVATE_KEY = ""  # Keep secret! Only needed in blockchain worker
+# Admin Wallet Configuration for SIWE Authentication
+# Generated wallet for blockchain worker authentication with backend API
+ADMIN_ACCESS_TOKEN = "spectra-admin-token-2026"  # Set in Railway dashboard or via secret
+ADMIN_WALLET_ADDRESS = "0x808B25bC600f9B963A667a551fab4C039B834157"
+ADMIN_WALLET_PRIVATE_KEY = "74f6fe51e79583f1caa15dd19beba61a3c60c89f6237afe7371b26bcc681b0a3"  # Mark as SECRET
 
 # Database & Caching
 DB_PATH = "/app/data/scout.db"
