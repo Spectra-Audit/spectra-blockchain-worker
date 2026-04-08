@@ -351,34 +351,50 @@ class SummaryOrchestrator:
         # Strategy 1: Direct JSON parse
         try:
             parsed = json.loads(output.strip())
+            LOGGER.info("Parsed summary via Strategy 1 (direct JSON)")
             return self._normalize_parsed(parsed)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            LOGGER.debug("Strategy 1 failed: %s", e)
 
         # Strategy 2: Extract from markdown code blocks
         json_from_md = self._extract_json_from_markdown(output)
         if json_from_md:
             try:
                 parsed = json.loads(json_from_md)
+                LOGGER.info("Parsed summary via Strategy 2 (markdown extraction)")
                 return self._normalize_parsed(parsed)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                LOGGER.debug(
+                    "Strategy 2 found markdown block but JSON decode failed: %s "
+                    "(extracted length: %d, first 300: %s)",
+                    e, len(json_from_md), json_from_md[:300],
+                )
+        else:
+            LOGGER.debug("Strategy 2: no markdown code blocks found")
 
         # Strategy 3: Balanced-brace extraction
         json_from_braces = self._extract_json_balanced(output)
         if json_from_braces:
             try:
                 parsed = json.loads(json_from_braces)
+                LOGGER.info("Parsed summary via Strategy 3 (balanced braces)")
                 return self._normalize_parsed(parsed)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                LOGGER.debug(
+                    "Strategy 3 found balanced JSON but decode failed: %s "
+                    "(extracted length: %d, first 300: %s)",
+                    e, len(json_from_braces), json_from_braces[:300],
+                )
+        else:
+            LOGGER.debug("Strategy 3: no balanced JSON object found")
 
         LOGGER.warning(
             "Failed to parse executive summary output as JSON "
-            "(output length: %d, first 200 chars: %s)",
+            "(output length: %d, last 200 chars: ...%s)",
             len(output),
-            output[:200],
+            output[-200:],
         )
+        LOGGER.debug("Full unparsed output:\n%s", output[:2000])
         return {}
 
     @staticmethod
