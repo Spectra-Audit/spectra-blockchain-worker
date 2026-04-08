@@ -146,6 +146,14 @@ class AuditOrchestrator:
         # Track running audits
         self._running_audits: Dict[str, AuditResult] = {}
 
+        # Executive summary orchestrator (separate from code audit system)
+        self._summary_orchestrator = None
+        try:
+            from executive_summary.orchestrator import SummaryOrchestrator
+            self._summary_orchestrator = SummaryOrchestrator()
+        except Exception as exc:
+            LOGGER.warning("Executive summary orchestrator not available: %s", exc)
+
     async def run_full_audit(
         self,
         project_id: str,
@@ -216,6 +224,9 @@ class AuditOrchestrator:
                     f"Audit results PATCH FAILED for {project_id[:8]}... "
                     f"(keys: {list(results.keys())})"
                 )
+
+            # Generate executive summary after audit completes
+            await self._generate_and_store_summary(project_id, results)
 
             LOGGER.info(
                 f"Completed full audit for {project_id[:8]}...",
@@ -426,6 +437,88 @@ class AuditOrchestrator:
         aggregated["collected_at"] = datetime.utcnow().isoformat()
 
         return aggregated
+
+    async def _generate_and_store_summary(
+        self,
+        project_id: str,
+        audit_data: Dict[str, Any],
+    ) -> None:
+        """Generate and persist an executive summary for a project.
+
+        Safe wrapper — failures are logged but never propagate.
+        """
+        if not self._summary_orchestrator:
+            return
+
+        try:
+            summary = await self._summary_orchestrator.generate_summary(
+                project_id=project_id,
+                audit_data=audit_data,
+                backend_client=self.backend_client,
+            )
+            if summary:
+                await self._store_executive_summary(project_id, summary)
+        except Exception as exc:
+            LOGGER.warning(
+                "Executive summary generation failed for %s: %s",
+                project_id[:8], exc,
+            )
+
+    async def _store_executive_summary(
+        self,
+        project_id: str,
+        summary: Dict[str, Any],
+    ) -> bool:
+        """Persist executive summary fields to the backend."""
+        import os
+
+        endpoint = f"/admin/projects/{project_id}/audit-results"
+
+        payload = {
+            "audit_data": {
+                "executive_summary": summary.get("executive_summary", ""),
+                "security_analysis": summary.get("security_analysis", ""),
+                "recommendations": summary.get("recommendations", []),
+                "safety_assessment": summary.get("safety_assessment", {}),
+                "detailed_analysis": summary.get("detailed_analysis", {}),
+                "project_notes": summary.get("project_notes", []),
+                "confidence_score": summary.get("confidence_score", 0),
+            },
+        }
+
+        internal_secret = os.environ.get("INTERNAL_API_SECRET")
+        headers = {"Content-Type": "application/json"}
+        if internal_secret:
+            headers["X-Internal-Api-Secret"] = internal_secret
+
+        try:
+            if self.backend_client is not None and hasattr(self.backend_client, "patch"):
+                response = self.backend_client.patch(
+                    endpoint, json=payload, headers=headers,
+                )
+                if hasattr(response, "status_code") and response.status_code == 200:
+                    LOGGER.info(
+                        "Executive summary stored for %s", project_id[:8],
+                    )
+                    return True
+
+            # Direct HTTP fallback
+            api_base_url = os.environ.get("API_BASE_URL", "http://localhost:8000/v1")
+            url = (
+                f"{api_base_url.rstrip('/')}{endpoint}"
+                if endpoint.startswith('/')
+                else f"{api_base_url}/{endpoint}"
+            )
+            with httpx.Client(timeout=30.0) as client:
+                response = client.patch(url, json=payload, headers=headers)
+            return response.status_code == 200
+
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to store executive summary for %s: %s",
+                project_id[:8], exc,
+            )
+            return False
 
     async def _store_audit_results(
         self,
@@ -689,6 +782,9 @@ class AuditOrchestrator:
                             f"Updated all dynamic data for {project_id[:8]}... "
                             f"({len(results)} scout types updated)"
                         )
+
+                        # Regenerate executive summary with updated data
+                        await self._generate_and_store_summary(project_id, results)
 
                 except Exception as e:
                     LOGGER.error(f"Failed to update {project_id[:8]}...: {e}")
