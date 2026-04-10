@@ -211,11 +211,7 @@ class FeaturedScout:
         self._lock = threading.Lock()
         self._meta_key = "featured_last_block"
         self._meta_provider_key = "featured_active_rpc_index"
-        self._client = backend_client or BackendClient(
-            config.api_root,
-            config.admin_token,
-            config.admin_refresh_token,
-        )
+        self._client = backend_client or BackendClient(config.api_root)
         self._checksum_contract_address = Web3.to_checksum_address(
             self._config.contract_address
         )

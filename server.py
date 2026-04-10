@@ -186,28 +186,15 @@ def _do_background_initialization():
             database = DatabaseManager(db_path=db_path)
             logger.info(f"[bg-init] Database initialized: {db_path}")
 
-            # Create backend client (optional)
+            # Create backend client using INTERNAL_API_SECRET (no SIWE)
             backend_client = None
             api_base_url = os.environ.get("API_BASE_URL")
             if api_base_url and not api_base_url.startswith("{{"):
                 try:
                     from scout.backend_client import BackendClient
-                    from scout.siwe_authenticator import SiweAuthenticator
-                    from scout.auth_wallet import load_or_create_admin_wallet
 
-                    os.environ["SCOUT_SKIP_WALLET_PROMPT"] = "1"
-
-                    admin_wallet = load_or_create_admin_wallet(database)
-                    authenticator = SiweAuthenticator(api_base_url, admin_wallet, database)
-
-                    def token_provider(force_refresh: bool = False) -> tuple[str, str]:
-                        return authenticator.get_tokens()
-
-                    backend_client = BackendClient(
-                        api_base_url,
-                        token_provider=token_provider
-                    )
-                    logger.info(f"[bg-init] Backend client configured: {api_base_url}")
+                    backend_client = BackendClient(api_base_url)
+                    logger.info(f"[bg-init] Backend client configured with INTERNAL_API_SECRET: {api_base_url}")
                 except Exception as e:
                     logger.warning(f"[bg-init] Failed to initialize backend client: {e}")
                     logger.info("[bg-init] Continuing without backend client")

@@ -480,8 +480,7 @@ class AuditOrchestrator:
     ) -> bool:
         """Persist executive summary fields to the backend.
 
-        Uses direct HTTP with INTERNAL_API_SECRET first (no SIWE/JWT overhead).
-        Falls back to backend_client only if INTERNAL_API_SECRET is not configured.
+        Uses direct httpx with INTERNAL_API_SECRET header.
         """
         import os
         import time
@@ -502,78 +501,45 @@ class AuditOrchestrator:
         }
 
         internal_secret = os.environ.get("INTERNAL_API_SECRET")
+        if not internal_secret:
+            LOGGER.error("INTERNAL_API_SECRET not set — cannot store executive summary")
+            return False
 
-        # --- Strategy 1: Direct httpx with INTERNAL_API_SECRET (preferred) ---
-        # The admin endpoint only checks X-Internal-Api-Secret, not JWT.
-        # This avoids SIWE token bootstrap which can hang silently.
-        if internal_secret:
-            headers = {
-                "Content-Type": "application/json",
-                "X-Internal-Api-Secret": internal_secret,
-            }
-            api_base_url = os.environ.get("API_BASE_URL", "http://localhost:8000/v1")
-            url = f"{api_base_url.rstrip('/')}{endpoint}"
-            try:
-                LOGGER.info(
-                    "Storing executive summary for %s via direct httpx (INTERNAL_API_SECRET)",
-                    project_id[:8],
-                )
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.patch(url, json=payload, headers=headers)
-                elapsed = time.monotonic() - start
-                LOGGER.info(
-                    "Direct httpx PATCH for %s: HTTP %d (%.1fs)",
-                    project_id[:8], response.status_code, elapsed,
-                )
-                if response.status_code == 200:
-                    return True
-                LOGGER.error(
-                    "Direct httpx PATCH failed for %s: HTTP %d body=%s",
-                    project_id[:8], response.status_code, response.text[:300],
-                )
-            except Exception as exc:
-                elapsed = time.monotonic() - start
-                LOGGER.warning(
-                    "Direct httpx PATCH error for %s after %.1fs: %s",
-                    project_id[:8], elapsed, exc,
-                )
+        headers = {
+            "Content-Type": "application/json",
+            "X-Internal-Api-Secret": internal_secret,
+        }
+        api_base_url = os.environ.get("API_BASE_URL", "http://localhost:8000/v1")
+        url = f"{api_base_url.rstrip('/')}{endpoint}"
 
-        # --- Strategy 2: backend_client fallback (only when no INTERNAL_API_SECRET) ---
-        if self.backend_client is not None and hasattr(self.backend_client, "patch"):
-            headers = {"Content-Type": "application/json"}
-            if internal_secret:
-                headers["X-Internal-Api-Secret"] = internal_secret
-            try:
-                LOGGER.info(
-                    "Storing executive summary for %s via backend_client (fallback)",
-                    project_id[:8],
-                )
-                response = self.backend_client.patch(
-                    endpoint, json=payload, headers=headers, timeout=30,
-                )
-                elapsed = time.monotonic() - start
-                if hasattr(response, "status_code"):
-                    LOGGER.info(
-                        "backend_client PATCH for %s: HTTP %d (%.1fs)",
-                        project_id[:8], response.status_code, elapsed,
-                    )
-                    if response.status_code == 200:
-                        return True
-                else:
-                    LOGGER.warning(
-                        "backend_client.patch returned non-response: %s (%.1fs)",
-                        type(response), elapsed,
-                    )
-            except Exception as exc:
-                elapsed = time.monotonic() - start
-                LOGGER.warning(
-                    "backend_client PATCH error for %s after %.1fs: %s",
-                    project_id[:8], elapsed, exc,
-                )
+        try:
+            LOGGER.info(
+                "Storing executive summary for %s via httpx (INTERNAL_API_SECRET)",
+                project_id[:8],
+            )
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.patch(url, json=payload, headers=headers)
+            elapsed = time.monotonic() - start
+            LOGGER.info(
+                "httpx PATCH for %s: HTTP %d (%.1fs)",
+                project_id[:8], response.status_code, elapsed,
+            )
+            if response.status_code == 200:
+                return True
+            LOGGER.error(
+                "httpx PATCH failed for %s: HTTP %d body=%s",
+                project_id[:8], response.status_code, response.text[:300],
+            )
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            LOGGER.warning(
+                "httpx PATCH error for %s after %.1fs: %s",
+                project_id[:8], elapsed, exc,
+            )
 
         elapsed = time.monotonic() - start
         LOGGER.error(
-            "All strategies failed to store executive summary for %s (%.1fs)",
+            "Failed to store executive summary for %s (%.1fs)",
             project_id[:8], elapsed,
         )
         return False
@@ -583,7 +549,7 @@ class AuditOrchestrator:
         project_id: str,
         results: Dict[str, Any],
     ) -> bool:
-        """Store audit results to backend API.
+        """Store audit results to backend API via INTERNAL_API_SECRET.
 
         Args:
             project_id: Project identifier
@@ -635,41 +601,16 @@ class AuditOrchestrator:
                     f"keys={list(formatted_results.keys())}, "
                     f"contract_audit_score={formatted_results.get('contract_audit', {}).get('overall_score', 'N/A')}")
 
-        # Add internal API secret header for authentication
+        # Direct HTTP with INTERNAL_API_SECRET
         internal_secret = os.environ.get("INTERNAL_API_SECRET")
-        headers = {"Content-Type": "application/json"}
-        if internal_secret:
-            headers["X-Internal-Api-Secret"] = internal_secret
+        if not internal_secret:
+            LOGGER.error("INTERNAL_API_SECRET not set — cannot store audit results")
+            return False
 
-        # Strategy 1: Use BackendClient if available and functional
-        if self.backend_client is not None:
-            try:
-                if hasattr(self.backend_client, "patch"):
-                    response = self.backend_client.patch(
-                        endpoint,
-                        json=payload,
-                        headers=headers,
-                    )
-                    if hasattr(response, "status_code"):
-                        LOGGER.info(f"Backend response status: {response.status_code}")
-                        return response.status_code == 200
-                    return True
-
-                if hasattr(self.backend_client, "post"):
-                    response = self.backend_client.post(
-                        endpoint,
-                        json=payload,
-                        headers=headers,
-                    )
-                    if hasattr(response, "status_code"):
-                        LOGGER.info(f"Backend response status: {response.status_code}")
-                        return response.status_code == 200
-                    return True
-
-            except Exception as exc:
-                LOGGER.warning("BackendClient failed, trying direct HTTP: %s", exc)
-
-        # Strategy 2: Direct HTTP fallback with INTERNAL_API_SECRET
+        headers = {
+            "Content-Type": "application/json",
+            "X-Internal-Api-Secret": internal_secret,
+        }
         api_base_url = os.environ.get("API_BASE_URL", "http://localhost:8000/v1")
         url = (
             f"{api_base_url.rstrip('/')}{endpoint}"
@@ -680,11 +621,11 @@ class AuditOrchestrator:
         try:
             with httpx.Client(timeout=30.0) as client:
                 response = client.patch(url, json=payload, headers=headers)
-            LOGGER.info("Direct HTTP result: %s", response.status_code)
+            LOGGER.info("Audit results stored: HTTP %s", response.status_code)
             if response.status_code == 200:
                 return True
             LOGGER.error(
-                "Direct HTTP failed: %s %s",
+                "Failed to store audit results: HTTP %s %s",
                 response.status_code,
                 response.text[:200],
             )

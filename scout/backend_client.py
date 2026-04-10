@@ -1,8 +1,14 @@
-"""HTTP client utilities for communicating with the Spectra backend."""
+"""HTTP client utilities for communicating with the Spectra backend.
+
+Uses X-Internal-Api-Secret header for service-to-service authentication.
+No SIWE/JWT token management — the shared INTERNAL_API_SECRET env var is
+the single auth mechanism.
+"""
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -14,16 +20,17 @@ LOGGER = logging.getLogger(__name__)
 
 
 class BackendClient:
-    """Shared HTTP client with retry and auth support."""
+    """Shared HTTP client authenticated via INTERNAL_API_SECRET.
+
+    Every request includes the ``X-Internal-Api-Secret`` header read from
+    the ``INTERNAL_API_SECRET`` environment variable.  No JWT / SIWE token
+    management is performed.
+    """
 
     def __init__(
         self,
         base_url: str,
-        admin_token: Optional[str] = None,
-        admin_refresh_token: Optional[str] = None,
         *,
-        token_provider: Optional[Callable[[bool], tuple[str, str]]] = None,
-        token_persistor: Optional[Callable[[str, str], None]] = None,
         session: Optional[Session] = None,
         max_attempts: int = 5,
         initial_delay: float = 0.5,
@@ -35,22 +42,24 @@ class BackendClient:
         self.base_url = base_url.rstrip("/")
         self._session = session or requests.Session()
         self._lock = threading.Lock()
-        self._token_provider = token_provider
-        self._token_persistor = token_persistor
-        self._access_token: Optional[str] = None
-        self._refresh_token: Optional[str] = None
-        self._session.headers.update({"Accept": "application/json"})
 
-        self._bootstrapped = False
-        if admin_token and admin_refresh_token:
-            self.update_tokens(admin_token, admin_refresh_token)
-            self._bootstrapped = True
+        # Authenticate via shared internal secret
+        self._internal_secret = os.environ.get("INTERNAL_API_SECRET", "")
+        if not self._internal_secret:
+            LOGGER.warning(
+                "INTERNAL_API_SECRET not set — backend API calls will be rejected"
+            )
         else:
-            if self._token_provider is None:
-                raise ValueError("Authentication tokens or token_provider required")
-            # Defer authentication — don't block startup if backend is not ready yet.
-            # The first actual API call will trigger lazy bootstrap.
-            LOGGER.info("Backend client created with lazy token bootstrap (will auth on first request)")
+            LOGGER.info(
+                "BackendClient initialized with INTERNAL_API_SECRET (%s…)",
+                self._internal_secret[:6],
+            )
+
+        self._session.headers.update({
+            "Accept": "application/json",
+            "X-Internal-Api-Secret": self._internal_secret,
+        })
+
         self._max_attempts = max(1, max_attempts)
         self._initial_delay = max(0.0, initial_delay)
         self._max_delay = max(max_delay, self._initial_delay)
@@ -136,7 +145,6 @@ class BackendClient:
             True if successful, False otherwise
         """
         from datetime import datetime
-        import os
 
         endpoint = f"admin/projects/{project_id}/audit-results"
         payload = {
@@ -144,14 +152,8 @@ class BackendClient:
             "completed_at": datetime.utcnow().isoformat(),
         }
 
-        # Add internal API secret header for authentication
-        internal_secret = os.environ.get("INTERNAL_API_SECRET")
-        headers = {}
-        if internal_secret:
-            headers["X-Internal-Api-Secret"] = internal_secret
-
         try:
-            response = self.patch(endpoint, json=payload, headers=headers, timeout=30)
+            response = self.patch(endpoint, json=payload, timeout=30)
             if response and response.status_code == 200:
                 LOGGER.info(f"Stored audit results for project {project_id[:8]}...")
                 return True
@@ -196,32 +198,7 @@ class BackendClient:
         raise_for_status: bool,
         should_retry: Optional[Callable[[], bool]] = None,
     ) -> Optional[Response]:
-        # Lazy token bootstrap -- authenticate on first actual API call.
-        # Retry up to 3 times with short backoff so transient backend
-        # unavailability doesn't permanently kill result storage.
-        if not self._bootstrapped:
-            with self._lock:
-                if not self._bootstrapped:
-                    bootstrap_attempts = 3
-                    last_bootstrap_exc: Exception | None = None
-                    for _bs_attempt in range(bootstrap_attempts):
-                        try:
-                            self._bootstrap_tokens(force=False)
-                            self._bootstrapped = True
-                            LOGGER.info("Lazy token bootstrap succeeded on first API call")
-                            break
-                        except Exception as exc:
-                            last_bootstrap_exc = exc
-                            LOGGER.warning(
-                                "Lazy token bootstrap failed (attempt %d/%d): %s",
-                                _bs_attempt + 1, bootstrap_attempts, exc,
-                            )
-                    if not self._bootstrapped and last_bootstrap_exc is not None:
-                        LOGGER.error("All lazy token bootstrap attempts failed")
-                        raise last_bootstrap_exc
-
         delay = self._initial_delay
-        token_refreshed = False
         for attempt in range(1, self._max_attempts + 1):
             if should_retry is not None and not should_retry():
                 LOGGER.debug("Retry aborted by caller", extra={"method": method, "path": path})
@@ -250,17 +227,14 @@ class BackendClient:
                 continue
 
             if response.status_code == 401:
-                if token_refreshed:
-                    if raise_for_status:
-                        response.raise_for_status()
-                    return response
-                try:
-                    self._refresh_access_token()
-                except Exception as exc:  # pragma: no cover - defensive
-                    LOGGER.error("Failed to refresh admin token", exc_info=exc)
-                    raise RuntimeError("Unable to refresh admin access token") from exc
-                token_refreshed = True
-                continue
+                LOGGER.error(
+                    "HTTP 401 — INTERNAL_API_SECRET rejected by backend. "
+                    "Check that INTERNAL_API_SECRET matches on both services.",
+                    extra={"url": url},
+                )
+                if raise_for_status:
+                    response.raise_for_status()
+                return response
 
             if response.status_code == 429:
                 retry_after = self._retry_after_delay(response)
@@ -287,88 +261,6 @@ class BackendClient:
                 response.raise_for_status()
             return response
         return None
-
-    def get_access_token(self) -> Optional[str]:
-        """Get the current access token.
-
-        Returns:
-            Current access token or None if not authenticated
-        """
-        with self._lock:
-            return self._access_token
-
-    def update_tokens(self, access_token: str, refresh_token: Optional[str] = None) -> None:
-        if not access_token:
-            raise ValueError("access_token is required")
-        if refresh_token is not None and not refresh_token:
-            raise ValueError("refresh_token cannot be empty")
-        current_access: Optional[str]
-        current_refresh: Optional[str]
-        with self._lock:
-            self._access_token = access_token
-            if refresh_token is not None:
-                self._refresh_token = refresh_token
-            current_access = self._access_token
-            current_refresh = self._refresh_token
-            self._session.headers.update({"Authorization": f"Bearer {current_access}"})
-        if self._token_persistor and current_access and current_refresh:
-            self._token_persistor(current_access, current_refresh)
-
-    def _refresh_access_token(self) -> None:
-        refresh_token = self._refresh_token
-        if not refresh_token:
-            self._bootstrap_tokens(force=True)
-            return
-        url = self._build_url("auth/refresh")
-        payload = {"refresh_token": refresh_token}
-        headers = {
-            "Authorization": f"Bearer {refresh_token}",
-            "Accept": "application/json",
-        }
-        try:
-            with self._lock:
-                response = self._session.request(
-                    "post",
-                    url,
-                    json=payload,
-                    headers=headers,
-                    timeout=10,
-                )
-        except (requests.Timeout, requests.ConnectionError) as exc:
-            LOGGER.warning("Refresh request failed", extra={"error": str(exc)})
-            self._bootstrap_tokens(force=True)
-            return
-        if response.status_code != 200:
-            LOGGER.warning(
-                "Refresh request returned error",
-                extra={"status": response.status_code},
-            )
-            self._bootstrap_tokens(force=True)
-            return
-        try:
-            data = response.json()
-        except ValueError as exc:  # pragma: no cover - invalid backend response
-            LOGGER.error("Invalid refresh response", exc_info=exc)
-            self._bootstrap_tokens(force=True)
-            return
-        access_token = data.get("access_token")
-        if not access_token:
-            LOGGER.error("Refresh response missing access_token")
-            self._bootstrap_tokens(force=True)
-            return
-        new_refresh = data.get("refresh_token") or refresh_token
-        self.update_tokens(access_token, new_refresh)
-
-    def _bootstrap_tokens(self, force: bool) -> None:
-        if self._token_provider is None:
-            raise RuntimeError("Authentication tokens unavailable")
-        tokens = self._token_provider(force)
-        if not isinstance(tokens, tuple) or len(tokens) != 2:
-            raise RuntimeError("token_provider must return (access_token, refresh_token)")
-        access_token, refresh_token = tokens
-        if not access_token or not refresh_token:
-            raise RuntimeError("token_provider returned invalid tokens")
-        self.update_tokens(access_token, refresh_token)
 
     def _build_url(self, path: str) -> str:
         if path.startswith("http://") or path.startswith("https://"):

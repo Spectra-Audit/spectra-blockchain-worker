@@ -24,7 +24,7 @@ from .featured_scout import FeaturedScout, _load_config_from_env, resolve_ws_pro
 from .payment_wallet_scout import PaymentWalletScout
 from .pro_scout import DEFAULT_DB_PATH, ProScout
 from .project_scout import ProjectScout
-from .siwe_authenticator import SiweAuthenticator
+# SiweAuthenticator removed — all auth via INTERNAL_API_SECRET
 from .token_distribution_scout import TokenDistributionScout
 from .token_holder_scout import TokenHolderScout, TrackedToken
 from .usdt_payment_scout import USDTPaymentScout
@@ -82,18 +82,12 @@ class ScoutApp:
         featured_config = _load_config_from_env(database=database)
         api_base_url = os.environ.get("API_BASE_URL") or featured_config.api_root
 
-        # Initialize authenticator and backend client (may fail if backend not running)
-        authenticator = None
+        # Initialize backend client using INTERNAL_API_SECRET (no SIWE)
         backend_client = None
         try:
-            authenticator = SiweAuthenticator(api_base_url, admin_wallet, database)
-            backend_client = BackendClient(
-                api_base_url,
-                token_provider=authenticator.get_tokens,
-                token_persistor=authenticator.persist_tokens,
-            )
+            backend_client = BackendClient(api_base_url)
         except Exception as e:
-            LOGGER.warning(f"Failed to initialize backend client (backend may not be running): {e}")
+            LOGGER.warning(f"Failed to initialize backend client: {e}")
 
         # Initialize shared RPC Manager for all scouts
         rpc_manager = None
@@ -149,26 +143,16 @@ class ScoutApp:
                 LOGGER.info("FeaturedScout registered with unified API server")
 
                 # Initialize Payment Verifier Scout for on-demand tx verification
-                # PaymentVerifierScout uses the SIWE-authenticated token from backend_client
                 try:
                     from .payment_verifier_scout import PaymentVerifierScout
 
-                    # Get access token from SIWE-authenticated backend client
-                    admin_token = None
-                    if backend_client:
-                        admin_token = backend_client.get_access_token()
-
-                    if not admin_token:
-                        LOGGER.warning(
-                            "No access token available (backend_client not authenticated or ADMIN_ACCESS_TOKEN not set). "
-                            "Payment Verifier Scout will not be able to send callbacks to backend. "
-                            "Payment verification will fail."
-                        )
+                    # PaymentVerifierScout now uses INTERNAL_API_SECRET via BackendClient
+                    internal_secret = os.environ.get("INTERNAL_API_SECRET", "")
 
                     LOGGER.info("Initializing Payment Verifier Scout...")
                     payment_verifier_scout = PaymentVerifierScout(
                         backend_url=api_base_url,
-                        backend_token=admin_token or os.environ.get("ADMIN_ACCESS_TOKEN", ""),
+                        backend_token=internal_secret,
                         rpc_manager=rpc_manager,
                     )
                     payment_verifier_scout.start()
