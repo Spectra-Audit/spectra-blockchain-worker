@@ -344,12 +344,15 @@ class SummaryOrchestrator:
         2. JSON wrapped in markdown code blocks (```json ... ```)
         3. JSON with leading/trailing explanatory text
         4. JSON with unbalanced text containing extra braces
+        5. Prose with braces (e.g. {risk: high}) before the real JSON body
 
         Strategy order:
         1. Direct JSON parse
-        2. Strip markdown fences then balanced-brace extraction
-        3. Balanced-brace extraction on raw output
-        4. Each strategy has a JSON repair fallback
+        2. Strip markdown fences then JSON-object extraction
+        3. JSON-object extraction on raw output
+        4. Aggressive first{/last} extraction
+        5. Scan all {" positions as potential JSON starts
+        Each strategy has a JSON repair fallback.
         """
         if not output or not output.strip():
             return {}
@@ -362,23 +365,23 @@ class SummaryOrchestrator:
         except json.JSONDecodeError as e:
             LOGGER.debug("Strategy 1 failed: %s", e)
 
-        # Strategy 2: Strip markdown fences, then balanced-brace extract
+        # Strategy 2: Strip markdown fences, then extract JSON object
         stripped = self._strip_markdown_fences(output)
         if stripped != output.strip():
-            json_candidate = self._extract_json_balanced(stripped)
+            json_candidate = self._extract_json_object(stripped)
             if json_candidate:
-                result = self._try_parse_json(json_candidate, "Strategy 2 (strip fences + balanced braces)")
+                result = self._try_parse_json(json_candidate, "Strategy 2 (strip fences + JSON object)")
                 if result:
                     return result
 
-        # Strategy 3: Balanced-brace extraction on raw output
-        json_from_braces = self._extract_json_balanced(output)
-        if json_from_braces:
-            result = self._try_parse_json(json_from_braces, "Strategy 3 (balanced braces)")
+        # Strategy 3: JSON-object extraction on raw output
+        json_from_obj = self._extract_json_object(output)
+        if json_from_obj:
+            result = self._try_parse_json(json_from_obj, "Strategy 3 (JSON object scan)")
             if result:
                 return result
         else:
-            LOGGER.debug("Strategy 3: no balanced JSON object found")
+            LOGGER.debug("Strategy 3: no JSON object found")
 
         # Strategy 4: Aggressive — strip everything before first { and after last }
         json_aggressive = self._extract_json_aggressive(output)
@@ -386,6 +389,11 @@ class SummaryOrchestrator:
             result = self._try_parse_json(json_aggressive, "Strategy 4 (aggressive extraction)")
             if result:
                 return result
+
+        # Strategy 5: Try every {" position as a potential JSON start
+        result = self._scan_json_starts(output)
+        if result:
+            return result
 
         LOGGER.warning(
             "Failed to parse executive summary output as JSON "
@@ -435,10 +443,13 @@ class SummaryOrchestrator:
         # Strategy B: Only a trailing fence (the production bug case).
         # The JSON body runs from the start of the string up to the last ```.
         # We find the LAST occurrence of ``` and truncate there.
+        # Do NOT require the candidate to start with { — the AI may include
+        # prose before the JSON body, and downstream strategies will locate
+        # the actual JSON object within the stripped text.
         last_fence = stripped.rfind("```")
         if last_fence > 0:
             candidate = stripped[:last_fence].strip()
-            if candidate.startswith("{") or candidate.startswith("["):
+            if candidate:
                 return candidate
 
         return stripped
@@ -550,6 +561,111 @@ class SummaryOrchestrator:
                     return text[start : i + 1]
 
             i += 1
+
+        return None
+
+    @staticmethod
+    def _extract_json_object(text: str) -> Optional[str]:
+        """Extract the first valid JSON object, skipping prose with braces.
+
+        Unlike _extract_json_balanced which starts at the first { (which may
+        be inside prose like {risk: high}), this method looks for positions
+        where { is followed by a double-quote — the hallmark of a JSON key.
+        This skips false-positive braces in prose text.
+
+        Searches for patterns like {"key" at every occurrence and tries
+        balanced-brace extraction from each, returning the first result
+        that looks like valid JSON.
+        """
+        # Look for {" which is the start of a JSON object with a string key
+        search_pos = 0
+        while search_pos < len(text):
+            # Find next potential JSON object start: {" or {\n"
+            idx = text.find("{", search_pos)
+            if idx < 0:
+                break
+
+            # Check if this { is followed by " (JSON key) or whitespace then "
+            rest = text[idx + 1 : idx + 5].lstrip()
+            if rest.startswith('"'):
+                # Try balanced extraction from this position
+                extracted = SummaryOrchestrator._extract_json_balanced_from(text, idx)
+                if extracted:
+                    return extracted
+
+            search_pos = idx + 1
+
+        return None
+
+    @staticmethod
+    def _extract_json_balanced_from(text: str, start: int) -> Optional[str]:
+        """Extract balanced JSON starting from a specific position."""
+        if start >= len(text) or text[start] != "{":
+            return None
+
+        depth = 0
+        in_string = False
+        escape_next = False
+        i = start
+
+        while i < len(text):
+            char = text[i]
+
+            if escape_next:
+                escape_next = False
+                i += 1
+                continue
+
+            if char == "\\":
+                escape_next = True
+                i += 1
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                i += 1
+                continue
+
+            if in_string:
+                i += 1
+                continue
+
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+
+            i += 1
+
+        return None
+
+    def _scan_json_starts(self, text: str) -> Optional[Dict[str, Any]]:
+        """Last-resort: try balanced extraction from every { position.
+
+        For each position, attempt to parse the extracted text as JSON.
+        Returns the first successful parse, or None.
+        """
+        search_pos = 0
+        attempts = 0
+        max_attempts = 20  # Safety limit
+
+        while search_pos < len(text) and attempts < max_attempts:
+            idx = text.find("{", search_pos)
+            if idx < 0:
+                break
+
+            extracted = self._extract_json_balanced_from(text, idx)
+            if extracted and len(extracted) > 20:  # Skip tiny fragments
+                result = self._try_parse_json(
+                    extracted, f"Strategy 5 (scan position {idx})"
+                )
+                if result:
+                    return result
+
+            search_pos = idx + 1
+            attempts += 1
 
         return None
 
