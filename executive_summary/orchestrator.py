@@ -400,15 +400,47 @@ class SummaryOrchestrator:
     def _strip_markdown_fences(text: str) -> str:
         """Remove markdown code fences and surrounding prose from text.
 
-        Handles GLM-style output: optional prose, then ```json, then JSON,
-        then ```, then optional prose.
+        Handles common AI output patterns:
+        1. ```json\\n{...}\\n```             (full fence with language tag)
+        2. ```\\n{...}\\n```                 (fence without language tag)
+        3. {...}```                           (trailing fence only, no newline)
+        4. prose\\n```json\\n{...}\\n```     (prose before fence)
+        5. Raw {...}                          (no fences at all)
+
+        The old implementation used ^.*?``` with re.DOTALL to strip leading
+        fences, which incorrectly consumed the entire JSON body when only a
+        trailing fence was present (the regex matched from ^ to the *first*
+        ```, which was the trailing one).
+
+        Fix: detect whether the string STARTS with a fence (possibly after
+        short prose) to decide which stripping strategy to apply.
         """
         stripped = text.strip()
-        # Remove leading fence: anything up to and including ```json or ```
-        # This handles cases where there's prose before the fence
-        stripped = re.sub(r"^.*?```(?:json)?\s*\n?", "", stripped, count=1, flags=re.DOTALL)
-        # Remove trailing fence
-        stripped = re.sub(r"\n?\s*```\s*.*$", "", stripped, count=1, flags=re.DOTALL)
+
+        # Fast path: no backticks at all
+        if "```" not in stripped:
+            return stripped
+
+        # Strategy A: The string contains BOTH a leading and trailing fence.
+        # Match: optional short prose, ```json, then capture everything until
+        # the LAST ``` in the string.  The captured group is the JSON body.
+        m = re.match(
+            r"(?:.*?\n)?```(?:json)?\s*\n(.*?)\n?\s*```\s*.*$",
+            stripped,
+            re.DOTALL,
+        )
+        if m:
+            return m.group(1).strip()
+
+        # Strategy B: Only a trailing fence (the production bug case).
+        # The JSON body runs from the start of the string up to the last ```.
+        # We find the LAST occurrence of ``` and truncate there.
+        last_fence = stripped.rfind("```")
+        if last_fence > 0:
+            candidate = stripped[:last_fence].strip()
+            if candidate.startswith("{") or candidate.startswith("["):
+                return candidate
+
         return stripped
 
     def _try_parse_json(self, text: str, label: str) -> Optional[Dict[str, Any]]:
