@@ -1354,7 +1354,7 @@ if HAS_FASTAPI:
             token_address: Primary token contract address
             chain_id: Chain ID
             force_full: Whether to force full audit including static data
-            token_addresses: All token addresses for multi-token projects
+            token_addresses: All contract addresses (token + non-token) for the project
         """
         import functools
 
@@ -1363,8 +1363,8 @@ if HAS_FASTAPI:
         try:
             if len(addresses) > 1:
                 LOGGER.info(
-                    f"Starting multi-token audit for {project_id[:8]}... "
-                    f"({len(addresses)} tokens, force_full={force_full})"
+                    f"Starting multi-contract audit for {project_id[:8]}... "
+                    f"({len(addresses)} contracts, force_full={force_full})"
                 )
             else:
                 LOGGER.info(
@@ -1380,6 +1380,7 @@ if HAS_FASTAPI:
                     project_id,
                     token_address,
                     chain_id,
+                    token_addresses,
                 ),
             )
 
@@ -1434,6 +1435,7 @@ def _run_audit_sync(
     project_id: str,
     token_address: str,
     chain_id: int,
+    token_addresses: Optional[List[str]] = None,
 ) -> Any:
     """Synchronous wrapper that runs the full audit in a **new** event loop.
 
@@ -1447,11 +1449,18 @@ def _run_audit_sync(
     calls) is all synchronous *blocking* I/O.  Running inside its own
     loop in its own thread prevents any of those blocking calls from
     stalling the server's main loop.
+
+    Args:
+        project_id: Project UUID
+        token_address: Primary contract address
+        chain_id: Chain ID
+        token_addresses: All contract addresses (token + non-token) for the project
     """
     coro = orchestrator.run_full_audit(
         project_id=project_id,
         token_address=token_address,
         chain_id=chain_id,
+        token_addresses=token_addresses,
     )
     return asyncio.run(coro)
 
