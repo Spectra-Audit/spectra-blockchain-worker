@@ -718,12 +718,19 @@ class UnifiedAuditService:
         if result.code_audit:
             scores.append(("code", result.code_audit.get("overall_score", 50), 0.4))
 
-        # Distribution score
+        # Distribution score (blended Gini + Nakamoto)
         if result.distribution_metrics:
             metrics = result.distribution_metrics.get("metrics", {})
-            # Gini coefficient: lower is better (more distributed)
             gini = metrics.get("gini_coefficient", 1.0)
-            dist_score = max(0, 100 - (gini * 100))
+            nakamoto = metrics.get("nakamoto_coefficient", 0)
+
+            gini_score = max(0, 100 - (gini * 100))
+            # Nakamoto scaling: score = min(nakamoto * 5, 100), so nakamoto=20 -> 100
+            nakamoto_score = min(nakamoto * 5, 100)
+
+            alpha = 0.6
+            dist_score = alpha * gini_score + (1 - alpha) * nakamoto_score
+            dist_score = max(0, min(100, dist_score))
             scores.append(("distribution", dist_score, 0.2))
 
         # Liquidity score
