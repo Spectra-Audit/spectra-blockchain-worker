@@ -16,6 +16,7 @@ Minimizes external API calls by:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -309,8 +310,29 @@ class UnifiedAuditService:
 
                     # Step 3: Convert and merge claude findings with existing findings
                     # Convert ClaudeAgentFinding to dict format for frontend
+                    contract_name = source_info.get("contract_name", "")
+                    short_addr = token_address[:10] + "..." if token_address else ""
+
                     for finding in claude_findings:
-                        contract_result.ai_audit_findings.append(finding.to_dict())
+                        finding_dict = finding.to_dict()
+
+                        # Populate location fallback when the AI agent did not
+                        # return a specific code location.  Use
+                        #   ContractName:line_number  if available, otherwise
+                        #   ContractName:functionName  from description, or  0xAddr...
+                        if not finding_dict.get("location"):
+                            desc = finding_dict.get("description", "")
+                            # Try to extract function name from description
+                            fn_match = re.search(r'(?:function\s+)(\w+)', desc)
+                            fn_name = fn_match.group(1) if fn_match else finding.category
+                            if contract_name:
+                                finding_dict["location"] = (
+                                    f"{contract_name}:{fn_name}()"
+                                )
+                            else:
+                                finding_dict["location"] = short_addr
+
+                        contract_result.ai_audit_findings.append(finding_dict)
 
                     # Recalculate score with combined findings
                     contract_result.overall_score = (
@@ -607,13 +629,30 @@ class UnifiedAuditService:
             # Transform ai_audit_findings to findings format expected by backend
             if "ai_audit_findings" in contract_audit:
                 findings = []
+                # Contract name / address for location fallback
+                contract_name = contract_audit.get("contract_name", "")
+                token_addr = contract_audit.get("token_address", result.token_address)
+                short_addr = token_addr[:10] + "..." if token_addr else ""
+
                 for finding in contract_audit["ai_audit_findings"]:
+                    loc = finding.get("location", "")
+                    if not loc:
+                        desc = finding.get("description", "")
+                        fn_match = re.search(r'(?:function\s+)(\w+)', desc)
+                        fn_name = fn_match.group(1) if fn_match else finding.get("category", "")
+                        if contract_name and fn_name:
+                            loc = f"{contract_name}:{fn_name}()"
+                        elif contract_name:
+                            loc = f"{contract_name}"
+                        else:
+                            loc = short_addr
+
                     findings.append({
                         "severity": finding.get("severity", "info"),
                         "type": finding.get("category", "Code Issue"),
                         "category": finding.get("category", "Code Issue"),
-                        "code_location": finding.get("location", ""),
-                        "location": finding.get("location", ""),  # Also include for compatibility
+                        "code_location": loc,
+                        "location": loc,
                         "description": finding.get("description", ""),
                         "recommendation": finding.get("recommendation", ""),
                         "agent_name": finding.get("agent_name", ""),

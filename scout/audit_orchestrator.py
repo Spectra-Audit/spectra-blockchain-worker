@@ -575,14 +575,32 @@ class AuditOrchestrator:
                 # Also transform ai_audit_findings to findings format if present
                 if "ai_audit_findings" in value:
                     findings = []
+                    # Extract contract name from code_audit data for location fallback
+                    contract_name = value.get("contract_name", "")
+                    token_addr = value.get("token_address", "")
+                    short_addr = token_addr[:10] + "..." if token_addr else ""
+
                     for finding in value["ai_audit_findings"]:
                         if isinstance(finding, dict):
+                            loc = finding.get("location", "")
+                            if not loc:
+                                # Fallback: use contract name + function from description
+                                desc = finding.get("description", "")
+                                fn_match = __import__('re').search(r'(?:function\s+)(\w+)', desc)
+                                fn_name = fn_match.group(1) if fn_match else finding.get("category", "")
+                                if contract_name and fn_name:
+                                    loc = f"{contract_name}:{fn_name}()"
+                                elif contract_name:
+                                    loc = f"{contract_name}"
+                                else:
+                                    loc = short_addr
+
                             findings.append({
                                 "severity": finding.get("severity", "info"),
                                 "type": finding.get("category", "Code Issue"),
                                 "category": finding.get("category", "Code Issue"),
-                                "code_location": finding.get("location", ""),
-                                "location": finding.get("location", ""),
+                                "code_location": loc,
+                                "location": loc,
                                 "description": finding.get("description", ""),
                                 "recommendation": finding.get("recommendation", ""),
                                 "agent_name": finding.get("agent_name", ""),

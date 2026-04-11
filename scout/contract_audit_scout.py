@@ -88,15 +88,24 @@ class ContractAuditResult:
     optimization_runs: Optional[int]
     contract_size: int
     libraries_used: List[str]
+    contract_name: Optional[str] = None  # From block explorer (e.g. "WETH")
 
     # AI Audit Results
-    ai_audit_enabled: bool
-    ai_audit_findings: List[Dict[str, Any]]  # Individual agent findings
-    overall_score: float  # 0-100
-    risk_level: str  # "low", "medium", "high", "critical"
+    ai_audit_enabled: bool = False
+    ai_audit_findings: List[Dict[str, Any]] = None  # Individual agent findings
+    overall_score: float = 50.0  # 0-100
+    risk_level: str = "medium"  # "low", "medium", "high", "critical"
 
-    flags: List[str]
-    analyzed_at: str
+    flags: List[str] = None
+    analyzed_at: str = None
+
+    def __post_init__(self):
+        if self.ai_audit_findings is None:
+            self.ai_audit_findings = []
+        if self.flags is None:
+            self.flags = []
+        if self.analyzed_at is None:
+            self.analyzed_at = datetime.utcnow().isoformat()
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage."""
@@ -110,6 +119,7 @@ class ContractAuditResult:
             "optimization_runs": self.optimization_runs,
             "contract_size": self.contract_size,
             "libraries_used": self.libraries_used,
+            "contract_name": self.contract_name,
             "ai_audit_enabled": self.ai_audit_enabled,
             "ai_audit_findings": self.ai_audit_findings,
             "overall_score": self.overall_score,
@@ -197,7 +207,7 @@ Focus on:
 4. ReentrancyGuard usage or lack thereof
 
 Return findings as JSON array with this exact structure:
-[{{"severity": "high|medium|low", "location": "function_name", "description": "...", "recommendation": "..."}}]
+[{{"severity": "high|medium|low", "location": "ContractName:lineNumber or functionName()", "description": "...", "recommendation": "..."}}]
 
 Only return the JSON array, no other text."""
 
@@ -216,7 +226,7 @@ Focus on:
 4. centralized control risks
 
 Return findings as JSON array with this exact structure:
-[{{"severity": "high|medium|low", "location": "function_name", "description": "...", "recommendation": "..."}}]
+[{{"severity": "high|medium|low", "location": "ContractName:lineNumber or functionName()", "description": "...", "recommendation": "..."}}]
 
 Only return the JSON array, no other text."""
 
@@ -235,7 +245,7 @@ Focus on:
 4. Unchecked arithmetic operations
 
 Return findings as JSON array with this exact structure:
-[{{"severity": "high|medium|low", "location": "function_name", "description": "...", "recommendation": "..."}}]
+[{{"severity": "high|medium|low", "location": "ContractName:lineNumber or functionName()", "description": "...", "recommendation": "..."}}]
 
 Only return the JSON array, no other text."""
 
@@ -254,7 +264,7 @@ Focus on:
 4. Memory vs storage usage
 
 Return findings as JSON array with this exact structure:
-[{{"severity": "low|info", "location": "function_name", "description": "...", "recommendation": "..."}}]
+[{{"severity": "low|info", "location": "ContractName:lineNumber or functionName()", "description": "...", "recommendation": "..."}}]
 
 Only return the JSON array, no other text."""
 
@@ -273,7 +283,7 @@ Focus on:
 4. Front-running opportunities
 
 Return findings as JSON array with this exact structure:
-[{{"severity": "high|medium|low", "location": "function_name", "description": "...", "recommendation": "..."}}]
+[{{"severity": "high|medium|low", "location": "ContractName:lineNumber or functionName()", "description": "...", "recommendation": "..."}}]
 
 Only return the JSON array, no other text."""
 
@@ -582,6 +592,7 @@ class ContractAuditScout:
                         optimization_runs=last_audit["optimization_runs"],
                         contract_size=last_audit["contract_size"],
                         libraries_used=last_audit["libraries_used"],
+                        contract_name=last_audit.get("contract_name"),
                         ai_audit_enabled=last_audit["ai_audit_enabled"],
                         ai_audit_findings=last_audit["ai_audit_findings"],
                         overall_score=last_audit["overall_score"],
@@ -733,6 +744,7 @@ class ContractAuditScout:
             optimization_runs=source_info.get("optimization_runs") if source_info else None,
             contract_size=contract_size,
             libraries_used=source_info.get("library", "").split(",") if source_info and source_info.get("library") else [],
+            contract_name=source_info.get("contract_name") if source_info else None,
             ai_audit_enabled=ai_audit_enabled,  # Set by the if/else block above
             ai_audit_findings=[f.to_dict() for f in ai_findings],
             overall_score=overall_score,

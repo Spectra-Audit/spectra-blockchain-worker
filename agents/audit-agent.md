@@ -123,7 +123,7 @@ Return a JSON array of findings. Each finding MUST have this exact structure:
     "confidence": "high|medium",
     "category": "reentrancy|access_control|arithmetic|gas|logic|oracle|flash_loan|front_running|proxy|unchecked_return|tx_origin|dos|cross_contract|token_specific",
     "description": "Clear, specific description of the vulnerability with exploit path",
-    "location": "ContractName.functionName() or specific code reference",
+    "location": "ContractName:lineNumber (e.g., WETH.sol:142 or Staking:deposit()). MUST include line number when source code has line numbers. Use functionName() only when exact line is unavailable.",
     "recommendation": "Specific fix or mitigation strategy"
   }
 ]
