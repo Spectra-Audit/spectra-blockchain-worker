@@ -311,6 +311,7 @@ class UnifiedAuditService:
                     # Step 3: Convert and merge claude findings with existing findings
                     # Convert ClaudeAgentFinding to dict format for frontend
                     contract_name = source_info.get("contract_name", "")
+                    source_code = source_info.get("source_code", "")
                     short_addr = token_address[:10] + "..." if token_address else ""
 
                     for finding in claude_findings:
@@ -331,6 +332,11 @@ class UnifiedAuditService:
                                 )
                             else:
                                 finding_dict["location"] = short_addr
+
+                        # Enrich with code snippet, location detail, and highlight
+                        self._enrich_finding_with_snippet(
+                            finding_dict, source_code, contract_name, is_verified=True
+                        )
 
                         contract_result.ai_audit_findings.append(finding_dict)
 
@@ -378,6 +384,195 @@ class UnifiedAuditService:
             recommendation=d.get("recommendation", ""),
             confidence=d.get("confidence", "medium"),
         )
+
+    # ------------------------------------------------------------------
+    # Code-snippet enrichment helpers
+    # ------------------------------------------------------------------
+
+    def _parse_location(self, location: str, default_contract_name: str) -> dict:
+        """Parse a location string into structured components.
+
+        Supported patterns:
+        - ``"ContractName:142"``
+        - ``"ContractName:functionName()"``
+        - ``"functionName()"``
+        - bare string (returned as-is with default contract name)
+        """
+        result: dict = {"contract_name": default_contract_name}
+
+        if not location:
+            return result
+
+        # "ContractName:lineNumber"
+        match = re.match(r"^(.+?):(\d+)$", location.strip())
+        if match:
+            result["contract_name"] = match.group(1)
+            result["line_number"] = int(match.group(2))
+            return result
+
+        # "ContractName:functionName()"  (may contain args inside parens)
+        match = re.match(r"^(.+?):(\w+)\(.*\)$", location.strip())
+        if match:
+            result["contract_name"] = match.group(1)
+            result["function_name"] = match.group(2)
+            return result
+
+        # "functionName()" alone
+        match = re.match(r"^(\w+)\(.*\)$", location.strip())
+        if match:
+            result["function_name"] = match.group(1)
+            return result
+
+        return result
+
+    def _extract_function_snippet(
+        self,
+        source_code: str,
+        function_name: Optional[str] = None,
+        line_number: Optional[int] = None,
+    ) -> Optional[str]:
+        """Extract the relevant function body from Solidity source code.
+
+        Strategy 1: locate by ``function_name``.
+        Strategy 2: locate by ``line_number`` (context window around the line).
+        """
+        if not source_code:
+            return None
+
+        lines = source_code.split("\n")
+
+        # Strategy 1 — match by function / modifier / event / error name
+        if function_name:
+            pattern = rf"(?:function|modifier|event|error)\s+{re.escape(function_name)}\b"
+            for i, line in enumerate(lines):
+                if re.search(pattern, line):
+                    return self._extract_block(lines, i)
+
+        # Strategy 2 — context around the target line number (1-based)
+        if line_number and 0 < line_number <= len(lines):
+            start = max(0, line_number - 10)
+            return self._extract_block(lines, start)
+
+        return None
+
+    def _extract_block(self, lines: list, start_line: int) -> Optional[str]:
+        """Extract a braced code block starting from *start_line*.
+
+        Walks forward counting braces until the block closes.  Returns at most
+        50 lines as a safety limit.
+        """
+        brace_count = 0
+        found_open = False
+        snippet_lines: list = []
+        max_lines = 50
+
+        for i in range(start_line, min(len(lines), start_line + max_lines)):
+            line = lines[i]
+            snippet_lines.append(line)
+            brace_count += line.count("{") - line.count("}")
+            if "{" in line:
+                found_open = True
+            if found_open and brace_count <= 0:
+                break
+
+        return "\n".join(snippet_lines) if snippet_lines else None
+
+    def _compute_highlight(self, snippet: str, description: str) -> tuple:
+        """Return ``(highlight_start, highlight_end)`` char offsets.
+
+        Picks the line inside *snippet* whose identifiers best overlap with
+        keywords extracted from *description*.
+        """
+        if not snippet:
+            return (0, 0)
+
+        # Tokenise description and filter common English words
+        keywords = re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", description)
+        common = {
+            "the", "a", "an", "is", "are", "was", "were", "be", "been",
+            "being", "have", "has", "had", "do", "does", "did", "will",
+            "would", "could", "should", "may", "might", "must", "shall",
+            "can", "need", "dare", "to", "of", "in", "for", "on", "with",
+            "at", "by", "from", "as", "into", "through", "during", "before",
+            "after", "above", "below", "between", "and", "but", "or", "nor",
+            "not", "so", "yet", "both", "either", "neither", "each", "every",
+            "all", "any", "few", "more", "most", "other", "some", "such",
+            "no", "only", "own", "same", "than", "too", "very", "just",
+            "because", "this", "that", "these", "those", "it", "its", "if",
+            "else", "when", "where", "which", "who", "whom", "what", "how",
+            "function", "contract", "should", "recommendation",
+        }
+        keywords = [k for k in keywords if k.lower() not in common and len(k) > 2][:5]
+
+        lines = snippet.split("\n")
+        best_line = 0
+        best_score = 0
+
+        for i, line in enumerate(lines):
+            score = sum(1 for kw in keywords if kw in line)
+            if score > best_score:
+                best_score = score
+                best_line = i
+
+        # Calculate char offsets for the best-matching line
+        char_offset = sum(len(lines[j]) + 1 for j in range(best_line))
+        line_text = lines[best_line] if best_line < len(lines) else ""
+
+        if best_score > 0:
+            return (char_offset, char_offset + len(line_text))
+
+        # Fallback: highlight first non-empty, non-comment line
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped and not stripped.startswith("//") and not stripped.startswith("/*"):
+                offset = sum(len(lines[j]) + 1 for j in range(i))
+                return (offset, offset + len(line))
+
+        return (0, 0)
+
+    def _enrich_finding_with_snippet(
+        self,
+        finding_dict: dict,
+        source_code: str,
+        contract_name: str,
+        is_verified: bool,
+    ) -> dict:
+        """Add ``code_snippet``, ``location_detail`` and highlight offsets."""
+        location = finding_dict.get("location", "")
+
+        parsed = self._parse_location(location, contract_name)
+
+        finding_dict["location_detail"] = {
+            "contract_name": parsed["contract_name"],
+            "line_number": parsed.get("line_number"),
+            "function_name": parsed.get("function_name"),
+            "is_verified": is_verified,
+        }
+
+        if not is_verified or not source_code:
+            finding_dict["code_snippet"] = None
+            finding_dict["highlight_start"] = None
+            finding_dict["highlight_end"] = None
+            return finding_dict
+
+        snippet = self._extract_function_snippet(
+            source_code,
+            parsed.get("function_name"),
+            parsed.get("line_number"),
+        )
+        finding_dict["code_snippet"] = snippet
+
+        if snippet:
+            hl_start, hl_end = self._compute_highlight(
+                snippet, finding_dict.get("description", "")
+            )
+            finding_dict["highlight_start"] = hl_start
+            finding_dict["highlight_end"] = hl_end
+        else:
+            finding_dict["highlight_start"] = None
+            finding_dict["highlight_end"] = None
+
+        return finding_dict
 
     async def _audit_unverified_contract(
         self,
@@ -656,6 +851,10 @@ class UnifiedAuditService:
                         "description": finding.get("description", ""),
                         "recommendation": finding.get("recommendation", ""),
                         "agent_name": finding.get("agent_name", ""),
+                        "code_snippet": finding.get("code_snippet"),
+                        "location_detail": finding.get("location_detail"),
+                        "highlight_start": finding.get("highlight_start"),
+                        "highlight_end": finding.get("highlight_end"),
                     })
                 contract_audit["findings"] = findings
 

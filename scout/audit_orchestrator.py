@@ -604,6 +604,10 @@ class AuditOrchestrator:
                                 "description": finding.get("description", ""),
                                 "recommendation": finding.get("recommendation", ""),
                                 "agent_name": finding.get("agent_name", ""),
+                                "code_snippet": finding.get("code_snippet"),
+                                "location_detail": finding.get("location_detail"),
+                                "highlight_start": finding.get("highlight_start"),
+                                "highlight_end": finding.get("highlight_end"),
                             })
                     formatted_results["contract_audit"]["findings"] = findings
             else:
