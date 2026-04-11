@@ -636,8 +636,8 @@ class ContractAuditScout:
         """
         checksum_address = Web3.to_checksum_address(token_address)
 
-        # Retry logic for RPC calls
-        max_retries = 3
+        # Retry logic for RPC calls with improved 429 handling
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 code = self.w3.eth.get_code(checksum_address)
@@ -646,15 +646,40 @@ class ContractAuditScout:
                 else:
                     LOGGER.warning(f"No code found for {checksum_address}, attempt {attempt + 1}/{max_retries}")
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(1)  # Wait before retry
+                        await asyncio.sleep(1)
             except Exception as e:
-                LOGGER.warning(f"RPC error getting code for {checksum_address}, attempt {attempt + 1}/{max_retries}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                error_str = str(e).lower()
+                is_rate_limit = any(sig in error_str for sig in (
+                    "429", "rate", "too many", "exhausted", "quota",
+                ))
+                if is_rate_limit:
+                    # Longer backoff for rate limiting: 3s, 6s, 12s, 24s
+                    backoff = min(3 * (2 ** attempt), 30)
+                    LOGGER.warning(
+                        f"Rate-limited getting code for {checksum_address}, "
+                        f"attempt {attempt + 1}/{max_retries}, backing off {backoff}s: {e}"
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(backoff)
+                    else:
+                        LOGGER.error(
+                            f"Failed to get code for {checksum_address} "
+                            f"after {max_retries} attempts (rate limited)"
+                        )
+                        return hashlib.sha256(b"").hexdigest()
                 else:
-                    # Final retry failed, return empty hash
-                    LOGGER.error(f"Failed to get code for {checksum_address} after {max_retries} attempts")
-                    return hashlib.sha256(b"").hexdigest()
+                    LOGGER.warning(
+                        f"RPC error getting code for {checksum_address}, "
+                        f"attempt {attempt + 1}/{max_retries}: {e}"
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    else:
+                        LOGGER.error(
+                            f"Failed to get code for {checksum_address} "
+                            f"after {max_retries} attempts"
+                        )
+                        return hashlib.sha256(b"").hexdigest()
 
         return hashlib.sha256(b"").hexdigest()
 

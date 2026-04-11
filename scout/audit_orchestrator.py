@@ -353,8 +353,9 @@ class AuditOrchestrator:
     ) -> Dict[str, Any]:
         """Collect audit data for multiple tokens and aggregate.
 
-        Runs all scouts for each token in parallel, then aggregates
-        per-token holder/pair data with token_address populated.
+        Runs all scouts for each token with staggered starts to avoid
+        RPC rate limiting, then aggregates per-token holder/pair data
+        with token_address populated.
 
         Args:
             token_addresses: List of token contract addresses
@@ -365,14 +366,23 @@ class AuditOrchestrator:
         """
         import asyncio as _asyncio
 
-        # Run audits for each token in parallel
+        # Stagger token audits to avoid burst RPC rate limiting.
+        # Each audit fires multiple RPC calls (eth_getCode, eth_call, etc.)
+        # so launching 19+ simultaneously overwhelms free-tier providers.
+        _STAGGER_DELAY = 1.0  # seconds between token audit starts
+
+        async def _staggered_collect(addr: str, delay: float) -> Dict[str, Any]:
+            if delay > 0:
+                await _asyncio.sleep(delay)
+            return await self._collect_all_audit_data(
+                token_address=addr,
+                chain_id=chain_id,
+            )
+
         per_token_tasks = []
-        for addr in token_addresses:
+        for idx, addr in enumerate(token_addresses):
             per_token_tasks.append(
-                self._collect_all_audit_data(
-                    token_address=addr,
-                    chain_id=chain_id,
-                )
+                _staggered_collect(addr, delay=idx * _STAGGER_DELAY)
             )
 
         per_token_results = await _asyncio.gather(
@@ -397,11 +407,16 @@ class AuditOrchestrator:
                 holders_raw = token_dist.get("top_holders") or token_dist.get("holders") or []
                 holder_count = token_dist.get("holder_count") or token_dist.get("total_holders")
                 dist_score = token_dist.get("score")
+                dist_metrics = token_dist.get("metrics")
+                market_cap = token_dist.get("market_cap_usd")
                 per_token_holders[addr] = {
                     "holders": holders_raw,
                     "score": dist_score,
                     "holder_count": holder_count,
+                    "metrics": dist_metrics,
                 }
+                if market_cap is not None:
+                    per_token_holders[addr]["market_cap_usd"] = market_cap
 
             # Collect liquidity pairs with token_address
             liq_data = token_result.get("liquidity", {})
