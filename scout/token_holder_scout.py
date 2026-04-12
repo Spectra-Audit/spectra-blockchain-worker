@@ -157,8 +157,8 @@ class TokenHolderScout:
                 "nakamoto_coefficient": metrics.nakamoto_coefficient,
                 "top_10_pct_supply": metrics.top_10_pct_supply,
                 "top_1_pct_supply": metrics.top_1_pct_supply,
-                "top_100_balance_sum": metrics.top_100_balance_sum,
-                "estimated_total_supply": metrics.estimated_total_supply,
+                "top_100_balance_sum": int(metrics.top_100_balance_sum, 16) if metrics.top_100_balance_sum else 0,
+                "estimated_total_supply": int(metrics.estimated_total_supply, 16) if metrics.estimated_total_supply else 0,
             }
         }
 

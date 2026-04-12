@@ -1830,8 +1830,8 @@ class DatabaseManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     token_address TEXT NOT NULL,
                     chain_id TEXT NOT NULL,
-                    total_supply INTEGER NOT NULL,
-                    max_supply INTEGER,
+                    total_supply TEXT NOT NULL,
+                    max_supply TEXT,
                     supply_tier TEXT NOT NULL,
                     total_holders INTEGER NOT NULL,
                     top_10_holder_pct REAL NOT NULL,
@@ -1972,7 +1972,7 @@ class DatabaseManager:
                  tokenomics_score, risk_level, flags, recommendations, analyzed_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                token_address.lower(), chain_id, total_supply, max_supply, supply_tier,
+                token_address.lower(), chain_id, str(total_supply), str(max_supply) if max_supply is not None else None, supply_tier,
                 total_holders, top_10_holder_pct, contract_holder_pct, staking_contract_pct,
                 gini_coefficient, nakamoto_coefficient, utility_flags, vesting_flags,
                 tokenomics_score, risk_level, flags, recommendations, analyzed_at,

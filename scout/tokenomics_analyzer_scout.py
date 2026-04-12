@@ -252,18 +252,20 @@ class TokenomicsAnalyzerScout:
             )
 
             if metrics:
+                # estimated_total_supply is stored as hex string in HolderMetrics
+                total_supply_int = int(metrics.estimated_total_supply, 16) if metrics.estimated_total_supply else 0
                 return {
                     "holders": [
                         {
                             "address": h.address,
                             "balance": h.balance,
-                            "share": (h.balance / metrics.estimated_total_supply_int * 100)
-                                   if metrics.estimated_total_supply_int > 0 else 0,
+                            "share": (h.balance / total_supply_int * 100)
+                                   if total_supply_int > 0 else 0,
                         }
                         for h in metrics.top_holders
                     ],
                     "total_holders": metrics.total_holder_count,
-                    "total_supply": metrics.estimated_total_supply_int,
+                    "total_supply": total_supply_int,
                 }
         except Exception as e:
             LOGGER.warning(f"Failed to get holder data from API: {e}")
