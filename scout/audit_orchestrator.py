@@ -256,12 +256,17 @@ class AuditOrchestrator:
         self,
         token_address: str,
         chain_id: int,
+        skip_expensive: bool = False,
     ) -> Dict[str, Any]:
         """Collect data from all audit services in parallel.
 
         Args:
             token_address: Token contract address
             chain_id: Chain ID
+            skip_expensive: If True, skip holder distribution and tokenomics
+                collection. Used for secondary tokens in multi-token audits to
+                avoid overwhelming Ethplorer freekey rate limits. Only code
+                audit and liquidity are collected when True.
 
         Returns:
             Dictionary with all collected audit data
@@ -271,7 +276,8 @@ class AuditOrchestrator:
 
         # Task 1: Token holder distribution (dynamic - weekly updates)
         # force=True to always collect fresh data during audits
-        if self.token_holder_scout:
+        # SKIPPED for secondary tokens in multi-token audits to save API budget
+        if self.token_holder_scout and not skip_expensive:
             tasks.append(("token_distribution", self.token_holder_scout.collect_token_data(
                 token_address=token_address,
                 chain_id=chain_id,
@@ -281,7 +287,8 @@ class AuditOrchestrator:
         # Task 2: Tokenomics analysis (NEW!)
         # Note: TokenomicsAnalyzerScout will use cached holder data from database
         # if available, avoiding duplicate API calls with TokenHolderScout
-        if self.tokenomics_analyzer_scout:
+        # SKIPPED for secondary tokens in multi-token audits to save API budget
+        if self.tokenomics_analyzer_scout and not skip_expensive:
             tasks.append(("tokenomics", self.tokenomics_analyzer_scout.analyze_tokenomics(
                 token_address=token_address,
                 chain_id=str(chain_id),
@@ -374,18 +381,30 @@ class AuditOrchestrator:
         # Use 3s delay to stay within Ethplorer freekey rate limits (~1 req/sec).
         _STAGGER_DELAY = 3.0  # seconds between token audit starts
 
-        async def _staggered_collect(addr: str, delay: float) -> Dict[str, Any]:
+        async def _staggered_collect(
+            addr: str, delay: float, skip_expensive: bool = False
+        ) -> Dict[str, Any]:
             if delay > 0:
                 await _asyncio.sleep(delay)
             return await self._collect_all_audit_data(
                 token_address=addr,
                 chain_id=chain_id,
+                skip_expensive=skip_expensive,
             )
 
         per_token_tasks = []
         for idx, addr in enumerate(token_addresses):
+            # Only the primary token (index 0) gets expensive holder/tokenomics
+            # collection. Secondary tokens only get code audit + liquidity.
+            # This prevents Ethplorer freekey rate limits from being exhausted
+            # by 19 tokens each making 2+ API calls.
+            is_primary = idx == 0
             per_token_tasks.append(
-                _staggered_collect(addr, delay=idx * _STAGGER_DELAY)
+                _staggered_collect(
+                    addr,
+                    delay=idx * _STAGGER_DELAY,
+                    skip_expensive=not is_primary,
+                )
             )
 
         per_token_results = await _asyncio.gather(
@@ -458,8 +477,12 @@ class AuditOrchestrator:
             elif isinstance(tok_data, dict) and not tok_data:
                 LOGGER.warning(f"No tokenomics data for token {addr[:16]}...")
 
-        # Build aggregated output
-        aggregated["per_token_holders"] = per_token_holders
+        # Build aggregated output — only include per-token dicts when they have entries
+        if per_token_holders:
+            aggregated["per_token_holders"] = per_token_holders
+        if "per_token_tokenomics" not in aggregated:
+            # Ensure the key is absent if no token ever had substantive data
+            aggregated.pop("per_token_tokenomics", None)
         aggregated["liquidity"] = {"pairs": all_pairs}
         if all_findings:
             aggregated.setdefault("contract_audit", {})["findings"] = all_findings
