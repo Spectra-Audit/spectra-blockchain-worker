@@ -405,20 +405,26 @@ class AuditOrchestrator:
 
             # Collect per-token holder data with token_address
             token_dist = token_result.get("token_distribution", {})
-            if isinstance(token_dist, dict):
+            if isinstance(token_dist, dict) and token_dist:
                 holders_raw = token_dist.get("top_holders") or token_dist.get("holders") or []
                 holder_count = token_dist.get("holder_count") or token_dist.get("total_holders")
                 dist_score = token_dist.get("score")
                 dist_metrics = token_dist.get("metrics")
                 market_cap = token_dist.get("market_cap_usd")
-                per_token_holders[addr] = {
-                    "holders": holders_raw,
-                    "score": dist_score,
-                    "holder_count": holder_count,
-                    "metrics": dist_metrics,
-                }
-                if market_cap is not None:
-                    per_token_holders[addr]["market_cap_usd"] = market_cap
+                # Only store if there's actual data (holders or metrics)
+                if holders_raw or (isinstance(dist_metrics, dict) and dist_metrics):
+                    per_token_holders[addr] = {
+                        "holders": holders_raw,
+                        "score": dist_score,
+                        "holder_count": holder_count,
+                        "metrics": dist_metrics,
+                    }
+                    if market_cap is not None:
+                        per_token_holders[addr]["market_cap_usd"] = market_cap
+                else:
+                    LOGGER.warning(f"Skipping empty holder data for token {addr[:16]}...")
+            elif isinstance(token_dist, dict) and not token_dist:
+                LOGGER.warning(f"No token_distribution data for token {addr[:16]}...")
 
             # Collect liquidity pairs with token_address
             liq_data = token_result.get("liquidity", {})
@@ -439,10 +445,17 @@ class AuditOrchestrator:
 
             # Collect tokenomics per-token
             tok_data = token_result.get("tokenomics", {})
-            if isinstance(tok_data, dict):
-                if "per_token_tokenomics" not in aggregated:
-                    aggregated["per_token_tokenomics"] = {}
-                aggregated["per_token_tokenomics"][addr] = tok_data
+            if isinstance(tok_data, dict) and tok_data:
+                # Only store if there's actual data (metrics or score)
+                has_substantive = tok_data.get("metrics") or tok_data.get("score") is not None
+                if has_substantive:
+                    if "per_token_tokenomics" not in aggregated:
+                        aggregated["per_token_tokenomics"] = {}
+                    aggregated["per_token_tokenomics"][addr] = tok_data
+                else:
+                    LOGGER.warning(f"Skipping empty tokenomics data for token {addr[:16]}...")
+            elif isinstance(tok_data, dict) and not tok_data:
+                LOGGER.warning(f"No tokenomics data for token {addr[:16]}...")
 
         # Build aggregated output
         aggregated["per_token_holders"] = per_token_holders
