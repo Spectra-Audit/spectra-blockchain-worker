@@ -161,6 +161,7 @@ class AuditOrchestrator:
         chain_id: int,
         payment_id: Optional[str] = None,
         token_addresses: Optional[List[str]] = None,
+        contract_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> AuditResult:
         """Run full-spectrum audit for a project.
 
@@ -173,6 +174,8 @@ class AuditOrchestrator:
             chain_id: Chain ID
             payment_id: Optional payment identifier
             token_addresses: All token addresses for multi-token projects
+            contract_metadata: Per-contract metadata [{address, is_token, name}]
+                used to split tokens from non-token contracts.
 
         Returns:
             AuditResult with aggregated results
@@ -200,6 +203,7 @@ class AuditOrchestrator:
                 results = await self._collect_multi_token_audit_data(
                     token_addresses=addresses,
                     chain_id=chain_id,
+                    contract_metadata=contract_metadata,
                 )
             else:
                 # Single token: original path
@@ -359,27 +363,55 @@ class AuditOrchestrator:
         self,
         token_addresses: List[str],
         chain_id: int,
+        contract_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Collect audit data for multiple tokens and aggregate.
+        """Collect audit data for multiple contracts and aggregate.
 
-        Runs all scouts for each token with staggered starts to avoid
-        RPC rate limiting, then aggregates per-token holder/pair data
-        with token_address populated.
+        Uses contract_metadata (with is_token flag) to split contracts into
+        two groups:
+          - Token contracts (is_token=True): full audit (code + tokenomics +
+            distribution + liquidity)
+          - Non-token contracts (is_token=False): code audit only
+
+        If no metadata is provided, falls back to treating all contracts as
+        tokens (legacy behaviour).
 
         Args:
-            token_addresses: List of token contract addresses
+            token_addresses: List of contract addresses
             chain_id: Chain ID
+            contract_metadata: Per-contract metadata [{address, is_token, name}]
 
         Returns:
             Dictionary with aggregated multi-token audit data
         """
         import asyncio as _asyncio
 
-        # Stagger token audits to avoid burst RPC/API rate limiting.
-        # Each audit fires multiple API calls (Ethplorer, RPC, DexScreener)
-        # so launching 19+ simultaneously overwhelms free-tier providers.
-        # Use 3s delay to stay within Ethplorer freekey rate limits (~1 req/sec).
-        _STAGGER_DELAY = 3.0  # seconds between token audit starts
+        # Build is_token lookup from metadata
+        is_token_map: Dict[str, bool] = {}
+        if contract_metadata:
+            for cm in contract_metadata:
+                addr_key = (cm.get("address") or "").lower()
+                is_token_map[addr_key] = cm.get("is_token", False)
+
+        # Split addresses into tokens vs non-tokens
+        token_addrs: List[str] = []
+        non_token_addrs: List[str] = []
+        for addr in token_addresses:
+            if is_token_map.get(addr.lower(), True):
+                token_addrs.append(addr)
+            else:
+                non_token_addrs.append(addr)
+
+        LOGGER.info(
+            f"Multi-contract audit: {len(token_addrs)} token contracts "
+            f"(full audit), {len(non_token_addrs)} non-token contracts "
+            f"(code-only), total={len(token_addresses)}"
+        )
+
+        # Stagger delays: tokens use 3s (Ethplorer/DexScreener rate limits),
+        # non-tokens use 1s (code audit only, no external API calls).
+        _TOKEN_STAGGER = 3.0
+        _NONTOKEN_STAGGER = 1.0
 
         async def _staggered_collect(
             addr: str, delay: float, skip_expensive: bool = False
@@ -392,38 +424,45 @@ class AuditOrchestrator:
                 skip_expensive=skip_expensive,
             )
 
-        per_token_tasks = []
-        for idx, addr in enumerate(token_addresses):
-            # Only the primary token (index 0) gets expensive holder/tokenomics
-            # collection. Secondary tokens only get code audit + liquidity.
-            # This prevents Ethplorer freekey rate limits from being exhausted
-            # by 19 tokens each making 2+ API calls.
-            is_primary = idx == 0
+        per_token_tasks: List = []
+        addr_order: List[str] = []
+
+        # Schedule token contracts first (full audit, longer stagger)
+        for addr in token_addrs:
+            delay = len(per_token_tasks) * _TOKEN_STAGGER
             per_token_tasks.append(
-                _staggered_collect(
-                    addr,
-                    delay=idx * _STAGGER_DELAY,
-                    skip_expensive=not is_primary,
-                )
+                _staggered_collect(addr, delay=delay, skip_expensive=False)
             )
+            addr_order.append(addr)
+
+        # Schedule non-token contracts (code audit only, shorter stagger)
+        # Carry forward cumulative delay from token group so non-token
+        # audits don't overlap with still-running token API calls.
+        base_offset = len(token_addrs) * _TOKEN_STAGGER
+        for addr in non_token_addrs:
+            delay = base_offset + (len(per_token_tasks) - len(token_addrs)) * _NONTOKEN_STAGGER
+            per_token_tasks.append(
+                _staggered_collect(addr, delay=delay, skip_expensive=True)
+            )
+            addr_order.append(addr)
 
         per_token_results = await _asyncio.gather(
             *per_token_tasks,
             return_exceptions=True,
         )
 
-        # Aggregate results across tokens
+        # Aggregate results across all contracts
         aggregated: Dict[str, Any] = {}
         per_token_holders: Dict[str, Any] = {}
         all_pairs: list = []
         all_findings: list = []
 
-        for addr, token_result in zip(token_addresses, per_token_results):
+        for addr, token_result in zip(addr_order, per_token_results):
             if isinstance(token_result, Exception):
-                LOGGER.error(f"Failed to collect data for token {addr[:10]}...: {token_result}")
+                LOGGER.error(f"Failed to collect data for {addr[:10]}...: {token_result}")
                 continue
 
-            # Collect per-token holder data with token_address
+            # Collect per-token holder data (only token contracts will have this)
             token_dist = token_result.get("token_distribution", {})
             if isinstance(token_dist, dict) and token_dist:
                 holders_raw = token_dist.get("top_holders") or token_dist.get("holders") or []
@@ -431,7 +470,6 @@ class AuditOrchestrator:
                 dist_score = token_dist.get("score")
                 dist_metrics = token_dist.get("metrics")
                 market_cap = token_dist.get("market_cap_usd")
-                # Only store if there's actual data (holders or metrics)
                 if holders_raw or (isinstance(dist_metrics, dict) and dist_metrics):
                     per_token_holders[addr] = {
                         "holders": holders_raw,
@@ -442,11 +480,11 @@ class AuditOrchestrator:
                     if market_cap is not None:
                         per_token_holders[addr]["market_cap_usd"] = market_cap
                 else:
-                    LOGGER.warning(f"Skipping empty holder data for token {addr[:16]}...")
+                    LOGGER.warning(f"Skipping empty holder data for {addr[:16]}...")
             elif isinstance(token_dist, dict) and not token_dist:
-                LOGGER.warning(f"No token_distribution data for token {addr[:16]}...")
+                LOGGER.debug(f"No token_distribution data for {addr[:16]}...")
 
-            # Collect liquidity pairs with token_address
+            # Collect liquidity pairs (token contracts only — non-tokens skip this)
             liq_data = token_result.get("liquidity", {})
             if isinstance(liq_data, dict):
                 pairs = liq_data.get("pairs") or []
@@ -455,7 +493,7 @@ class AuditOrchestrator:
                         p["token_address"] = addr
                     all_pairs.append(p)
 
-            # Collect code audit findings
+            # Collect code audit findings from ALL contracts
             code_data = token_result.get("code_audit", {})
             if isinstance(code_data, dict):
                 findings = code_data.get("findings") or code_data.get("ai_audit_findings") or []
@@ -463,25 +501,23 @@ class AuditOrchestrator:
                 if "contract_audit" not in aggregated:
                     aggregated["contract_audit"] = code_data
 
-            # Collect tokenomics per-token
+            # Collect tokenomics per-token (only token contracts will have this)
             tok_data = token_result.get("tokenomics", {})
             if isinstance(tok_data, dict) and tok_data:
-                # Only store if there's actual data (metrics or score)
                 has_substantive = tok_data.get("metrics") or tok_data.get("score") is not None
                 if has_substantive:
                     if "per_token_tokenomics" not in aggregated:
                         aggregated["per_token_tokenomics"] = {}
                     aggregated["per_token_tokenomics"][addr] = tok_data
                 else:
-                    LOGGER.warning(f"Skipping empty tokenomics data for token {addr[:16]}...")
+                    LOGGER.warning(f"Skipping empty tokenomics data for {addr[:16]}...")
             elif isinstance(tok_data, dict) and not tok_data:
-                LOGGER.warning(f"No tokenomics data for token {addr[:16]}...")
+                LOGGER.debug(f"No tokenomics data for {addr[:16]}...")
 
-        # Build aggregated output — only include per-token dicts when they have entries
+        # Build aggregated output
         if per_token_holders:
             aggregated["per_token_holders"] = per_token_holders
         if "per_token_tokenomics" not in aggregated:
-            # Ensure the key is absent if no token ever had substantive data
             aggregated.pop("per_token_tokenomics", None)
         aggregated["liquidity"] = {"pairs": all_pairs}
         if all_findings:
@@ -490,26 +526,35 @@ class AuditOrchestrator:
         aggregated["token_count"] = len(token_addresses)
         aggregated["collected_at"] = datetime.utcnow().isoformat()
 
-        # Propagate top-level tokenomics and token_distribution from the primary
-        # token so the backend merge route (and frontend) can find them without
-        # needing per_token_* derivation.  The primary token (index 0) is the
-        # only one that runs the expensive holder/tokenomics scouts.
-        primary_addr = token_addresses[0] if token_addresses else None
-        if primary_addr:
+        # Propagate top-level tokenomics and token_distribution from the first
+        # TOKEN contract (not the first contract overall) so the backend merge
+        # route and frontend can find them without per_token_* derivation.
+        for primary_addr in token_addrs:
+            idx = addr_order.index(primary_addr) if primary_addr in addr_order else None
+            if idx is None:
+                continue
             _primary_result = (
-                per_token_results[0]
-                if per_token_results and not isinstance(per_token_results[0], Exception)
+                per_token_results[idx]
+                if per_token_results and not isinstance(per_token_results[idx], Exception)
                 else None
             )
-            if isinstance(_primary_result, dict):
-                _primary_tok = _primary_result.get("tokenomics")
-                if isinstance(_primary_tok, dict) and _primary_tok.get("metrics"):
-                    aggregated["tokenomics"] = _primary_tok
-                _primary_dist = _primary_result.get("token_distribution")
-                if isinstance(_primary_dist, dict) and (
-                    _primary_dist.get("metrics") or _primary_dist.get("top_holders") or _primary_dist.get("holders")
-                ):
-                    aggregated["token_distribution"] = _primary_dist
+            if not isinstance(_primary_result, dict):
+                continue
+
+            _primary_tok = _primary_result.get("tokenomics")
+            if isinstance(_primary_tok, dict) and _primary_tok.get("metrics"):
+                aggregated["tokenomics"] = _primary_tok
+            _primary_dist = _primary_result.get("token_distribution")
+            if isinstance(_primary_dist, dict) and (
+                _primary_dist.get("metrics")
+                or _primary_dist.get("top_holders")
+                or _primary_dist.get("holders")
+            ):
+                aggregated["token_distribution"] = _primary_dist
+
+            # Use first token that has data; stop when both keys present
+            if "tokenomics" in aggregated and "token_distribution" in aggregated:
+                break
 
         return aggregated
 

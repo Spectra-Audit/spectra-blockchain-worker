@@ -239,6 +239,25 @@ if HAS_FASTAPI:
             default=None,
             description="All token addresses for a multi-token project",
         )
+        contract_metadata: Optional[List[Dict[str, Any]]] = Field(
+            default=None,
+            description=(
+                "Per-contract metadata: [{address, is_token, name}]. "
+                "Worker uses is_token to decide which contracts get "
+                "tokenomics/distribution analysis vs code-audit-only."
+            ),
+        )
+
+        @validator("contract_metadata")
+        def validate_contract_metadata(cls, v):
+            if v is None:
+                return v
+            for entry in v:
+                if not isinstance(entry, dict):
+                    raise ValueError("Each contract_metadata entry must be a dict")
+                if "address" not in entry:
+                    raise ValueError("Each contract_metadata entry must have 'address'")
+            return v
 
         @validator("token_address")
         def validate_token_address(cls, v: str) -> str:
@@ -750,6 +769,7 @@ if HAS_FASTAPI:
             request.chain_id,
             request.force_full,
             request.token_addresses,
+            request.contract_metadata,
         )
 
         token_count = len(request.token_addresses) if request.token_addresses else 1
@@ -1342,6 +1362,7 @@ if HAS_FASTAPI:
         chain_id: int,
         force_full: bool,
         token_addresses: Optional[List[str]] = None,
+        contract_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Run audit task in a thread so the event loop stays responsive.
 
@@ -1355,6 +1376,7 @@ if HAS_FASTAPI:
             chain_id: Chain ID
             force_full: Whether to force full audit including static data
             token_addresses: All contract addresses (token + non-token) for the project
+            contract_metadata: Per-contract metadata with is_token flag
         """
         import functools
 
@@ -1381,6 +1403,7 @@ if HAS_FASTAPI:
                     token_address,
                     chain_id,
                     token_addresses,
+                    contract_metadata,
                 ),
             )
 
@@ -1436,6 +1459,7 @@ def _run_audit_sync(
     token_address: str,
     chain_id: int,
     token_addresses: Optional[List[str]] = None,
+    contract_metadata: Optional[List[Dict[str, Any]]] = None,
 ) -> Any:
     """Synchronous wrapper that runs the full audit in a **new** event loop.
 
@@ -1455,12 +1479,14 @@ def _run_audit_sync(
         token_address: Primary contract address
         chain_id: Chain ID
         token_addresses: All contract addresses (token + non-token) for the project
+        contract_metadata: Per-contract metadata with is_token flag
     """
     coro = orchestrator.run_full_audit(
         project_id=project_id,
         token_address=token_address,
         chain_id=chain_id,
         token_addresses=token_addresses,
+        contract_metadata=contract_metadata,
     )
     return asyncio.run(coro)
 
