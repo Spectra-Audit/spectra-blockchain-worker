@@ -260,24 +260,42 @@ def _do_background_initialization():
                 orchestrator = scout_app.audit_orchestrator
                 logger.info("[bg-init] Using ScoutApp's audit orchestrator")
             else:
-                logger.info("[bg-init] Creating unified audit service...")
-                unified_audit_service = create_unified_audit_service(
-                    database=scout_app.database,
-                    w3=w3,
-                    backend_client=scout_app.backend_client,
-                    token_holder_scout=None,
-                    liquidity_analyzer_scout=None,
-                    tokenomics_analyzer_scout=None,
+                # Reuse unified audit service from ScoutApp if available,
+                # otherwise create a new one.
+                unified_audit_service = (
+                    getattr(scout_app, 'unified_audit_service', None)
                 )
+                if not unified_audit_service:
+                    logger.info("[bg-init] Creating unified audit service...")
+                    unified_audit_service = create_unified_audit_service(
+                        database=scout_app.database,
+                        w3=w3,
+                        backend_client=scout_app.backend_client,
+                        token_holder_scout=scout_app.token_holder_scout,
+                        liquidity_analyzer_scout=scout_app.liquidity_analyzer_scout,
+                        tokenomics_analyzer_scout=scout_app.tokenomics_analyzer_scout,
+                    )
 
-                logger.info("[bg-init] Creating audit orchestrator...")
+                # Wire scout instances from ScoutApp into the orchestrator so
+                # Phase 1 async HTTP tasks (token_distribution, tokenomics,
+                # liquidity) actually execute for token contracts.
+                logger.info(
+                    "[bg-init] Creating audit orchestrator with scouts: "
+                    "token_holder=%s, tokenomics=%s, liquidity=%s",
+                    type(scout_app.token_holder_scout).__name__
+                    if scout_app.token_holder_scout else "None",
+                    type(scout_app.tokenomics_analyzer_scout).__name__
+                    if scout_app.tokenomics_analyzer_scout else "None",
+                    type(scout_app.liquidity_analyzer_scout).__name__
+                    if scout_app.liquidity_analyzer_scout else "None",
+                )
                 orchestrator = create_audit_orchestrator(
                     database=scout_app.database,
                     backend_client=scout_app.backend_client,
                     w3=w3,
-                    token_holder_scout=None,
-                    tokenomics_analyzer_scout=None,
-                    liquidity_analyzer_scout=None,
+                    token_holder_scout=scout_app.token_holder_scout,
+                    tokenomics_analyzer_scout=scout_app.tokenomics_analyzer_scout,
+                    liquidity_analyzer_scout=scout_app.liquidity_analyzer_scout,
                     unified_audit_service=unified_audit_service,
                 )
 
