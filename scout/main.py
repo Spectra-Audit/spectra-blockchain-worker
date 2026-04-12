@@ -264,7 +264,7 @@ class ScoutApp:
         # Initialize Tokenomics Analyzer Scout if enabled
         # IMPORTANT: Use the same api_manager as TokenHolderScout to avoid duplicate API calls
         tokenomics_analyzer_scout = None
-        if os.environ.get("ENABLE_TOKENOMICS_ANALYZER", "").lower() == "true":
+        if os.environ.get("ENABLE_TOKENOMICS_ANALYZER", "true").lower() == "true":
             try:
                 from .tokenomics_analyzer_scout import TokenomicsAnalyzerScout
 

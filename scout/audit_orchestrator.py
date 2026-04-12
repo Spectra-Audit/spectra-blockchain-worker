@@ -270,10 +270,12 @@ class AuditOrchestrator:
         tasks = []
 
         # Task 1: Token holder distribution (dynamic - weekly updates)
+        # force=True to always collect fresh data during audits
         if self.token_holder_scout:
             tasks.append(("token_distribution", self.token_holder_scout.collect_token_data(
                 token_address=token_address,
                 chain_id=chain_id,
+                force=True,
             )))
 
         # Task 2: Tokenomics analysis (NEW!)
