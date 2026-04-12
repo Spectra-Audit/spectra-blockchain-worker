@@ -262,102 +262,168 @@ class AuditOrchestrator:
         chain_id: int,
         skip_expensive: bool = False,
     ) -> Dict[str, Any]:
-        """Collect data from all audit services in parallel.
+        """Collect data from all audit services.
+
+        **Two-phase execution** to avoid event-loop starvation:
+          Phase 1 (async HTTP):  token_distribution, tokenomics, liquidity
+          Phase 2 (blocking):    code_audit (subprocess.run via claude-code CLI)
+
+        The code audit calls ``subprocess.run()`` which blocks the event loop
+        for up to 5 minutes per contract.  If token HTTP scouts and code audits
+        run inside the same ``asyncio.gather()``, the blocking subprocess calls
+        prevent async HTTP responses from being processed, causing token data
+        to silently time out or return None.  Running token scouts first
+        guarantees their results are available before the blocking phase starts.
 
         Args:
             token_address: Token contract address
             chain_id: Chain ID
             skip_expensive: If True, skip holder distribution and tokenomics
-                collection. Used for secondary tokens in multi-token audits to
-                avoid overwhelming Ethplorer freekey rate limits. Only code
-                audit and liquidity are collected when True.
+                collection. Used for non-token contracts in multi-contract
+                audits. Only code audit and liquidity are collected when True.
 
         Returns:
             Dictionary with all collected audit data
         """
-        results = {}
-        tasks = []
+        results: Dict[str, Any] = {}
 
-        # Task 1: Token holder distribution (dynamic - weekly updates)
-        # force=True to always collect fresh data during audits
-        # SKIPPED for secondary tokens in multi-token audits to save API budget
+        # ── Phase 1: async HTTP tasks (non-blocking) ──────────────────────
+        async_tasks: list = []
+
         if self.token_holder_scout and not skip_expensive:
-            tasks.append(("token_distribution", self.token_holder_scout.collect_token_data(
+            async_tasks.append(("token_distribution", self.token_holder_scout.collect_token_data(
                 token_address=token_address,
                 chain_id=chain_id,
                 force=True,
             )))
+            LOGGER.info("[PHASE1] Queued token_distribution for %s", token_address[:16])
 
-        # Task 2: Tokenomics analysis (NEW!)
-        # Note: TokenomicsAnalyzerScout will use cached holder data from database
-        # if available, avoiding duplicate API calls with TokenHolderScout
-        # SKIPPED for secondary tokens in multi-token audits to save API budget
         if self.tokenomics_analyzer_scout and not skip_expensive:
-            tasks.append(("tokenomics", self.tokenomics_analyzer_scout.analyze_tokenomics(
+            async_tasks.append(("tokenomics", self.tokenomics_analyzer_scout.analyze_tokenomics(
                 token_address=token_address,
                 chain_id=str(chain_id),
             )))
+            LOGGER.info("[PHASE1] Queued tokenomics for %s", token_address[:16])
 
-        # Task 3: Liquidity analysis
         if self.liquidity_analyzer_scout:
-            tasks.append(("liquidity", self.liquidity_analyzer_scout.analyze_liquidity(
+            async_tasks.append(("liquidity", self.liquidity_analyzer_scout.analyze_liquidity(
                 token_address=token_address,
                 chain_id="ethereum" if chain_id == 1 else str(chain_id),
             )))
+            LOGGER.info("[PHASE1] Queued liquidity for %s", token_address[:16])
 
-        # Task 4: Code audit (use unified audit service if available, otherwise fallback)
-        if self.unified_audit_service:
-            # Use new unified audit service (handles verified/unverified automatically)
-            tasks.append(("code_audit", self.unified_audit_service._audit_verified_contract(
-                token_address=token_address,
-                chain_id=chain_id,
-                force=False,
-            )))
-        elif self.contract_audit_scout:
-            # Fallback to legacy contract audit scout
-            tasks.append(("code_audit", self.contract_audit_scout.audit_contract(
-                token_address=token_address,
-                chain_id=chain_id,
-                force=False,
-            )))
-
-        # Run all tasks in parallel and collect results
-        if tasks:
-            import asyncio
+        if async_tasks:
             completed = await asyncio.gather(
-                *[task for _, task in tasks],
+                *[task for _, task in async_tasks],
                 return_exceptions=True,
             )
+            for (key, _), result in zip(async_tasks, completed):
+                self._store_task_result(results, key, result)
 
-            for (key, _), result in zip(tasks, completed):
-                if isinstance(result, Exception):
-                    # Check if it's a Web3 RPC error
-                    if hasattr(result, 'args') and result.args:
-                        error_dict = result.args[0] if isinstance(result.args[0], dict) else {}
-                        if 'code' in error_dict and error_dict['code'] == -32603:
-                            LOGGER.error(f"RPC error collecting {key}: {error_dict.get('message', 'Unknown error')}. This may be due to rate limiting or network issues.")
-                        else:
-                            LOGGER.error(f"Failed to collect {key}: {result}")
-                    else:
-                        LOGGER.error(f"Failed to collect {key}: {result}")
-                    results[key] = {
-                        "error": str(result),
-                        "error_type": type(result).__name__,
-                        "collected_at": datetime.utcnow().isoformat(),
-                    }
-                elif result:
-                    # Convert dataclass/result objects to dict for storage
-                    if hasattr(result, "__dict__"):
-                        results[key] = _serialize_for_json(result.__dict__)
-                    elif hasattr(result, "to_dict"):
-                        results[key] = _serialize_for_json(result.to_dict())
-                    else:
-                        results[key] = _serialize_for_json(result)
+        LOGGER.info(
+            "[PHASE1] Complete for %s: keys=%s",
+            token_address[:16], list(results.keys()),
+        )
+
+        # ── Phase 2: code audit (blocking subprocess) ─────────────────────
+        code_coro = None
+        if self.unified_audit_service:
+            code_coro = self.unified_audit_service._audit_verified_contract(
+                token_address=token_address,
+                chain_id=chain_id,
+                force=False,
+            )
+        elif self.contract_audit_scout:
+            code_coro = self.contract_audit_scout.audit_contract(
+                token_address=token_address,
+                chain_id=chain_id,
+                force=False,
+            )
+
+        if code_coro:
+            LOGGER.info("[PHASE2] Starting code_audit for %s", token_address[:16])
+            try:
+                code_result = await code_coro
+                self._store_task_result(results, "code_audit", code_result)
+            except Exception as exc:
+                LOGGER.error("[PHASE2] code_audit failed for %s: %s", token_address[:16], exc)
+                results["code_audit"] = {
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "collected_at": datetime.utcnow().isoformat(),
+                }
+            LOGGER.info(
+                "[PHASE2] code_audit done for %s: has_data=%s",
+                token_address[:16],
+                "code_audit" in results and "error" not in results.get("code_audit", {}),
+            )
 
         # Mark collection timestamp
         results["collected_at"] = datetime.utcnow().isoformat()
 
+        LOGGER.info(
+            "[COLLECT] All data for %s: final_keys=%s",
+            token_address[:16], list(results.keys()),
+        )
+
         return results
+
+    def _store_task_result(
+        self,
+        results: Dict[str, Any],
+        key: str,
+        result: Any,
+    ) -> None:
+        """Process a single task result and store it in the results dict.
+
+        Handles exceptions, None returns, dataclass objects, and plain dicts.
+        Always stores *something* for the key (error marker if needed) so that
+        upstream aggregation can distinguish "scout ran but failed" from
+        "scout was never scheduled".
+        """
+        if isinstance(result, Exception):
+            if hasattr(result, 'args') and result.args:
+                error_dict = result.args[0] if isinstance(result.args[0], dict) else {}
+                if 'code' in error_dict and error_dict['code'] == -32603:
+                    LOGGER.error(
+                        "[TASK] RPC error collecting %s: %s. "
+                        "This may be due to rate limiting or network issues.",
+                        key, error_dict.get('message', 'Unknown error'),
+                    )
+                else:
+                    LOGGER.error("[TASK] Failed to collect %s: %s", key, result)
+            else:
+                LOGGER.error("[TASK] Failed to collect %s: %s", key, result)
+            results[key] = {
+                "error": str(result),
+                "error_type": type(result).__name__,
+                "collected_at": datetime.utcnow().isoformat(),
+            }
+        elif result is None:
+            # Scout returned None -- log clearly so upstream can differentiate
+            # from "never scheduled".
+            LOGGER.warning(
+                "[TASK] Scout returned None for key=%s — no data available",
+                key,
+            )
+            results[key] = {
+                "error": "Scout returned None (no data)",
+                "error_type": "NoneResult",
+                "collected_at": datetime.utcnow().isoformat(),
+            }
+        elif result:
+            # Convert dataclass/result objects to dict for storage
+            if hasattr(result, "__dict__"):
+                results[key] = _serialize_for_json(result.__dict__)
+            elif hasattr(result, "to_dict"):
+                results[key] = _serialize_for_json(result.to_dict())
+            else:
+                results[key] = _serialize_for_json(result)
+            LOGGER.info(
+                "[TASK] Stored %s: result_keys=%s",
+                key,
+                list(results[key].keys()) if isinstance(results[key], dict) else type(results[key]).__name__,
+            )
 
     async def _collect_multi_token_audit_data(
         self,
@@ -458,13 +524,37 @@ class AuditOrchestrator:
         all_findings: list = []
 
         for addr, token_result in zip(addr_order, per_token_results):
+            is_token_addr = is_token_map.get(addr.lower(), True)
+
             if isinstance(token_result, Exception):
-                LOGGER.error(f"Failed to collect data for {addr[:10]}...: {token_result}")
+                LOGGER.error(
+                    "[AGG] Exception for %s (is_token=%s): %s",
+                    addr[:16], is_token_addr, token_result,
+                )
                 continue
+
+            # Log what each per-token result contains for diagnostics
+            if is_token_addr:
+                LOGGER.info(
+                    "[AGG] Token contract %s: result_keys=%s, "
+                    "has_token_distribution=%s, has_tokenomics=%s",
+                    addr[:16],
+                    list(token_result.keys()) if isinstance(token_result, dict) else type(token_result).__name__,
+                    "token_distribution" in token_result if isinstance(token_result, dict) else False,
+                    "tokenomics" in token_result if isinstance(token_result, dict) else False,
+                )
 
             # Collect per-token holder data (only token contracts will have this)
             token_dist = token_result.get("token_distribution", {})
             if isinstance(token_dist, dict) and token_dist:
+                # Skip error-only dicts (scout returned None or failed)
+                if token_dist.get("error_type"):
+                    LOGGER.warning(
+                        "[AGG] token_distribution for %s has error: %s",
+                        addr[:16], token_dist.get("error"),
+                    )
+                    continue
+
                 holders_raw = token_dist.get("top_holders") or token_dist.get("holders") or []
                 holder_count = token_dist.get("holder_count") or token_dist.get("total_holders")
                 dist_score = token_dist.get("score")
@@ -479,12 +569,25 @@ class AuditOrchestrator:
                     }
                     if market_cap is not None:
                         per_token_holders[addr]["market_cap_usd"] = market_cap
+                    LOGGER.info(
+                        "[AGG] Stored per_token_holders for %s: "
+                        "holders=%d, metrics_keys=%s",
+                        addr[:16],
+                        len(holders_raw),
+                        list(dist_metrics.keys()) if isinstance(dist_metrics, dict) else "None",
+                    )
                 else:
-                    LOGGER.warning(f"Skipping empty holder data for {addr[:16]}...")
+                    LOGGER.warning(
+                        "[AGG] Skipping empty holder data for %s: "
+                        "holders_raw=%d, dist_metrics=%s",
+                        addr[:16],
+                        len(holders_raw) if isinstance(holders_raw, list) else "not-a-list",
+                        type(dist_metrics).__name__,
+                    )
             elif isinstance(token_dist, dict) and not token_dist:
-                LOGGER.debug(f"No token_distribution data for {addr[:16]}...")
+                LOGGER.debug("[AGG] No token_distribution data for %s", addr[:16])
 
-            # Collect liquidity pairs (token contracts only — non-tokens skip this)
+            # Collect liquidity pairs (token contracts only -- non-tokens skip this)
             liq_data = token_result.get("liquidity", {})
             if isinstance(liq_data, dict):
                 pairs = liq_data.get("pairs") or []
@@ -504,15 +607,36 @@ class AuditOrchestrator:
             # Collect tokenomics per-token (only token contracts will have this)
             tok_data = token_result.get("tokenomics", {})
             if isinstance(tok_data, dict) and tok_data:
+                # Skip error-only dicts (scout returned None or failed)
+                if tok_data.get("error_type"):
+                    LOGGER.warning(
+                        "[AGG] tokenomics for %s has error: %s",
+                        addr[:16], tok_data.get("error"),
+                    )
+                    continue
+
                 has_substantive = tok_data.get("metrics") or tok_data.get("score") is not None
                 if has_substantive:
                     if "per_token_tokenomics" not in aggregated:
                         aggregated["per_token_tokenomics"] = {}
                     aggregated["per_token_tokenomics"][addr] = tok_data
+                    LOGGER.info(
+                        "[AGG] Stored per_token_tokenomics for %s: "
+                        "has_metrics=%s, score=%s",
+                        addr[:16],
+                        bool(tok_data.get("metrics")),
+                        tok_data.get("score"),
+                    )
                 else:
-                    LOGGER.warning(f"Skipping empty tokenomics data for {addr[:16]}...")
+                    LOGGER.warning(
+                        "[AGG] Skipping empty tokenomics for %s: "
+                        "keys=%s, score=%s",
+                        addr[:16],
+                        list(tok_data.keys()),
+                        tok_data.get("score"),
+                    )
             elif isinstance(tok_data, dict) and not tok_data:
-                LOGGER.debug(f"No tokenomics data for {addr[:16]}...")
+                LOGGER.debug("[AGG] No tokenomics data for %s", addr[:16])
 
         # Build aggregated output
         if per_token_holders:
@@ -539,11 +663,27 @@ class AuditOrchestrator:
                 else None
             )
             if not isinstance(_primary_result, dict):
+                LOGGER.warning(
+                    "[PROPAGATE] Primary token %s result is %s, skipping",
+                    primary_addr[:16],
+                    type(per_token_results[idx]).__name__ if idx is not None and idx < len(per_token_results) else "None",
+                )
                 continue
 
             _primary_tok = _primary_result.get("tokenomics")
             if isinstance(_primary_tok, dict) and _primary_tok.get("metrics"):
                 aggregated["tokenomics"] = _primary_tok
+                LOGGER.info(
+                    "[PROPAGATE] Set top-level tokenomics from %s: score=%s",
+                    primary_addr[:16], _primary_tok.get("score"),
+                )
+            elif _primary_tok:
+                LOGGER.warning(
+                    "[PROPAGATE] tokenomics for %s exists but has no metrics: keys=%s",
+                    primary_addr[:16],
+                    list(_primary_tok.keys()) if isinstance(_primary_tok, dict) else type(_primary_tok).__name__,
+                )
+
             _primary_dist = _primary_result.get("token_distribution")
             if isinstance(_primary_dist, dict) and (
                 _primary_dist.get("metrics")
@@ -551,10 +691,32 @@ class AuditOrchestrator:
                 or _primary_dist.get("holders")
             ):
                 aggregated["token_distribution"] = _primary_dist
+                LOGGER.info(
+                    "[PROPAGATE] Set top-level token_distribution from %s",
+                    primary_addr[:16],
+                )
+            elif _primary_dist:
+                LOGGER.warning(
+                    "[PROPAGATE] token_distribution for %s exists but has no "
+                    "metrics/holders: keys=%s",
+                    primary_addr[:16],
+                    list(_primary_dist.keys()) if isinstance(_primary_dist, dict) else type(_primary_dist).__name__,
+                )
 
             # Use first token that has data; stop when both keys present
             if "tokenomics" in aggregated and "token_distribution" in aggregated:
                 break
+
+        LOGGER.info(
+            "[MULTI-AGG] Final aggregated keys=%s, "
+            "has_tokenomics=%s, has_token_distribution=%s, "
+            "per_token_holders=%d addrs, per_token_tokenomics=%d addrs",
+            list(aggregated.keys()),
+            "tokenomics" in aggregated,
+            "token_distribution" in aggregated,
+            len(per_token_holders),
+            len(aggregated.get("per_token_tokenomics", {})),
+        )
 
         return aggregated
 

@@ -10,6 +10,7 @@ comprehensive analysis pass instead of 5 sequential agent calls.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -328,7 +329,13 @@ class ClaudeCodeOrchestrator:
                 len(code),
             )
 
-            result = subprocess.run(
+            # Run subprocess in a thread so the event loop stays responsive.
+            # Without this, subprocess.run() blocks the event loop for up to
+            # 5 minutes, starving concurrent async HTTP tasks (token_holder_scout,
+            # tokenomics_analyzer_scout, etc.) and causing them to time out
+            # silently.
+            result = await asyncio.to_thread(
+                subprocess.run,
                 cmd,
                 input=prompt,
                 capture_output=True,
