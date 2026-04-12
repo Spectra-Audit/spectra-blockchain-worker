@@ -490,6 +490,27 @@ class AuditOrchestrator:
         aggregated["token_count"] = len(token_addresses)
         aggregated["collected_at"] = datetime.utcnow().isoformat()
 
+        # Propagate top-level tokenomics and token_distribution from the primary
+        # token so the backend merge route (and frontend) can find them without
+        # needing per_token_* derivation.  The primary token (index 0) is the
+        # only one that runs the expensive holder/tokenomics scouts.
+        primary_addr = token_addresses[0] if token_addresses else None
+        if primary_addr:
+            _primary_result = (
+                per_token_results[0]
+                if per_token_results and not isinstance(per_token_results[0], Exception)
+                else None
+            )
+            if isinstance(_primary_result, dict):
+                _primary_tok = _primary_result.get("tokenomics")
+                if isinstance(_primary_tok, dict) and _primary_tok.get("metrics"):
+                    aggregated["tokenomics"] = _primary_tok
+                _primary_dist = _primary_result.get("token_distribution")
+                if isinstance(_primary_dist, dict) and (
+                    _primary_dist.get("metrics") or _primary_dist.get("top_holders") or _primary_dist.get("holders")
+                ):
+                    aggregated["token_distribution"] = _primary_dist
+
         return aggregated
 
     async def _generate_and_store_summary(
