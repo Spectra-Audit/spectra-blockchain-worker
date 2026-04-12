@@ -81,6 +81,9 @@ class EthplorerHolderProvider(HolderAPIProvider):
         self.base_url: Optional[str] = None
         self._ep_session: Optional[aiohttp.ClientSession] = None
         self._sessions_loop_id: Optional[int] = None
+        # Rate limiter: freekey allows ~2 req/sec, personal key ~10 req/sec
+        self._min_interval = 0.5 if api_key == "freekey" else 0.1
+        self._last_request_time: float = 0.0
 
     def _get_base_url(self, chain_id: int) -> str:
         """Get base URL for a given chain.
@@ -98,6 +101,15 @@ class EthplorerHolderProvider(HolderAPIProvider):
         if not base_url:
             raise ValueError(f"Chain {chain_id} not supported by Ethplorer")
         return base_url
+
+    async def _rate_limit(self) -> None:
+        """Enforce minimum interval between API requests."""
+        import time
+        now = time.monotonic()
+        elapsed = now - self._last_request_time
+        if elapsed < self._min_interval:
+            await asyncio.sleep(self._min_interval - elapsed)
+        self._last_request_time = time.monotonic()
 
     async def _get_ep_session(self, base_url: str) -> aiohttp.ClientSession:
         """Get or create Ethplorer HTTP session for a specific base URL.
@@ -157,6 +169,7 @@ class EthplorerHolderProvider(HolderAPIProvider):
         base_url = self._get_base_url(chain_id)
 
         try:
+            await self._rate_limit()
             session = await self._get_ep_session(base_url)
             url = f"/getTokenInfo/{token_address}"
 
@@ -206,6 +219,7 @@ class EthplorerHolderProvider(HolderAPIProvider):
             limit = 100
 
         try:
+            await self._rate_limit()
             session = await self._get_ep_session(base_url)
             url = f"/getTopTokenHolders/{token_address}"
 
@@ -285,6 +299,7 @@ class EthplorerHolderProvider(HolderAPIProvider):
         base_url = self._get_base_url(chain_id)
 
         try:
+            await self._rate_limit()
             session = await self._get_ep_session(base_url)
             url = f"/getTokenInfo/{token_address}"
 

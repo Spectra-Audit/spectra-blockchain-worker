@@ -368,10 +368,11 @@ class AuditOrchestrator:
         """
         import asyncio as _asyncio
 
-        # Stagger token audits to avoid burst RPC rate limiting.
-        # Each audit fires multiple RPC calls (eth_getCode, eth_call, etc.)
+        # Stagger token audits to avoid burst RPC/API rate limiting.
+        # Each audit fires multiple API calls (Ethplorer, RPC, DexScreener)
         # so launching 19+ simultaneously overwhelms free-tier providers.
-        _STAGGER_DELAY = 1.0  # seconds between token audit starts
+        # Use 3s delay to stay within Ethplorer freekey rate limits (~1 req/sec).
+        _STAGGER_DELAY = 3.0  # seconds between token audit starts
 
         async def _staggered_collect(addr: str, delay: float) -> Dict[str, Any]:
             if delay > 0:
