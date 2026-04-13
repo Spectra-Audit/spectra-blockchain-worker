@@ -283,6 +283,65 @@ class HolderAPIManager:
 
         return None
 
+    async def get_token_decimals(
+        self,
+        token_address: str,
+        chain_id: int,
+    ) -> int:
+        """Get token decimals from contract via RPC.
+
+        Uses eth_call to invoke the ERC20 decimals() function.
+        The function selector for decimals() is 0x313ce567.
+
+        Args:
+            token_address: Token contract address
+            chain_id: Chain ID
+
+        Returns:
+            Token decimals (defaults to 18 if call fails)
+        """
+        if not self.database:
+            LOGGER.debug("Cannot get decimals: no database manager configured, defaulting to 18")
+            return 18
+
+        rpc_mgr = None
+        try:
+            from scout.shared_rpc_manager import create_rpc_manager
+
+            rpc_mgr = create_rpc_manager(chain_id, self.database)
+
+            provider = rpc_mgr.get_healthy_providers()
+            if not provider:
+                LOGGER.warning(f"No healthy RPC providers for chain {chain_id}, defaulting decimals to 18")
+                return 18
+
+            provider = provider[0]
+
+            # ERC20 decimals() function call
+            # Function selector: 0x313ce567 (keccak256("decimals()")[:4])
+            call_payload = {
+                "to": token_address,
+                "data": "0x313ce567"
+            }
+
+            result = await provider.make_request(
+                "eth_call",
+                [call_payload, "latest"]
+            )
+
+            if result and isinstance(result, str):
+                decimals = int(result, 16) if result.startswith("0x") else int(result)
+                LOGGER.info(f"Got decimals for {token_address[:10]}...: {decimals}")
+                return decimals
+
+        except Exception as e:
+            LOGGER.warning(f"Failed to get decimals for {token_address}: {e}, defaulting to 18")
+        finally:
+            if rpc_mgr:
+                await rpc_mgr.close()
+
+        return 18
+
     async def get_holder_data(
         self,
         token_address: str,
@@ -314,6 +373,7 @@ class HolderAPIManager:
                 if cached_count is not None:
                     # Calculate metrics from cached data
                     total_supply = await self.get_total_supply(token_address, chain_id)
+                    decimals = await self.get_token_decimals(token_address, chain_id)
                     final_holder_count = cached_count if cached_count is not None else len(cached_holders)
                     price_usd = await self._fetch_price_usd(token_address, chain_id)
                     metrics_dict = self._calculate_metrics(
@@ -321,6 +381,7 @@ class HolderAPIManager:
                         final_holder_count,
                         total_supply,
                         price_usd=price_usd,
+                        decimals=decimals,
                     )
                     LOGGER.info(
                         f"Cache hit for {token_address[:10]}... on chain {chain_id} "
@@ -394,12 +455,14 @@ class HolderAPIManager:
                         LOGGER.info(f"Using holder count from API: {holder_count}")
 
                     # Calculate metrics with real total supply
+                    decimals = await self.get_token_decimals(token_address, chain_id)
                     price_usd = await self._fetch_price_usd(token_address, chain_id)
                     metrics_dict = self._calculate_metrics(
                         top_holders,
                         final_holder_count,
                         total_supply,
                         price_usd=price_usd,
+                        decimals=decimals,
                     )
 
                     LOGGER.info(
@@ -459,6 +522,7 @@ class HolderAPIManager:
         total_count: int,
         total_supply: Optional[int] = None,
         price_usd: Optional[float] = None,
+        decimals: int = 18,
     ) -> Dict:
         """Calculate distribution metrics from holder data.
 
@@ -469,6 +533,8 @@ class HolderAPIManager:
             holders: List of holder data (sorted by balance descending)
             total_count: Total holder count (for percentage calculations)
             total_supply: Optional total supply from contract call (estimated if None)
+            price_usd: Optional token price in USD for tier classification
+            decimals: Token decimals for converting raw balances (default: 18)
 
         Returns:
             Dictionary with calculated metrics
@@ -542,7 +608,8 @@ class HolderAPIManager:
             "top_100_balance_sum": top_100_sum_hex,
             "estimated_total_supply": estimated_total_supply_hex,
             "holder_tiers": self._calculate_holder_tiers(
-                filtered_holders, total_count, estimated_total_supply, price_usd
+                filtered_holders, total_count, estimated_total_supply, price_usd,
+                decimals=decimals,
             ) if price_usd and price_usd > 0 else None,
         }
 
@@ -552,10 +619,11 @@ class HolderAPIManager:
         total_count: int,
         total_supply: int,
         price_usd: float,
+        decimals: int = 18,
     ) -> Optional[List[Dict]]:
         """Classify holders into USD-based tier buckets (Etherscan-style).
 
-        Known holders are classified exactly by balance * price_usd.
+        Known holders are classified exactly by (balance / 10^decimals) * price_usd.
         Remaining holders are estimated by average remaining balance.
 
         Args:
@@ -563,6 +631,7 @@ class HolderAPIManager:
             total_count: Total holder count
             total_supply: Effective total supply (burned tokens already excluded)
             price_usd: Current token price in USD
+            decimals: Token decimals for converting raw balances (default: 18)
 
         Returns:
             List of tier dicts or None if price_usd is invalid
@@ -577,8 +646,10 @@ class HolderAPIManager:
         ]
 
         known_supply = 0
+        decimals_divisor = 10 ** decimals
         for h in holders:
-            usd_value = h.balance * price_usd
+            token_amount = h.balance / decimals_divisor
+            usd_value = token_amount * price_usd
             known_supply += h.balance
 
             # Classify: find highest tier whose min_usd threshold is met
@@ -594,7 +665,8 @@ class HolderAPIManager:
 
         if remaining_count > 0 and remaining_supply > 0:
             avg_balance = remaining_supply / remaining_count
-            avg_usd = avg_balance * price_usd
+            avg_token_amount = avg_balance / decimals_divisor
+            avg_usd = avg_token_amount * price_usd
             for bucket in buckets:
                 if avg_usd >= bucket["min_usd"]:
                     bucket["holders"] += remaining_count
