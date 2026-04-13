@@ -305,7 +305,7 @@ class AuditOrchestrator:
             )))
             LOGGER.info("[PHASE1] Queued tokenomics for %s", token_address[:16])
 
-        if self.liquidity_analyzer_scout:
+        if self.liquidity_analyzer_scout and not skip_expensive:
             async_tasks.append(("liquidity", self.liquidity_analyzer_scout.analyze_liquidity(
                 token_address=token_address,
                 chain_id="ethereum" if chain_id == 1 else str(chain_id),
@@ -533,110 +533,83 @@ class AuditOrchestrator:
                 )
                 continue
 
-            # Log what each per-token result contains for diagnostics
+            if not isinstance(token_result, dict):
+                LOGGER.warning("[AGG] Non-dict result for %s: %s", addr[:16], type(token_result).__name__)
+                continue
+
+            # --- Token-specific data (distribution, liquidity, tokenomics) ---
             if is_token_addr:
                 LOGGER.info(
-                    "[AGG] Token contract %s: result_keys=%s, "
-                    "has_token_distribution=%s, has_tokenomics=%s",
+                    "[AGG] Token contract %s: result_keys=%s",
                     addr[:16],
-                    list(token_result.keys()) if isinstance(token_result, dict) else type(token_result).__name__,
-                    "token_distribution" in token_result if isinstance(token_result, dict) else False,
-                    "tokenomics" in token_result if isinstance(token_result, dict) else False,
+                    list(token_result.keys()),
                 )
 
-            # Collect per-token holder data (only token contracts will have this)
-            token_dist = token_result.get("token_distribution", {})
-            if isinstance(token_dist, dict) and token_dist:
-                # Skip error-only dicts (scout returned None or failed)
-                if token_dist.get("error_type"):
+                # Collect per-token holder data
+                token_dist = token_result.get("token_distribution")
+                if isinstance(token_dist, dict) and token_dist and not token_dist.get("error_type"):
+                    holders_raw = token_dist.get("top_holders") or token_dist.get("holders") or []
+                    holder_count = token_dist.get("holder_count") or token_dist.get("total_holders")
+                    dist_score = token_dist.get("score")
+                    dist_metrics = token_dist.get("metrics")
+                    market_cap = token_dist.get("market_cap_usd")
+                    if holders_raw or (isinstance(dist_metrics, dict) and dist_metrics):
+                        per_token_holders[addr] = {
+                            "holders": holders_raw,
+                            "score": dist_score,
+                            "holder_count": holder_count,
+                            "metrics": dist_metrics,
+                        }
+                        if market_cap is not None:
+                            per_token_holders[addr]["market_cap_usd"] = market_cap
+                        LOGGER.info(
+                            "[AGG] Stored per_token_holders for %s: holders=%d",
+                            addr[:16], len(holders_raw),
+                        )
+                elif token_dist and isinstance(token_dist, dict) and token_dist.get("error_type"):
                     LOGGER.warning(
                         "[AGG] token_distribution for %s has error: %s",
                         addr[:16], token_dist.get("error"),
                     )
-                    continue
 
-                holders_raw = token_dist.get("top_holders") or token_dist.get("holders") or []
-                holder_count = token_dist.get("holder_count") or token_dist.get("total_holders")
-                dist_score = token_dist.get("score")
-                dist_metrics = token_dist.get("metrics")
-                market_cap = token_dist.get("market_cap_usd")
-                if holders_raw or (isinstance(dist_metrics, dict) and dist_metrics):
-                    per_token_holders[addr] = {
-                        "holders": holders_raw,
-                        "score": dist_score,
-                        "holder_count": holder_count,
-                        "metrics": dist_metrics,
-                    }
-                    if market_cap is not None:
-                        per_token_holders[addr]["market_cap_usd"] = market_cap
-                    LOGGER.info(
-                        "[AGG] Stored per_token_holders for %s: "
-                        "holders=%d, metrics_keys=%s",
-                        addr[:16],
-                        len(holders_raw),
-                        list(dist_metrics.keys()) if isinstance(dist_metrics, dict) else "None",
-                    )
-                else:
-                    LOGGER.warning(
-                        "[AGG] Skipping empty holder data for %s: "
-                        "holders_raw=%d, dist_metrics=%s",
-                        addr[:16],
-                        len(holders_raw) if isinstance(holders_raw, list) else "not-a-list",
-                        type(dist_metrics).__name__,
-                    )
-            elif isinstance(token_dist, dict) and not token_dist:
-                LOGGER.debug("[AGG] No token_distribution data for %s", addr[:16])
+                # Collect liquidity pairs
+                liq_data = token_result.get("liquidity")
+                if isinstance(liq_data, dict):
+                    pairs = liq_data.get("pairs") or []
+                    for p in pairs:
+                        if isinstance(p, dict):
+                            p["token_address"] = addr
+                        all_pairs.append(p)
 
-            # Collect liquidity pairs (token contracts only -- non-tokens skip this)
-            liq_data = token_result.get("liquidity", {})
-            if isinstance(liq_data, dict):
-                pairs = liq_data.get("pairs") or []
-                for p in pairs:
-                    if isinstance(p, dict):
-                        p["token_address"] = addr
-                    all_pairs.append(p)
+                # Collect tokenomics per-token
+                tok_data = token_result.get("tokenomics")
+                if isinstance(tok_data, dict) and tok_data:
+                    if tok_data.get("error_type"):
+                        LOGGER.warning(
+                            "[AGG] tokenomics for %s has error: %s",
+                            addr[:16], tok_data.get("error"),
+                        )
+                    elif tok_data.get("metrics") or tok_data.get("score") is not None:
+                        if "per_token_tokenomics" not in aggregated:
+                            aggregated["per_token_tokenomics"] = {}
+                        aggregated["per_token_tokenomics"][addr] = tok_data
+                        LOGGER.info(
+                            "[AGG] Stored per_token_tokenomics for %s: score=%s",
+                            addr[:16], tok_data.get("score"),
+                        )
+                    else:
+                        LOGGER.warning(
+                            "[AGG] Skipping empty tokenomics for %s: keys=%s",
+                            addr[:16], list(tok_data.keys()),
+                        )
 
-            # Collect code audit findings from ALL contracts
-            code_data = token_result.get("code_audit", {})
+            # --- Code audit findings from ALL contracts (token + non-token) ---
+            code_data = token_result.get("code_audit")
             if isinstance(code_data, dict):
                 findings = code_data.get("findings") or code_data.get("ai_audit_findings") or []
                 all_findings.extend(findings)
                 if "contract_audit" not in aggregated:
                     aggregated["contract_audit"] = code_data
-
-            # Collect tokenomics per-token (only token contracts will have this)
-            tok_data = token_result.get("tokenomics", {})
-            if isinstance(tok_data, dict) and tok_data:
-                # Skip error-only dicts (scout returned None or failed)
-                if tok_data.get("error_type"):
-                    LOGGER.warning(
-                        "[AGG] tokenomics for %s has error: %s",
-                        addr[:16], tok_data.get("error"),
-                    )
-                    continue
-
-                has_substantive = tok_data.get("metrics") or tok_data.get("score") is not None
-                if has_substantive:
-                    if "per_token_tokenomics" not in aggregated:
-                        aggregated["per_token_tokenomics"] = {}
-                    aggregated["per_token_tokenomics"][addr] = tok_data
-                    LOGGER.info(
-                        "[AGG] Stored per_token_tokenomics for %s: "
-                        "has_metrics=%s, score=%s",
-                        addr[:16],
-                        bool(tok_data.get("metrics")),
-                        tok_data.get("score"),
-                    )
-                else:
-                    LOGGER.warning(
-                        "[AGG] Skipping empty tokenomics for %s: "
-                        "keys=%s, score=%s",
-                        addr[:16],
-                        list(tok_data.keys()),
-                        tok_data.get("score"),
-                    )
-            elif isinstance(tok_data, dict) and not tok_data:
-                LOGGER.debug("[AGG] No tokenomics data for %s", addr[:16])
 
         # Build aggregated output
         if per_token_holders:
