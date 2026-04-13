@@ -38,6 +38,15 @@ from scout.rate_limiter import AsyncRateLimiter, get_rate_limiter
 
 LOGGER = logging.getLogger(__name__)
 
+# Holder tier thresholds for USD-based classification (Etherscan-style)
+HOLDER_TIER_THRESHOLDS = [
+    {"tier": "WHALE",   "label": "Whale (>$100K)",     "emoji": "🐋", "min_usd": 100_000},
+    {"tier": "SHARK",   "label": "Shark ($10K-$100K)", "emoji": "🦈", "min_usd": 10_000},
+    {"tier": "DOLPHIN", "label": "Dolphin ($1K-$10K)", "emoji": "🐬", "min_usd": 1_000},
+    {"tier": "FISH",    "label": "Fish ($100-$1K)",    "emoji": "🐟", "min_usd": 100},
+    {"tier": "CRAB",    "label": "Crab ($10-$100)",    "emoji": "🦀", "min_usd": 10},
+    {"tier": "SHRIMP",  "label": "Shrimp (<$10)",      "emoji": "🦐", "min_usd": 0},
+]
 
 class HolderAPIManager:
     """Manages multiple holder API providers with automatic failover.
@@ -306,10 +315,12 @@ class HolderAPIManager:
                     # Calculate metrics from cached data
                     total_supply = await self.get_total_supply(token_address, chain_id)
                     final_holder_count = cached_count if cached_count is not None else len(cached_holders)
+                    price_usd = await self._fetch_price_usd(token_address, chain_id)
                     metrics_dict = self._calculate_metrics(
                         cached_holders,
                         final_holder_count,
-                        total_supply
+                        total_supply,
+                        price_usd=price_usd,
                     )
                     LOGGER.info(
                         f"Cache hit for {token_address[:10]}... on chain {chain_id} "
@@ -383,10 +394,12 @@ class HolderAPIManager:
                         LOGGER.info(f"Using holder count from API: {holder_count}")
 
                     # Calculate metrics with real total supply
+                    price_usd = await self._fetch_price_usd(token_address, chain_id)
                     metrics_dict = self._calculate_metrics(
                         top_holders,
                         final_holder_count,
-                        total_supply
+                        total_supply,
+                        price_usd=price_usd,
                     )
 
                     LOGGER.info(
@@ -418,11 +431,34 @@ class HolderAPIManager:
         LOGGER.error(f"All providers failed for {token_address} on chain {chain_id}")
         return None
 
+    async def _fetch_price_usd(
+        self, token_address: str, chain_id: int,
+    ) -> Optional[float]:
+        """Fetch current token price from DexScreener for tier classification."""
+        try:
+            from scout.dexscreener_client import DexScreenerClient
+            dex_client = DexScreenerClient()
+            chain_str = "ethereum" if chain_id == 1 else str(chain_id)
+            pairs = await dex_client.get_token_pairs(
+                chain_str, token_address, fetch_detailed=False,
+            )
+            price = None
+            if pairs and pairs[0].price_usd:
+                price = float(pairs[0].price_usd)
+            await dex_client.close()
+            if price:
+                LOGGER.info(f"DexScreener price for {token_address[:10]}...: ${price}")
+            return price
+        except Exception as e:
+            LOGGER.warning(f"Failed to fetch price for tier classification: {e}")
+            return None
+
     def _calculate_metrics(
         self,
         holders: List[HolderData],
         total_count: int,
         total_supply: Optional[int] = None,
+        price_usd: Optional[float] = None,
     ) -> Dict:
         """Calculate distribution metrics from holder data.
 
@@ -505,7 +541,81 @@ class HolderAPIManager:
             "top_1_pct_supply": round(top_1_pct, 3),
             "top_100_balance_sum": top_100_sum_hex,
             "estimated_total_supply": estimated_total_supply_hex,
+            "holder_tiers": self._calculate_holder_tiers(
+                filtered_holders, total_count, estimated_total_supply, price_usd
+            ) if price_usd and price_usd > 0 else None,
         }
+
+    def _calculate_holder_tiers(
+        self,
+        holders: List[HolderData],
+        total_count: int,
+        total_supply: int,
+        price_usd: float,
+    ) -> Optional[List[Dict]]:
+        """Classify holders into USD-based tier buckets (Etherscan-style).
+
+        Known holders are classified exactly by balance * price_usd.
+        Remaining holders are estimated by average remaining balance.
+
+        Args:
+            holders: Filtered holder data (dead address already excluded)
+            total_count: Total holder count
+            total_supply: Effective total supply (burned tokens already excluded)
+            price_usd: Current token price in USD
+
+        Returns:
+            List of tier dicts or None if price_usd is invalid
+        """
+        if not price_usd or price_usd <= 0 or total_count <= 0 or total_supply <= 0:
+            return None
+
+        # Initialize tier buckets
+        buckets = [
+            {**t, "holders": 0, "supply": 0}
+            for t in HOLDER_TIER_THRESHOLDS
+        ]
+
+        known_supply = 0
+        for h in holders:
+            usd_value = h.balance * price_usd
+            known_supply += h.balance
+
+            # Classify: find highest tier whose min_usd threshold is met
+            for bucket in buckets:
+                if usd_value >= bucket["min_usd"]:
+                    bucket["holders"] += 1
+                    bucket["supply"] += h.balance
+                    break
+
+        # Estimate remaining holders
+        remaining_count = max(total_count - len(holders), 0)
+        remaining_supply = max(total_supply - known_supply, 0)
+
+        if remaining_count > 0 and remaining_supply > 0:
+            avg_balance = remaining_supply / remaining_count
+            avg_usd = avg_balance * price_usd
+            for bucket in buckets:
+                if avg_usd >= bucket["min_usd"]:
+                    bucket["holders"] += remaining_count
+                    bucket["supply"] += remaining_supply
+                    break
+
+        # Build result with percentages
+        result = []
+        for b in buckets:
+            holders_pct = (b["holders"] / total_count * 100) if total_count > 0 else 0
+            supply_pct = (b["supply"] / total_supply * 100) if total_supply > 0 else 0
+            result.append({
+                "tier": b["tier"],
+                "label": b["label"],
+                "emoji": b["emoji"],
+                "holders": b["holders"],
+                "holders_pct": round(holders_pct, 2),
+                "supply_pct": round(supply_pct, 2),
+            })
+
+        return result
 
     def _calculate_gini(self, balances: List[int]) -> float:
         """Calculate Gini coefficient from balance list.
