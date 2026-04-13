@@ -1822,9 +1822,57 @@ class DatabaseManager:
     # Tokenomics analysis -----------------------------------------------
 
     def ensure_tokenomics_schema(self) -> None:
-        """Ensure tokenomics analysis tables exist."""
+        """Ensure tokenomics analysis tables exist.
+
+        Handles migration from old schema where total_supply/max_supply
+        were INTEGER columns (which overflow for large token supplies).
+        """
 
         with self.write_connection() as conn:
+            # Check if existing table has INTEGER total_supply column
+            # and migrate to TEXT if needed.
+            try:
+                cols = conn.execute("PRAGMA table_info(tokenomics_analysis_snapshots)").fetchall()
+                if cols:
+                    col_types = {row[1]: row[2] for row in cols}
+                    if col_types.get("total_supply", "").upper() == "INTEGER":
+                        import logging
+                        logging.getLogger(__name__).info(
+                            "Migrating tokenomics_analysis_snapshots: "
+                            "total_supply/max_supply INTEGER -> TEXT"
+                        )
+                        # SQLite doesn't support ALTER COLUMN, so recreate
+                        conn.executescript("""
+                            ALTER TABLE tokenomics_analysis_snapshots RENAME TO _old_tokenomics;
+                            CREATE TABLE tokenomics_analysis_snapshots (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                token_address TEXT NOT NULL,
+                                chain_id TEXT NOT NULL,
+                                total_supply TEXT NOT NULL,
+                                max_supply TEXT,
+                                supply_tier TEXT NOT NULL,
+                                total_holders INTEGER NOT NULL,
+                                top_10_holder_pct REAL NOT NULL,
+                                contract_holder_pct REAL NOT NULL,
+                                staking_contract_pct REAL NOT NULL,
+                                gini_coefficient REAL NOT NULL,
+                                nakamoto_coefficient INTEGER NOT NULL,
+                                utility_flags TEXT,
+                                vesting_flags TEXT,
+                                tokenomics_score REAL NOT NULL,
+                                risk_level TEXT NOT NULL,
+                                flags TEXT,
+                                recommendations TEXT,
+                                analyzed_at TEXT NOT NULL,
+                                UNIQUE(token_address, chain_id, analyzed_at)
+                            );
+                            INSERT OR IGNORE INTO tokenomics_analysis_snapshots
+                                SELECT * FROM _old_tokenomics;
+                            DROP TABLE _old_tokenomics;
+                        """)
+            except Exception:
+                pass  # Table doesn't exist yet, create below
+
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS tokenomics_analysis_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

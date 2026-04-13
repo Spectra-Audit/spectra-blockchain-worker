@@ -426,6 +426,9 @@ class HolderAPIManager:
     ) -> Dict:
         """Calculate distribution metrics from holder data.
 
+        Dead address (0x...dEaD) is excluded from gini/nakamoto calculations
+        and its balance is subtracted from total supply (burned tokens).
+
         Args:
             holders: List of holder data (sorted by balance descending)
             total_count: Total holder count (for percentage calculations)
@@ -444,30 +447,50 @@ class HolderAPIManager:
                 "estimated_total_supply": "0x0",
             }
 
-        balances = [h.balance for h in holders]
+        # Exclude dead address from concentration metrics
+        DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD".lower()
+        dead_balance = 0
+        filtered_holders = []
+        for h in holders:
+            if h.address.lower() == DEAD_ADDRESS:
+                dead_balance = h.balance
+                LOGGER.info(f"Excluding dead address from metrics: balance={h.balance}")
+            else:
+                filtered_holders.append(h)
+
+        balances = [h.balance for h in filtered_holders]
         top_100_sum = sum(balances)
 
-        # Use real total supply from contract call, or estimate from top 100
-        if total_supply is None:
+        # Subtract burned tokens from total supply
+        if total_supply is not None:
+            effective_supply = total_supply - dead_balance
+            LOGGER.info(
+                f"Adjusted total supply for burned tokens: "
+                f"{total_supply} - {dead_balance} = {effective_supply}"
+            )
+            estimated_total_supply = max(effective_supply, 0)
+        elif dead_balance > 0:
+            # Estimate minus burned
+            estimated_total_supply = max(top_100_sum * 2 - dead_balance, 0)
+            LOGGER.debug("Using estimated supply adjusted for burned tokens")
+        else:
             estimated_total_supply = top_100_sum * 2
             LOGGER.debug("Using estimated total supply (top_100_sum * 2)")
-        else:
-            estimated_total_supply = total_supply
-            LOGGER.debug(f"Using real total supply from contract: {total_supply}")
 
         # Convert to hex strings for TEXT storage in database
         top_100_sum_hex = f"0x{top_100_sum:x}"
         estimated_total_supply_hex = f"0x{estimated_total_supply:x}"
 
-        # Gini coefficient
+        # Gini coefficient (excludes dead address)
         gini = self._calculate_gini(balances)
 
-        # Nakamoto coefficient (holders for 51% of top 100 sum)
+        # Nakamoto coefficient (holders for 51%, excludes dead address)
         nakamoto = self._calculate_nakamoto(balances, top_100_sum)
 
-        # Top 10% and 1% of holders (of total count)
-        top_10_n = max(1, total_count // 10) if total_count > 0 else 10
-        top_1_n = max(1, total_count // 100) if total_count > 0 else 1
+        # Top 10% and 1% of holders (adjust count for dead address removal)
+        effective_count = max(total_count - (1 if dead_balance > 0 else 0), 1)
+        top_10_n = max(1, effective_count // 10) if effective_count > 0 else 10
+        top_1_n = max(1, effective_count // 100) if effective_count > 0 else 1
 
         top_10_sum = sum(balances[:min(top_10_n, len(balances))])
         top_1_sum = sum(balances[:min(top_1_n, len(balances))])

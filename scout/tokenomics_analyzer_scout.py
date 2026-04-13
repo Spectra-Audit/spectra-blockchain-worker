@@ -832,27 +832,34 @@ class TokenomicsAnalyzerScout:
         risk_level: str,
         recommendations: List[str],
     ) -> None:
-        """Store analysis result in database."""
-        self.database.store_tokenomics_snapshot(
-            token_address=metrics.token_address,
-            chain_id=metrics.chain_id,
-            total_supply=metrics.total_supply,
-            max_supply=metrics.max_supply,
-            supply_tier=metrics.supply_tier,
-            total_holders=metrics.total_holders,
-            top_10_holder_pct=metrics.top_10_holder_pct,
-            contract_holder_pct=metrics.contract_holder_pct,
-            staking_contract_pct=metrics.staking_contract_pct,
-            gini_coefficient=metrics.gini_coefficient,
-            nakamoto_coefficient=metrics.nakamoto_coefficient,
-            utility_flags=json.dumps(metrics.utility_flags),
-            vesting_flags=json.dumps(metrics.vesting_flags),
-            tokenomics_score=score,
-            risk_level=risk_level,
-            flags=json.dumps(metrics.flags),
-            recommendations=json.dumps(recommendations),
-            analyzed_at=metrics.analyzed_at,
-        )
+        """Store analysis result in database.
+
+        Wrapped in try/except so local storage failures never prevent
+        the analysis result from reaching the backend.
+        """
+        try:
+            self.database.store_tokenomics_snapshot(
+                token_address=metrics.token_address,
+                chain_id=metrics.chain_id,
+                total_supply=metrics.total_supply,
+                max_supply=metrics.max_supply,
+                supply_tier=metrics.supply_tier,
+                total_holders=metrics.total_holders,
+                top_10_holder_pct=metrics.top_10_holder_pct,
+                contract_holder_pct=metrics.contract_holder_pct,
+                staking_contract_pct=metrics.staking_contract_pct,
+                gini_coefficient=metrics.gini_coefficient,
+                nakamoto_coefficient=metrics.nakamoto_coefficient,
+                utility_flags=json.dumps(metrics.utility_flags),
+                vesting_flags=json.dumps(metrics.vesting_flags),
+                tokenomics_score=score,
+                risk_level=risk_level,
+                flags=json.dumps(metrics.flags),
+                recommendations=json.dumps(recommendations),
+                analyzed_at=metrics.analyzed_at,
+            )
+        except Exception as e:
+            LOGGER.warning(f"Failed to store tokenomics snapshot locally: {e}")
 
     async def close(self) -> None:
         """Close resources."""
