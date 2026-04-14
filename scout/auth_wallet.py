@@ -28,57 +28,66 @@ class AdminWallet:
 
 
 def _persist_wallet(database: DatabaseManager, wallet: AdminWallet) -> None:
-    database.set_meta(ADMIN_WALLET_PRIVATE_KEY_META, wallet.private_key)
     database.set_meta(ADMIN_WALLET_ADDRESS_META, wallet.address)
-
-
-def _load_wallet_from_meta(database: DatabaseManager) -> AdminWallet | None:
-    private_key = database.get_meta(ADMIN_WALLET_PRIVATE_KEY_META)
-    address = database.get_meta(ADMIN_WALLET_ADDRESS_META)
-    if not private_key:
-        return None
-    account = Account.from_key(private_key)
-    checksum_address = account.address
-    if address != checksum_address:
-        database.set_meta(ADMIN_WALLET_ADDRESS_META, checksum_address)
-    return AdminWallet(address=checksum_address, private_key=private_key)
+    # NOTE: Private key is NEVER stored in the database.
+    # It must always come from the ADMIN_WALLET_PRIVATE_KEY env var.
 
 
 def load_or_create_admin_wallet(database: DatabaseManager) -> AdminWallet:
-    """Load the persisted admin wallet or create a new one.
+    """Load the admin wallet or create a new one.
+
+    Private key is ALWAYS read from environment variables only.
+    Database only stores the wallet address for reference.
 
     Priority order:
     1. Environment variables (ADMIN_WALLET_ADDRESS, ADMIN_WALLET_PRIVATE_KEY)
-    2. Database metadata (for persistence across restarts)
-    3. Generate new wallet (will log address for configuration)
+    2. Generate new wallet (will log address for configuration)
 
     When creating a new wallet the operator is prompted to confirm that the
     backend has been configured with the generated address. Automated
     environments can skip the prompt by setting ``SCOUT_SKIP_WALLET_PROMPT``.
     """
 
-    # 1. Check environment variables first (for Railway deployments)
+    # 1. Check environment variables (required for private key)
     env_address = os.environ.get(ADMIN_WALLET_ADDRESS_ENV)
     env_private_key = os.environ.get(ADMIN_WALLET_PRIVATE_KEY_ENV)
 
-    if env_address and env_private_key:
-        LOGGER.info(f"Using admin wallet from environment variables: {env_address}")
-        # Verify the private key matches the address
+    if env_private_key:
+        # Private key provided via env var — derive or verify address
         account = Account.from_key(env_private_key)
-        if account.address.lower() != env_address.lower():
-            raise ValueError(
-                f"Environment variable mismatch: ADMIN_WALLET_ADDRESS ({env_address}) "
-                f"does not match private key ({account.address})"
-            )
+        derived_address = account.address
+
+        if env_address:
+            # Both provided — verify they match
+            if account.address.lower() != env_address.lower():
+                raise ValueError(
+                    f"Environment variable mismatch: ADMIN_WALLET_ADDRESS ({env_address}) "
+                    f"does not match private key ({account.address})"
+                )
+            LOGGER.info(f"Using admin wallet from environment variables: {env_address}")
+        else:
+            # Only private key provided — derive address
+            LOGGER.info(f"Using admin wallet derived from private key: {derived_address}")
+            env_address = derived_address
+
         return AdminWallet(address=env_address, private_key=env_private_key)
 
-    # 2. Check database metadata
-    wallet = _load_wallet_from_meta(database)
-    if wallet is not None:
-        LOGGER.info(f"Using admin wallet from database: {wallet.address}")
-        return wallet
+    # 2. No private key in env — cannot proceed without one
+    # Check if address is in DB for a helpful error message
+    stored_address = database.get_meta(ADMIN_WALLET_ADDRESS_META)
 
-    # 3. Generate new wallet
+    if stored_address:
+        LOGGER.error(
+            f"Admin wallet address found in DB ({stored_address}) but "
+            f"ADMIN_WALLET_PRIVATE_KEY env var is not set. "
+            f"Set the env var to continue."
+        )
+        raise RuntimeError(
+            f"ADMIN_WALLET_PRIVATE_KEY environment variable is required. "
+            f"Wallet address {stored_address} was previously used."
+        )
+
+    # 3. Generate new wallet (only used for initial setup)
     account = Account.create()
     private_key = account.key.hex()
     checksum_address = account.address
@@ -87,15 +96,16 @@ def load_or_create_admin_wallet(database: DatabaseManager) -> AdminWallet:
     LOGGER.warning("Created new admin wallet", extra={"address": checksum_address})
 
     if not os.environ.get(SKIP_PROMPT_ENV_VAR):
-        print(f"New admin wallet created: {checksum_address}")
-        print("Ensure backend admin privileges are granted to this address.")
-        input("Press Enter once backend access has been configured...")
-    else:
-        # Log the wallet address prominently for Railway deployments
-        LOGGER.info(f"New admin wallet created: {checksum_address}")
-        LOGGER.info(f"Add this address to backend ADMIN_WALLETS: {checksum_address}")
-        LOGGER.info(
-            "Skipping admin wallet acknowledgement prompt", extra={"env": SKIP_PROMPT_ENV_VAR}
+        LOGGER.warning(
+            f"IMPORTANT: Add ADMIN_WALLET_PRIVATE_KEY={private_key} "
+            f"and ADMIN_WALLET_ADDRESS={checksum_address} to your environment variables. "
+            f"The private key will NOT be stored in the database on next startup."
         )
+    else:
+        # Log the wallet details prominently for Railway deployments
+        LOGGER.info(f"New admin wallet created: {checksum_address}")
+        LOGGER.info(f"Add these to your environment:")
+        LOGGER.info(f"  ADMIN_WALLET_ADDRESS={checksum_address}")
+        LOGGER.info(f"  ADMIN_WALLET_PRIVATE_KEY={private_key}")
 
     return wallet
