@@ -547,6 +547,7 @@ class HolderAPIManager:
                 "top_1_pct_supply": 0.0,
                 "top_100_balance_sum": "0x0",
                 "estimated_total_supply": "0x0",
+                "price_usd": price_usd,
             }
 
         # Exclude dead address from concentration metrics
@@ -611,6 +612,7 @@ class HolderAPIManager:
                 filtered_holders, total_count, estimated_total_supply, price_usd,
                 decimals=decimals,
             ) if price_usd and price_usd > 0 else None,
+            "price_usd": price_usd,
         }
 
     def _calculate_holder_tiers(

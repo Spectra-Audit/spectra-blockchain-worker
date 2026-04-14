@@ -60,6 +60,7 @@ class HolderMetrics:
     top_100_balance_sum: str
     estimated_total_supply: str
     holder_tiers: Optional[List[Dict]] = None
+    price_usd: Optional[float] = None
 
 
 class HolderAPIProvider(abc.ABC):

@@ -160,6 +160,7 @@ class TokenHolderScout:
                 "top_100_balance_sum": int(metrics.top_100_balance_sum, 16) if metrics.top_100_balance_sum else 0,
                 "estimated_total_supply": int(metrics.estimated_total_supply, 16) if metrics.estimated_total_supply else 0,
                 **({"holder_tiers": metrics.holder_tiers} if metrics.holder_tiers else {}),
+                **({"price_usd": metrics.price_usd} if metrics.price_usd is not None else {}),
             }
         }
 
