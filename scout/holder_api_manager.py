@@ -19,12 +19,14 @@ Features:
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from scout.cache_manager import HolderDataCache
+from scout.coingecko_holder_provider import CoinGeckoHolderProvider
+from scout.ethplorer_holder_provider import EthplorerHolderProvider
 from scout.holder_api_providers import (
     HolderAPIProvider,
     HolderData,
@@ -32,9 +34,10 @@ from scout.holder_api_providers import (
     MoralisHolderProvider,
     NodeRealHolderProvider,
 )
-from scout.coingecko_holder_provider import CoinGeckoHolderProvider
-from scout.ethplorer_holder_provider import EthplorerHolderProvider
 from scout.rate_limiter import AsyncRateLimiter, get_rate_limiter
+
+if TYPE_CHECKING:
+    from scout.database_manager import DatabaseManager
 
 LOGGER = logging.getLogger(__name__)
 
@@ -640,8 +643,21 @@ class HolderAPIManager:
         Returns:
             List of tier dicts or None if price_usd is invalid
         """
-        if not price_usd or price_usd <= 0 or total_count <= 0 or total_supply <= 0:
+        if (
+            not price_usd
+            or not math.isfinite(price_usd)
+            or price_usd <= 0
+            or total_count <= 0
+            or total_supply <= 0
+        ):
             return None
+
+        try:
+            decimals = int(decimals)
+        except (TypeError, ValueError):
+            decimals = 18
+        if decimals < 0:
+            decimals = 18
 
         # Initialize tier buckets
         buckets = [
@@ -653,15 +669,12 @@ class HolderAPIManager:
         known_supply = 0
         decimals_divisor = 10 ** decimals
         for h in holders:
-            token_amount = h.balance / decimals_divisor
-            usd_value = token_amount * price_usd
+            usd_value = self._holder_usd_value(h.balance, decimals_divisor, price_usd)
             known_supply += h.balance
 
-            for bucket in buckets:
-                if usd_value >= bucket["min_usd"]:
-                    bucket["holders"] += 1
-                    bucket["supply"] += h.balance
-                    break
+            bucket = self._tier_bucket_for_usd_value(buckets, usd_value)
+            bucket["holders"] += 1
+            bucket["supply"] += h.balance
 
         # ---- 2. Distribute remaining holders via Pareto model ----
         remaining_count = max(total_count - len(holders), 0)
@@ -722,15 +735,16 @@ class HolderAPIManager:
                 total_frac = sum(per_tier_frac)
                 if total_frac <= 0:
                     # Fallback: assign all to the tier matching avg_usd
-                    for bucket in buckets:
-                        if avg_usd >= bucket["min_usd"]:
-                            bucket["holders"] += remaining_count
-                            if remaining_supply > 0:
-                                bucket["supply"] += remaining_supply
-                            break
+                    bucket = self._tier_bucket_for_usd_value(buckets, avg_usd)
+                    bucket["holders"] += remaining_count
+                    if remaining_supply > 0:
+                        bucket["supply"] += remaining_supply
                 else:
+                    counts = self._allocate_remaining_tier_counts(
+                        remaining_count, per_tier_frac, total_frac,
+                    )
                     for i, bucket in enumerate(buckets):
-                        count = round(remaining_count * per_tier_frac[i] / total_frac)
+                        count = counts[i]
                         if count > 0:
                             bucket["holders"] += count
                             # Supply estimate: midpoint USD of tier × price
@@ -756,6 +770,51 @@ class HolderAPIManager:
             })
 
         return result
+
+    def _holder_usd_value(
+        self,
+        raw_balance: int,
+        decimals_divisor: int,
+        price_usd: float,
+    ) -> float:
+        """Calculate USD value from a raw token balance."""
+        if raw_balance <= 0 or decimals_divisor <= 0:
+            return 0.0
+        return (raw_balance / decimals_divisor) * price_usd
+
+    def _tier_bucket_for_usd_value(self, buckets: List[Dict], usd_value: float) -> Dict:
+        """Return the tier bucket for a holder's USD value."""
+        for bucket in buckets:
+            if usd_value >= bucket["min_usd"]:
+                return bucket
+        return buckets[-1]
+
+    def _allocate_remaining_tier_counts(
+        self,
+        remaining_count: int,
+        per_tier_frac: List[float],
+        total_frac: float,
+    ) -> List[int]:
+        """Allocate synthetic holders across tiers without losing counts to rounding."""
+        raw_counts = [
+            (remaining_count * fraction / total_frac) if total_frac > 0 else 0.0
+            for fraction in per_tier_frac
+        ]
+        counts = [int(math.floor(count)) for count in raw_counts]
+        shortfall = remaining_count - sum(counts)
+
+        if shortfall <= 0:
+            return counts
+
+        remainder_order = sorted(
+            range(len(raw_counts)),
+            key=lambda i: raw_counts[i] - counts[i],
+            reverse=True,
+        )
+        for index in remainder_order[:shortfall]:
+            counts[index] += 1
+
+        return counts
 
     def _calculate_gini(self, balances: List[int]) -> float:
         """Calculate Gini coefficient from balance list.
