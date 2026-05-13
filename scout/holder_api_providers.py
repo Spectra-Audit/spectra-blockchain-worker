@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import abc
 import asyncio
-import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -459,35 +458,49 @@ class MoralisHolderProvider(HolderAPIProvider):
         """
         try:
             session = await self._get_session()
-            params = {
-                "chain": self._chain_id_to_param(chain_id),
-                "limit": limit,
-                "order": "DESC",  # Highest balance first
-            }
+            holders = []
+            cursor = None
+            page_size = min(max(limit, 1), 100)
             headers = {"X-API-Key": self.api_key}
-            async with session.get(
-                f"{self.base_url}/erc20/{token_address}/owners",
-                params=params,
-                headers=headers
-            ) as response:
-                response.raise_for_status()
-                data = await response.json()
 
-                holders = []
-                if "result" in data:
-                    for i, owner in enumerate(data["result"]):
-                        balance_hex = owner.get("balance", "0x0")
-                        balance_int = int(balance_hex, 16) if balance_hex.startswith("0x") else 0
+            while len(holders) < limit:
+                params = {
+                    "chain": self._chain_id_to_param(chain_id),
+                    "limit": min(page_size, limit - len(holders)),
+                    "order": "DESC",  # Highest balance first
+                }
+                if cursor:
+                    params["cursor"] = cursor
 
-                        if balance_int > 0:
-                            holders.append(HolderData(
-                                address=owner.get("owner_address", ""),
-                                balance=balance_int,
-                                balance_hex=balance_hex,
-                                rank=i + 1,
-                            ))
+                async with session.get(
+                    f"{self.base_url}/erc20/{token_address}/owners",
+                    params=params,
+                    headers=headers
+                ) as response:
+                    response.raise_for_status()
+                    data = await response.json()
 
-                return holders
+                page_results = data.get("result") or []
+                if not page_results:
+                    break
+
+                for owner in page_results:
+                    balance_hex = owner.get("balance", "0x0")
+                    balance_int = int(balance_hex, 16) if balance_hex.startswith("0x") else 0
+
+                    if balance_int > 0:
+                        holders.append(HolderData(
+                            address=owner.get("owner_address", ""),
+                            balance=balance_int,
+                            balance_hex=balance_hex,
+                            rank=len(holders) + 1,
+                        ))
+
+                cursor = data.get("cursor")
+                if not cursor:
+                    break
+
+            return holders[:limit]
 
         except Exception as e:
             LOGGER.error(f"Moralis get_top_holders failed: {e}")

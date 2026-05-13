@@ -51,6 +51,9 @@ HOLDER_TIER_THRESHOLDS = [
     {"tier": "SHRIMP",  "label": "Shrimp (<$10)",      "emoji": "🦐", "min_usd": 0},
 ]
 
+DEFAULT_HOLDER_TIER_SCAN_LIMIT = 5000
+SHRIMP_THRESHOLD_USD = 10
+
 class HolderAPIManager:
     """Manages multiple holder API providers with automatic failover.
 
@@ -379,12 +382,23 @@ class HolderAPIManager:
                     decimals = await self.get_token_decimals(token_address, chain_id)
                     final_holder_count = cached_count if cached_count is not None else len(cached_holders)
                     price_usd = await self._fetch_price_usd(token_address, chain_id)
+                    tier_holders, forced_remaining_tier = await self._get_holder_tier_sample(
+                        token_address=token_address,
+                        chain_id=chain_id,
+                        current_provider=None,
+                        known_holders=cached_holders,
+                        total_count=final_holder_count,
+                        price_usd=price_usd,
+                        decimals=decimals,
+                    )
                     metrics_dict = self._calculate_metrics(
                         cached_holders,
                         final_holder_count,
                         total_supply,
                         price_usd=price_usd,
                         decimals=decimals,
+                        tier_holders=tier_holders,
+                        forced_remaining_tier=forced_remaining_tier,
                     )
                     LOGGER.info(
                         f"Cache hit for {token_address[:10]}... on chain {chain_id} "
@@ -460,12 +474,23 @@ class HolderAPIManager:
                     # Calculate metrics with real total supply
                     decimals = await self.get_token_decimals(token_address, chain_id)
                     price_usd = await self._fetch_price_usd(token_address, chain_id)
+                    tier_holders, forced_remaining_tier = await self._get_holder_tier_sample(
+                        token_address=token_address,
+                        chain_id=chain_id,
+                        current_provider=provider,
+                        known_holders=top_holders,
+                        total_count=final_holder_count,
+                        price_usd=price_usd,
+                        decimals=decimals,
+                    )
                     metrics_dict = self._calculate_metrics(
                         top_holders,
                         final_holder_count,
                         total_supply,
                         price_usd=price_usd,
                         decimals=decimals,
+                        tier_holders=tier_holders,
+                        forced_remaining_tier=forced_remaining_tier,
                     )
 
                     LOGGER.info(
@@ -519,6 +544,113 @@ class HolderAPIManager:
             LOGGER.warning(f"Failed to fetch price for tier classification: {e}")
             return None
 
+    async def _get_holder_tier_sample(
+        self,
+        token_address: str,
+        chain_id: int,
+        current_provider: Optional[HolderAPIProvider],
+        known_holders: List[HolderData],
+        total_count: int,
+        price_usd: Optional[float],
+        decimals: int,
+    ) -> Tuple[List[HolderData], Optional[str]]:
+        """Fetch a deeper sorted holder sample for tier estimation.
+
+        Holder APIs return balances sorted descending.  Once the lowest fetched
+        holder is below the shrimp threshold, every holder after that page is
+        also shrimp, so the remaining count can be assigned without fetching
+        every holder.
+        """
+        if not price_usd or price_usd <= 0 or total_count <= len(known_holders):
+            return known_holders, None
+
+        scan_limit = self._holder_tier_scan_limit(total_count)
+        if scan_limit <= len(known_holders):
+            return known_holders, None
+
+        try:
+            decimals_int = int(decimals)
+        except (TypeError, ValueError):
+            decimals_int = 18
+        decimals_divisor = 10 ** max(decimals_int, 0)
+        shrimp_balance_threshold = (SHRIMP_THRESHOLD_USD / price_usd) * decimals_divisor
+
+        best_holders = known_holders
+        providers = self._tier_scan_providers(current_provider, chain_id)
+
+        for provider in providers:
+            try:
+                if self.enable_rate_limiting and provider.provider_name in self.rate_limiters:
+                    await self.rate_limiters[provider.provider_name].acquire_or_wait(
+                        provider.provider_name,
+                    )
+
+                scanned_holders = await provider.get_top_holders(
+                    token_address,
+                    chain_id,
+                    scan_limit,
+                )
+            except Exception as e:
+                LOGGER.warning(
+                    "Tier holder scan failed with %s for %s: %s",
+                    provider.provider_name,
+                    token_address[:10],
+                    e,
+                )
+                continue
+
+            if len(scanned_holders) <= len(best_holders):
+                continue
+
+            best_holders = scanned_holders
+            last_balance = scanned_holders[-1].balance if scanned_holders else 0
+            LOGGER.info(
+                "Tier holder scan with %s fetched %d/%d holders for %s",
+                provider.provider_name,
+                len(scanned_holders),
+                total_count,
+                token_address[:10],
+            )
+
+            if len(scanned_holders) >= total_count:
+                return best_holders, None
+            if last_balance < shrimp_balance_threshold:
+                return best_holders, "SHRIMP"
+
+        return best_holders, None
+
+    def _holder_tier_scan_limit(self, total_count: int) -> int:
+        """Return the max number of sorted holders to scan for tier estimation."""
+        raw_limit = os.environ.get("HOLDER_TIER_SCAN_LIMIT")
+        try:
+            configured_limit = int(raw_limit) if raw_limit else DEFAULT_HOLDER_TIER_SCAN_LIMIT
+        except (TypeError, ValueError):
+            configured_limit = DEFAULT_HOLDER_TIER_SCAN_LIMIT
+        return max(0, min(total_count, configured_limit))
+
+    def _tier_scan_providers(
+        self,
+        current_provider: Optional[HolderAPIProvider],
+        chain_id: int,
+    ) -> List[HolderAPIProvider]:
+        """Return providers to try for deep tier scans, preserving priority."""
+        providers: List[HolderAPIProvider] = []
+        seen = set()
+
+        if current_provider and chain_id in current_provider.supported_chains:
+            providers.append(current_provider)
+            seen.add(current_provider.provider_name)
+
+        for provider in self.providers.values():
+            if provider.provider_name in seen:
+                continue
+            if chain_id not in provider.supported_chains:
+                continue
+            providers.append(provider)
+            seen.add(provider.provider_name)
+
+        return providers
+
     def _calculate_metrics(
         self,
         holders: List[HolderData],
@@ -526,6 +658,8 @@ class HolderAPIManager:
         total_supply: Optional[int] = None,
         price_usd: Optional[float] = None,
         decimals: int = 18,
+        tier_holders: Optional[List[HolderData]] = None,
+        forced_remaining_tier: Optional[str] = None,
     ) -> Dict:
         """Calculate distribution metrics from holder data.
 
@@ -563,6 +697,11 @@ class HolderAPIManager:
                 LOGGER.info(f"Excluding dead address from metrics: balance={h.balance}")
             else:
                 filtered_holders.append(h)
+
+        tier_filtered_holders = []
+        for h in tier_holders or filtered_holders:
+            if h.address.lower() != DEAD_ADDRESS:
+                tier_filtered_holders.append(h)
 
         balances = [h.balance for h in filtered_holders]
         top_100_sum = sum(balances)
@@ -612,8 +751,8 @@ class HolderAPIManager:
             "top_100_balance_sum": top_100_sum_hex,
             "estimated_total_supply": estimated_total_supply_hex,
             "holder_tiers": self._calculate_holder_tiers(
-                filtered_holders, total_count, estimated_total_supply, price_usd,
-                decimals=decimals,
+                tier_filtered_holders, total_count, estimated_total_supply, price_usd,
+                decimals=decimals, forced_remaining_tier=forced_remaining_tier,
             ) if price_usd and price_usd > 0 else None,
             "price_usd": price_usd,
         }
@@ -625,6 +764,7 @@ class HolderAPIManager:
         total_supply: int,
         price_usd: float,
         decimals: int = 18,
+        forced_remaining_tier: Optional[str] = None,
     ) -> Optional[List[Dict]]:
         """Classify holders into USD-based tier buckets (Etherscan-style).
 
@@ -680,7 +820,15 @@ class HolderAPIManager:
         remaining_count = max(total_count - len(holders), 0)
         remaining_supply = max(total_supply - known_supply, 0)
 
-        if remaining_count > 0:
+        if remaining_count > 0 and forced_remaining_tier:
+            bucket = next(
+                (b for b in buckets if b["tier"] == forced_remaining_tier),
+                buckets[-1],
+            )
+            bucket["holders"] += remaining_count
+            if remaining_supply > 0:
+                bucket["supply"] += remaining_supply
+        elif remaining_count > 0:
             # Compute the average USD value for the remaining holders.
             # When known holders collectively hold less than total supply,
             # we can compute the exact average of the remaining group.

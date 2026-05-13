@@ -1,7 +1,10 @@
 """Tests for holder tier classification in HolderAPIManager."""
 
+import asyncio
+from typing import Optional
+
 from scout.holder_api_manager import HolderAPIManager
-from scout.holder_api_providers import HolderData
+from scout.holder_api_providers import HolderAPIProvider, HolderData
 
 
 def _make_manager() -> HolderAPIManager:
@@ -12,6 +15,35 @@ def _make_manager() -> HolderAPIManager:
 def _make_holder(balance: int, address: str = "0xabc", rank: int = 1) -> HolderData:
     """Create a HolderData instance."""
     return HolderData(address=address, balance=balance, rank=rank)
+
+
+class _PagingHolderProvider(HolderAPIProvider):
+    """Mock provider that can return a sorted holder prefix for deep tier scans."""
+
+    def __init__(self, holders: list[HolderData]) -> None:
+        super().__init__(api_key="test")
+        self.holders = holders
+        self.requested_limits: list[int] = []
+
+    @property
+    def provider_name(self) -> str:
+        return "PagingMock"
+
+    @property
+    def supported_chains(self) -> list[int]:
+        return [1]
+
+    async def get_holder_count(self, token_address: str, chain_id: int) -> Optional[int]:
+        return len(self.holders)
+
+    async def get_top_holders(
+        self,
+        token_address: str,
+        chain_id: int,
+        limit: int = 100,
+    ) -> list[HolderData]:
+        self.requested_limits.append(limit)
+        return self.holders[:limit]
 
 
 class TestCalculateHolderTiers:
@@ -266,3 +298,58 @@ class TestCalculateHolderTiers:
         assert tier_map["WHALE"] == 1
         assert tier_map["DOLPHIN"] == 1
         assert tier_map["SHRIMP"] == 1
+
+    def test_deep_scan_forces_tail_to_shrimp_after_threshold(self, monkeypatch) -> None:
+        """Once a sorted deep scan reaches Shrimp, all unseen holders are Shrimp."""
+        price_usd = 1.0
+        decimals = 18
+        divisor = 10**decimals
+
+        holders = (
+            [_make_holder(200_000 * divisor, f"0xw{i}", i + 1) for i in range(10)]
+            + [_make_holder(50_000 * divisor, f"0xs{i}", i + 11) for i in range(20)]
+            + [_make_holder(5_000 * divisor, f"0xd{i}", i + 31) for i in range(30)]
+            + [_make_holder(500 * divisor, f"0xf{i}", i + 61) for i in range(40)]
+            + [_make_holder(50 * divisor, f"0xc{i}", i + 101) for i in range(50)]
+            + [_make_holder(5 * divisor, f"0xsh{i}", i + 151) for i in range(850)]
+        )
+        provider = _PagingHolderProvider(holders)
+        manager = HolderAPIManager(
+            providers=[provider],
+            enable_cache=False,
+            enable_rate_limiting=False,
+        )
+        monkeypatch.setenv("HOLDER_TIER_SCAN_LIMIT", "250")
+
+        scanned_holders, forced_tier = asyncio.run(
+            manager._get_holder_tier_sample(
+                token_address="0xtoken",
+                chain_id=1,
+                current_provider=provider,
+                known_holders=holders[:100],
+                total_count=len(holders),
+                price_usd=price_usd,
+                decimals=decimals,
+            )
+        )
+
+        assert len(scanned_holders) == 250
+        assert forced_tier == "SHRIMP"
+
+        result = manager._calculate_holder_tiers(
+            scanned_holders,
+            total_count=len(holders),
+            total_supply=sum(h.balance for h in holders),
+            price_usd=price_usd,
+            decimals=decimals,
+            forced_remaining_tier=forced_tier,
+        )
+        assert result is not None
+
+        tier_map = {t["tier"]: t["holders"] for t in result}
+        assert tier_map["WHALE"] == 10
+        assert tier_map["SHARK"] == 20
+        assert tier_map["DOLPHIN"] == 30
+        assert tier_map["FISH"] == 40
+        assert tier_map["CRAB"] == 50
+        assert tier_map["SHRIMP"] == 850
