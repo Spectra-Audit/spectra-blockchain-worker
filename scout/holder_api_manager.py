@@ -625,8 +625,10 @@ class HolderAPIManager:
     ) -> Optional[List[Dict]]:
         """Classify holders into USD-based tier buckets (Etherscan-style).
 
-        Known holders are classified exactly by (balance / 10^decimals) * price_usd.
-        Remaining holders are estimated by average remaining balance.
+        Known holders (from API data) are classified exactly by their
+        (balance / 10^decimals) * price_usd.  Remaining holders are
+        distributed across tiers using a Pareto (power-law) model that
+        reflects the heavy-tailed nature of crypto token holdings.
 
         Args:
             holders: Filtered holder data (dead address already excluded)
@@ -647,6 +649,7 @@ class HolderAPIManager:
             for t in HOLDER_TIER_THRESHOLDS
         ]
 
+        # ---- 1. Classify known holders exactly ----
         known_supply = 0
         decimals_divisor = 10 ** decimals
         for h in holders:
@@ -654,28 +657,91 @@ class HolderAPIManager:
             usd_value = token_amount * price_usd
             known_supply += h.balance
 
-            # Classify: find highest tier whose min_usd threshold is met
             for bucket in buckets:
                 if usd_value >= bucket["min_usd"]:
                     bucket["holders"] += 1
                     bucket["supply"] += h.balance
                     break
 
-        # Estimate remaining holders
+        # ---- 2. Distribute remaining holders via Pareto model ----
         remaining_count = max(total_count - len(holders), 0)
         remaining_supply = max(total_supply - known_supply, 0)
 
-        if remaining_count > 0 and remaining_supply > 0:
-            avg_balance = remaining_supply / remaining_count
+        if remaining_count > 0:
+            # Compute the average USD value for the remaining holders.
+            # When known holders collectively hold less than total supply,
+            # we can compute the exact average of the remaining group.
+            # When they exceed total supply (e.g. due to staking/re-delegation),
+            # fall back to the overall per-holder average (total_supply / total_count)
+            # which gives a much more realistic estimate for small holders.
+            if remaining_supply > 0:
+                avg_balance = remaining_supply / remaining_count
+            else:
+                # Known holders exceed total supply — use the overall per-holder
+                # average.  This is far lower than any top-100 balance and
+                # correctly places most small holders in Fish/Crab/Shrimp.
+                avg_balance = total_supply / total_count
+
             avg_token_amount = avg_balance / decimals_divisor
             avg_usd = avg_token_amount * price_usd
-            for bucket in buckets:
-                if avg_usd >= bucket["min_usd"]:
-                    bucket["holders"] += remaining_count
-                    bucket["supply"] += remaining_supply
-                    break
 
-        # Build result with percentages
+            # Pareto Type I distribution: P(X >= x) = (xm / x)^alpha
+            # Mean = alpha * xm / (alpha - 1)  =>  xm = mean * (alpha-1) / alpha
+            # alpha = 1.5 gives realistic crypto holder inequality
+            alpha = 1.5
+
+            if avg_usd <= 0:
+                # Edge case: assign all to Shrimp
+                buckets[-1]["holders"] += remaining_count
+                if remaining_supply > 0:
+                    buckets[-1]["supply"] += remaining_supply
+            else:
+                # Scale parameter from average
+                xm = avg_usd * (alpha - 1) / alpha
+
+                # Compute per-tier fraction using Pareto survival function
+                # P(X in [lower, upper)) = P(X >= lower) - P(X >= upper)
+                per_tier_frac = []
+                for i, bucket in enumerate(buckets):
+                    lower = bucket["min_usd"]
+                    upper = buckets[i - 1]["min_usd"] if i > 0 else float("inf")
+
+                    # Survival function at boundaries
+                    if lower >= xm:
+                        sf_lower = (xm / lower) ** alpha
+                    else:
+                        sf_lower = 1.0  # below scale → everyone exceeds
+
+                    if upper >= xm:
+                        sf_upper = (xm / upper) ** alpha
+                    else:
+                        sf_upper = 1.0
+
+                    per_tier_frac.append(max(sf_lower - sf_upper, 0.0))
+
+                total_frac = sum(per_tier_frac)
+                if total_frac <= 0:
+                    # Fallback: assign all to the tier matching avg_usd
+                    for bucket in buckets:
+                        if avg_usd >= bucket["min_usd"]:
+                            bucket["holders"] += remaining_count
+                            if remaining_supply > 0:
+                                bucket["supply"] += remaining_supply
+                            break
+                else:
+                    for i, bucket in enumerate(buckets):
+                        count = round(remaining_count * per_tier_frac[i] / total_frac)
+                        if count > 0:
+                            bucket["holders"] += count
+                            # Supply estimate: midpoint USD of tier × price
+                            if i < len(buckets) - 1:
+                                mid_usd = (bucket["min_usd"] + buckets[i + 1]["min_usd"]) / 2
+                            else:
+                                mid_usd = bucket["min_usd"] + 0.5
+                            mid_balance = (mid_usd / price_usd) * decimals_divisor
+                            bucket["supply"] += int(count * mid_balance)
+
+        # ---- 3. Build result with percentages ----
         result = []
         for b in buckets:
             holders_pct = (b["holders"] / total_count * 100) if total_count > 0 else 0
