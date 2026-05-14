@@ -8,7 +8,8 @@ Provider Priority Order:
 1. Ethplorer (Highest) - Uses "freekey" by default, supports ETH, BSC, Linea, Blast
 2. NodeReal - Requires API key, supports ETH and BSC
 3. Moralis - Requires API key, supports multiple chains
-4. CoinGecko (Lowest) - Requires API key, supports multiple chains
+4. Dune Sim - Requires API key, supports multiple EVM chains
+5. CoinGecko (Lowest) - Requires API key, supports multiple chains
 
 Features:
 - Automatic failover between providers
@@ -26,6 +27,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from scout.cache_manager import HolderDataCache
 from scout.coingecko_holder_provider import CoinGeckoHolderProvider
+from scout.dune_holder_provider import DuneSimHolderProvider
 from scout.ethplorer_holder_provider import EthplorerHolderProvider
 from scout.holder_api_providers import (
     HolderAPIProvider,
@@ -66,7 +68,8 @@ class HolderAPIManager:
     1. Ethplorer (Highest) - Uses "freekey" by default for free tier
     2. NodeReal - Requires NODEREAL_API_KEY
     3. Moralis - Requires MORALIS_API_KEY
-    4. CoinGecko (Lowest) - Requires COINGECKO_API_KEY
+    4. Dune Sim - Requires DUNE_SIM_API_KEY
+    5. CoinGecko (Lowest) - Requires COINGECKO_API_KEY
 
     Example:
         manager = HolderAPIManager()
@@ -156,6 +159,7 @@ class HolderAPIManager:
         - ETHPLORER_API_KEY: Initialize Ethplorer holder provider (defaults to "freekey" if not set)
         - NODEREAL_API_KEY: Initialize NodeReal holder provider
         - MORALIS_API_KEY: Initialize Moralis holder provider
+        - DUNE_SIM_API_KEY: Initialize Dune Sim holder provider
         - COINGECKO_API_KEY: Initialize CoinGecko holder provider
         """
         # Ethplorer (Highest Priority - always initialized if supported chains needed)
@@ -185,6 +189,19 @@ class HolderAPIManager:
             except Exception as e:
                 LOGGER.warning(f"Failed to initialize Moralis: {e}")
 
+        # Dune Sim
+        dune_key = (
+            os.environ.get("DUNE_SIM_API_KEY")
+            or os.environ.get("SIM_DUNE_API_KEY")
+            or os.environ.get("DUNE_API_KEY")
+        )
+        if dune_key:
+            try:
+                self.providers["DuneSim"] = DuneSimHolderProvider(dune_key)
+                LOGGER.info("Initialized Dune Sim holder provider")
+            except Exception as e:
+                LOGGER.warning(f"Failed to initialize Dune Sim: {e}")
+
         # CoinGecko
         coingecko_key = os.environ.get("COINGECKO_API_KEY")
         if coingecko_key:
@@ -198,7 +215,8 @@ class HolderAPIManager:
             LOGGER.warning(
                 "No holder API providers configured. "
                 "Ethplorer will use freekey by default. "
-                "Alternatively, set NODEREAL_API_KEY, MORALIS_API_KEY, or COINGECKO_API_KEY"
+                "Alternatively, set NODEREAL_API_KEY, MORALIS_API_KEY, "
+                "DUNE_SIM_API_KEY, or COINGECKO_API_KEY"
             )
 
     def get_provider_for_chain(

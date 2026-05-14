@@ -204,6 +204,9 @@ class ScoutApp:
         has_any_provider = (
             os.environ.get("NODEREAL_API_KEY") or
             os.environ.get("MORALIS_API_KEY") or
+            os.environ.get("DUNE_SIM_API_KEY") or
+            os.environ.get("SIM_DUNE_API_KEY") or
+            os.environ.get("DUNE_API_KEY") or
             os.environ.get("COINGECKO_API_KEY") or
             True  # Ethplorer always available with freekey
         )
@@ -1092,7 +1095,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "collect-holders":
             if not app.token_holder_scout:
                 print("Token Holder Scout is not initialized")
-                print("Set NODEREAL_API_KEY or MORALIS_API_KEY environment variable to enable it")
+                print("Set NODEREAL_API_KEY, MORALIS_API_KEY, or DUNE_SIM_API_KEY to enable it")
                 return 1
 
             from .async_runner import get_shared_async_runner
@@ -1178,7 +1181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "holder-status":
             if not app.token_holder_scout:
                 print("Token Holder Scout is not configured")
-                print("To enable it, set NODEREAL_API_KEY or MORALIS_API_KEY environment variable")
+                print("To enable it, set NODEREAL_API_KEY, MORALIS_API_KEY, or DUNE_SIM_API_KEY")
                 return 0
 
             print("Token Holder Scout Status:")
