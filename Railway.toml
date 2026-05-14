@@ -62,9 +62,9 @@ CHAIN_ID = "1"
 API_BASE_URL = ""  # Set to actual backend URL or leave empty for standalone mode
 # Admin Wallet Configuration for SIWE Authentication
 # Generated wallet for blockchain worker authentication with backend API
-ADMIN_ACCESS_TOKEN = "spectra-admin-token-2026"  # Set in Railway dashboard or via secret
+ADMIN_ACCESS_TOKEN = ""  # Set in Railway dashboard or via secret
 ADMIN_WALLET_ADDRESS = "0x808B25bC600f9B963A667a551fab4C039B834157"
-ADMIN_WALLET_PRIVATE_KEY = "74f6fe51e79583f1caa15dd19beba61a3c60c89f6237afe7371b26bcc681b0a3"  # Mark as SECRET
+ADMIN_WALLET_PRIVATE_KEY = ""  # Mark as SECRET
 
 # Database & Caching
 DB_PATH = "/app/data/scout.db"

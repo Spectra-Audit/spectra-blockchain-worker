@@ -4,15 +4,15 @@
 
 1. **Generated Admin Wallet**
    - Wallet address: `0x808B25bC600f9B963A667a551fab4C039B834157`
-   - Private key: `74f6fe51e79583f1caa15dd19beba61a3c60c89f6237afe7371b26bcc681b0a3`
+   - Private key: `<redacted-rotate-this-key>`
 
 2. **Updated Railway.toml**
-   - Added `ADMIN_ACCESS_TOKEN` = `spectra-admin-token-2026`
+   - Added `ADMIN_ACCESS_TOKEN` via secret manager
    - Added `ADMIN_WALLET_ADDRESS` = `0x808B25bC600f9B963A667a551fab4C039B834157`
    - Added `ADMIN_WALLET_PRIVATE_KEY` (marked as SECRET)
 
 3. **Updated .env File**
-   - Added `ADMIN_ACCESS_TOKEN` = `spectra-admin-token-2026`
+   - Added `ADMIN_ACCESS_TOKEN` via secret manager
 
 ## 📋 Next Steps (User Action Required)
 
@@ -34,9 +34,9 @@ ADMIN_WALLETS=0x808B25bC600f9B963A667a551fab4C039B834157,0xYOUR_OTHER_ADMIN_WALL
 1. Go to Railway.app → select blockchain-worker service
 2. Go to "Variables" tab
 3. Add these environment variables:
-   - `ADMIN_ACCESS_TOKEN` = `spectra-admin-token-2026`
+   - `ADMIN_ACCESS_TOKEN` = `<secret-admin-token>`
    - `ADMIN_WALLET_ADDRESS` = `0x808B25bC600f9B963A667a551fab4C039B834157`
-   - `ADMIN_WALLET_PRIVATE_KEY` = `74f6fe51e79583f1caa15dd19beba61a3c60c89f6237afe7371b26bcc681b0a3`
+   - `ADMIN_WALLET_PRIVATE_KEY` = `<secret-private-key>`
 4. Mark `ADMIN_WALLET_PRIVATE_KEY` as a **Secret** (click lock icon)
 5. Click "Redeploy" button
 

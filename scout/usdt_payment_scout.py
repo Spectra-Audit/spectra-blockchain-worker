@@ -71,7 +71,6 @@ USDT_TRANSFER_EVENT_ABI = {
 # Network-specific RPC configurations
 NETWORK_RPCS = {
     "ethereum": [
-        "https://eth.rpc.grove.city/v1/01fdb492",
         "https://rpc.coinsdo.net/eth",
         "https://ethereum.public.blockpi.network/v1/rpc/public",
         "https://ethereum-rpc.publicnode.com",

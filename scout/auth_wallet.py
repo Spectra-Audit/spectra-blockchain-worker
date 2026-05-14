@@ -97,15 +97,16 @@ def load_or_create_admin_wallet(database: DatabaseManager) -> AdminWallet:
 
     if not os.environ.get(SKIP_PROMPT_ENV_VAR):
         LOGGER.warning(
-            f"IMPORTANT: Add ADMIN_WALLET_PRIVATE_KEY={private_key} "
-            f"and ADMIN_WALLET_ADDRESS={checksum_address} to your environment variables. "
-            f"The private key will NOT be stored in the database on next startup."
+            "IMPORTANT: add ADMIN_WALLET_PRIVATE_KEY and ADMIN_WALLET_ADDRESS=%s "
+            "to your secret manager. The private key will NOT be stored in the "
+            "database on next startup.",
+            checksum_address,
         )
     else:
         # Log the wallet details prominently for Railway deployments
         LOGGER.info(f"New admin wallet created: {checksum_address}")
         LOGGER.info(f"Add these to your environment:")
         LOGGER.info(f"  ADMIN_WALLET_ADDRESS={checksum_address}")
-        LOGGER.info(f"  ADMIN_WALLET_PRIVATE_KEY={private_key}")
+        LOGGER.info("  ADMIN_WALLET_PRIVATE_KEY=<redacted>")
 
     return wallet
