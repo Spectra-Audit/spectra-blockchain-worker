@@ -14,11 +14,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 try:
-    from apscheduler.triggers.cron import CronTrigger
     from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
+
     HAS_SCHEDULER = True
 except ImportError:
     HAS_SCHEDULER = False
@@ -161,6 +162,22 @@ class TokenHolderScout:
                 "estimated_total_supply": int(metrics.estimated_total_supply, 16) if metrics.estimated_total_supply else 0,
                 **({"holder_tiers": metrics.holder_tiers} if metrics.holder_tiers else {}),
                 **({"price_usd": metrics.price_usd} if metrics.price_usd is not None else {}),
+                **(
+                    {"holder_tier_estimation_method": metrics.holder_tier_estimation_method}
+                    if metrics.holder_tier_estimation_method
+                    else {}
+                ),
+                **(
+                    {"holder_tier_sample_size": metrics.holder_tier_sample_size}
+                    if metrics.holder_tier_sample_size is not None
+                    else {}
+                ),
+                **(
+                    {"holder_tier_total_count": metrics.holder_tier_total_count}
+                    if metrics.holder_tier_total_count is not None
+                    else {}
+                ),
+                "holder_count_confirmed": metrics.holder_count_confirmed,
             }
         }
 

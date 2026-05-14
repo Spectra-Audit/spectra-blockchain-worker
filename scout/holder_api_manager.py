@@ -52,6 +52,7 @@ HOLDER_TIER_THRESHOLDS = [
 ]
 
 DEFAULT_HOLDER_TIER_SCAN_LIMIT = 5000
+DEFAULT_UNCONFIRMED_HOLDER_COUNT_FLOOR = 5000
 SHRIMP_THRESHOLD_USD = 10
 
 class HolderAPIManager:
@@ -382,7 +383,7 @@ class HolderAPIManager:
                     decimals = await self.get_token_decimals(token_address, chain_id)
                     final_holder_count = cached_count if cached_count is not None else len(cached_holders)
                     price_usd = await self._fetch_price_usd(token_address, chain_id)
-                    tier_holders, forced_remaining_tier = await self._get_holder_tier_sample(
+                    tier_holders, forced_remaining_tier, tier_metadata = await self._get_holder_tier_sample(
                         token_address=token_address,
                         chain_id=chain_id,
                         current_provider=None,
@@ -399,6 +400,7 @@ class HolderAPIManager:
                         decimals=decimals,
                         tier_holders=tier_holders,
                         forced_remaining_tier=forced_remaining_tier,
+                        tier_metadata=tier_metadata,
                     )
                     LOGGER.info(
                         f"Cache hit for {token_address[:10]}... on chain {chain_id} "
@@ -407,6 +409,7 @@ class HolderAPIManager:
                     return HolderMetrics(
                         total_holder_count=final_holder_count,
                         top_holders=cached_holders,
+                        holder_count_confirmed=True,
                         **metrics_dict
                     )
 
@@ -439,6 +442,12 @@ class HolderAPIManager:
                 # Fetch holder count from API if not in cache
                 if holder_count is None:
                     holder_count = await provider.get_holder_count(token_address, chain_id)
+                    if holder_count is None:
+                        holder_count = await self._fetch_holder_count_from_other_providers(
+                            token_address,
+                            chain_id,
+                            exclude_provider=provider.provider_name,
+                        )
                     # Cache the result
                     if holder_count is not None and self.enable_cache and self.cache:
                         self.cache.set_holder_count(token_address, chain_id, holder_count)
@@ -462,11 +471,18 @@ class HolderAPIManager:
                     total_supply = await self.get_total_supply(token_address, chain_id)
 
                     # Use holder count from API, or fall back to len(top_holders)
-                    final_holder_count = holder_count if holder_count is not None else len(top_holders)
+                    holder_count_confirmed = holder_count is not None
+                    final_holder_count = (
+                        holder_count
+                        if holder_count_confirmed
+                        else self._estimate_unconfirmed_holder_count(len(top_holders), limit)
+                    )
 
                     if holder_count is None:
                         LOGGER.warning(
-                            f"Holder count API returned None, using top holders count ({len(top_holders)}) as fallback"
+                            "Holder count API returned None; using conservative estimated count "
+                            f"({final_holder_count}) instead of treating the {len(top_holders)}-holder "
+                            "sample as the full population"
                         )
                     else:
                         LOGGER.info(f"Using holder count from API: {holder_count}")
@@ -474,7 +490,7 @@ class HolderAPIManager:
                     # Calculate metrics with real total supply
                     decimals = await self.get_token_decimals(token_address, chain_id)
                     price_usd = await self._fetch_price_usd(token_address, chain_id)
-                    tier_holders, forced_remaining_tier = await self._get_holder_tier_sample(
+                    tier_holders, forced_remaining_tier, tier_metadata = await self._get_holder_tier_sample(
                         token_address=token_address,
                         chain_id=chain_id,
                         current_provider=provider,
@@ -491,6 +507,7 @@ class HolderAPIManager:
                         decimals=decimals,
                         tier_holders=tier_holders,
                         forced_remaining_tier=forced_remaining_tier,
+                        tier_metadata=tier_metadata,
                     )
 
                     LOGGER.info(
@@ -508,6 +525,7 @@ class HolderAPIManager:
                     return HolderMetrics(
                         total_holder_count=final_holder_count,
                         top_holders=top_holders,
+                        holder_count_confirmed=holder_count_confirmed,
                         **metrics_dict
                     )
                 else:
@@ -521,6 +539,59 @@ class HolderAPIManager:
 
         LOGGER.error(f"All providers failed for {token_address} on chain {chain_id}")
         return None
+
+    async def _fetch_holder_count_from_other_providers(
+        self,
+        token_address: str,
+        chain_id: int,
+        exclude_provider: str,
+    ) -> Optional[int]:
+        """Try non-current providers for a confirmed holder count.
+
+        Some providers can return top holders but not a total count for a token.
+        A confirmed count from another provider is still better than treating a
+        top-100 sample as the entire holder population.
+        """
+        for candidate in self._tier_scan_providers(None, chain_id):
+            if candidate.provider_name == exclude_provider:
+                continue
+            try:
+                if self.enable_rate_limiting and candidate.provider_name in self.rate_limiters:
+                    await self.rate_limiters[candidate.provider_name].acquire_or_wait(
+                        candidate.provider_name,
+                    )
+                count = await candidate.get_holder_count(token_address, chain_id)
+            except Exception as e:
+                LOGGER.debug(
+                    "Holder count fallback failed with %s for %s: %s",
+                    candidate.provider_name,
+                    token_address[:10],
+                    e,
+                )
+                continue
+            if count is not None and count > 0:
+                LOGGER.info(
+                    "Using holder count from fallback provider %s: %s",
+                    candidate.provider_name,
+                    count,
+                )
+                return int(count)
+        return None
+
+    def _estimate_unconfirmed_holder_count(self, sample_size: int, requested_limit: int) -> int:
+        """Return a conservative count when no provider confirms total holders."""
+        if sample_size <= 0:
+            return 0
+        if sample_size < requested_limit:
+            return sample_size
+
+        raw_floor = os.environ.get("HOLDER_TIER_UNCONFIRMED_COUNT_FLOOR")
+        try:
+            configured_floor = int(raw_floor) if raw_floor else DEFAULT_UNCONFIRMED_HOLDER_COUNT_FLOOR
+        except (TypeError, ValueError):
+            configured_floor = DEFAULT_UNCONFIRMED_HOLDER_COUNT_FLOOR
+
+        return max(sample_size + 1, configured_floor)
 
     async def _fetch_price_usd(
         self, token_address: str, chain_id: int,
@@ -553,7 +624,7 @@ class HolderAPIManager:
         total_count: int,
         price_usd: Optional[float],
         decimals: int,
-    ) -> Tuple[List[HolderData], Optional[str]]:
+    ) -> Tuple[List[HolderData], Optional[str], Dict[str, int | str | bool | None]]:
         """Fetch a deeper sorted holder sample for tier estimation.
 
         Holder APIs return balances sorted descending.  Once the lowest fetched
@@ -561,12 +632,21 @@ class HolderAPIManager:
         also shrimp, so the remaining count can be assigned without fetching
         every holder.
         """
+        metadata: Dict[str, int | str | bool | None] = {
+            "holder_tier_estimation_method": "exact"
+            if total_count <= len(known_holders)
+            else "hybrid_model",
+            "holder_tier_sample_size": len(known_holders),
+            "holder_tier_total_count": total_count,
+            "holder_tier_tail_forced": False,
+        }
+
         if not price_usd or price_usd <= 0 or total_count <= len(known_holders):
-            return known_holders, None
+            return known_holders, None, metadata
 
         scan_limit = self._holder_tier_scan_limit(total_count)
         if scan_limit <= len(known_holders):
-            return known_holders, None
+            return known_holders, None, metadata
 
         try:
             decimals_int = int(decimals)
@@ -577,6 +657,7 @@ class HolderAPIManager:
 
         best_holders = known_holders
         providers = self._tier_scan_providers(current_provider, chain_id)
+        metadata["holder_tier_estimation_method"] = "threshold_scan"
 
         for provider in providers:
             try:
@@ -604,6 +685,8 @@ class HolderAPIManager:
 
             best_holders = scanned_holders
             last_balance = scanned_holders[-1].balance if scanned_holders else 0
+            metadata["holder_tier_sample_size"] = len(scanned_holders)
+            metadata["holder_tier_scan_provider"] = provider.provider_name
             LOGGER.info(
                 "Tier holder scan with %s fetched %d/%d holders for %s",
                 provider.provider_name,
@@ -613,11 +696,15 @@ class HolderAPIManager:
             )
 
             if len(scanned_holders) >= total_count:
-                return best_holders, None
+                metadata["holder_tier_estimation_method"] = "exact"
+                return best_holders, None, metadata
             if last_balance < shrimp_balance_threshold:
-                return best_holders, "SHRIMP"
+                metadata["holder_tier_tail_forced"] = True
+                return best_holders, "SHRIMP", metadata
 
-        return best_holders, None
+        if len(best_holders) == len(known_holders):
+            metadata["holder_tier_estimation_method"] = "hybrid_model"
+        return best_holders, None, metadata
 
     def _holder_tier_scan_limit(self, total_count: int) -> int:
         """Return the max number of sorted holders to scan for tier estimation."""
@@ -660,6 +747,7 @@ class HolderAPIManager:
         decimals: int = 18,
         tier_holders: Optional[List[HolderData]] = None,
         forced_remaining_tier: Optional[str] = None,
+        tier_metadata: Optional[Dict[str, int | str | bool | None]] = None,
     ) -> Dict:
         """Calculate distribution metrics from holder data.
 
@@ -743,6 +831,7 @@ class HolderAPIManager:
         top_10_pct = (top_10_sum / estimated_total_supply * 100) if estimated_total_supply > 0 else 0
         top_1_pct = (top_1_sum / estimated_total_supply * 100) if estimated_total_supply > 0 else 0
 
+        tier_metadata = tier_metadata or {}
         return {
             "gini_coefficient": round(max(0, min(1, gini)), 4),
             "nakamoto_coefficient": nakamoto,
@@ -755,6 +844,9 @@ class HolderAPIManager:
                 decimals=decimals, forced_remaining_tier=forced_remaining_tier,
             ) if price_usd and price_usd > 0 else None,
             "price_usd": price_usd,
+            "holder_tier_estimation_method": tier_metadata.get("holder_tier_estimation_method"),
+            "holder_tier_sample_size": tier_metadata.get("holder_tier_sample_size"),
+            "holder_tier_total_count": tier_metadata.get("holder_tier_total_count"),
         }
 
     def _calculate_holder_tiers(

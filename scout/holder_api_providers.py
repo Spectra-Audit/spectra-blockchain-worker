@@ -60,6 +60,10 @@ class HolderMetrics:
     estimated_total_supply: str
     holder_tiers: Optional[List[Dict]] = None
     price_usd: Optional[float] = None
+    holder_tier_estimation_method: Optional[str] = None
+    holder_tier_sample_size: Optional[int] = None
+    holder_tier_total_count: Optional[int] = None
+    holder_count_confirmed: bool = True
 
 
 class HolderAPIProvider(abc.ABC):

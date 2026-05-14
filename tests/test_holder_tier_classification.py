@@ -321,7 +321,7 @@ class TestCalculateHolderTiers:
         )
         monkeypatch.setenv("HOLDER_TIER_SCAN_LIMIT", "250")
 
-        scanned_holders, forced_tier = asyncio.run(
+        scanned_holders, forced_tier, metadata = asyncio.run(
             manager._get_holder_tier_sample(
                 token_address="0xtoken",
                 chain_id=1,
@@ -335,6 +335,8 @@ class TestCalculateHolderTiers:
 
         assert len(scanned_holders) == 250
         assert forced_tier == "SHRIMP"
+        assert metadata["holder_tier_estimation_method"] == "threshold_scan"
+        assert metadata["holder_tier_sample_size"] == 250
 
         result = manager._calculate_holder_tiers(
             scanned_holders,
@@ -353,3 +355,37 @@ class TestCalculateHolderTiers:
         assert tier_map["FISH"] == 40
         assert tier_map["CRAB"] == 50
         assert tier_map["SHRIMP"] == 850
+
+    def test_top_100_whales_do_not_become_100_percent_when_total_count_known(self) -> None:
+        """A large known holder count must drive percentages, not the sample size."""
+        manager = _make_manager()
+        price_usd = 1.0
+        decimals = 18
+        divisor = 10**decimals
+
+        holders = [_make_holder(200_000 * divisor, f"0x{i:040x}", i + 1) for i in range(100)]
+        total_supply = 100_000_000 * divisor
+        total_count = 50_000
+
+        result = manager._calculate_holder_tiers(
+            holders,
+            total_count=total_count,
+            total_supply=total_supply,
+            price_usd=price_usd,
+            decimals=decimals,
+        )
+        assert result is not None
+
+        tier_map = {t["tier"]: t for t in result}
+        assert tier_map["WHALE"]["holders"] < total_count
+        assert tier_map["WHALE"]["holders_pct"] < 1.0
+        assert sum(t["holders"] for t in result) == total_count
+        assert any(t["holders"] > 0 for t in result if t["tier"] != "WHALE")
+
+    def test_unconfirmed_full_sample_uses_estimated_count_floor(self, monkeypatch) -> None:
+        """Do not treat a truncated top-holder sample as the full population."""
+        manager = _make_manager()
+        monkeypatch.setenv("HOLDER_TIER_UNCONFIRMED_COUNT_FLOOR", "2500")
+
+        assert manager._estimate_unconfirmed_holder_count(sample_size=100, requested_limit=100) == 2500
+        assert manager._estimate_unconfirmed_holder_count(sample_size=75, requested_limit=100) == 75
