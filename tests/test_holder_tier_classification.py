@@ -443,6 +443,39 @@ class TestCalculateHolderTiers:
         assert metrics["gini_coefficient"] > 0.7
         assert metrics["holder_tier_total_count"] is None
 
+    def test_tail_estimation_does_not_create_synthetic_whale(self) -> None:
+        """Tail supply residuals should be spread, not assigned to one fake holder."""
+        manager = _make_manager()
+        holders = [_make_holder(200_000, "0x1000000000000000000000000000000000000001", 1)]
+
+        groups = manager._estimate_full_distribution_groups(
+            known_holders=holders,
+            total_count=1_001,
+            total_supply=1_000_000,
+            price_usd=1.0,
+            decimals=0,
+        )
+
+        assert sum(balance * count for balance, count in groups) == 1_000_000
+        assert max(balance for balance, _ in groups) == 200_000
+
+    def test_nakamoto_uses_estimated_tail_without_fake_residual_holder(self) -> None:
+        """A partial sample should not let a synthetic residual dominate Nakamoto."""
+        manager = _make_manager()
+        holders = [_make_holder(200_000, "0x1000000000000000000000000000000000000001", 1)]
+
+        metrics = manager._calculate_metrics(
+            holders,
+            total_count=1_001,
+            total_supply=1_000_000,
+            price_usd=1.0,
+            decimals=0,
+            tier_holders=holders,
+        )
+
+        assert metrics["nakamoto_coefficient"] > 1
+        assert metrics["gini_coefficient"] < 0.9
+
     def test_nakamoto_defaults_to_51_percent_threshold(self) -> None:
         """Nakamoto should use a configurable threshold with 51% default."""
         manager = _make_manager()

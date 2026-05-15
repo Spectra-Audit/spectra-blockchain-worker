@@ -1042,13 +1042,7 @@ class HolderAPIManager:
                 (b for b in HOLDER_TIER_THRESHOLDS if b["tier"] == forced_remaining_tier),
                 HOLDER_TIER_THRESHOLDS[-1],
             )
-            groups.extend(self._synthetic_balance_groups_for_tier(
-                target_bucket,
-                remaining_count,
-                remaining_supply,
-                price_usd,
-                decimals_divisor,
-            ))
+            groups.extend(self._even_balance_groups(remaining_supply, remaining_count))
             return groups
 
         avg_balance = remaining_supply / remaining_count
@@ -1074,26 +1068,70 @@ class HolderAPIManager:
             return groups
 
         counts = self._allocate_remaining_tier_counts(remaining_count, per_tier_frac, total_frac)
+        tier_allocations = [
+            (bucket, count)
+            for bucket, count in zip(HOLDER_TIER_THRESHOLDS, counts)
+            if count > 0
+        ]
+        representative_weights = [
+            self._tier_representative_balance(bucket, price_usd, decimals_divisor) * count
+            for bucket, count in tier_allocations
+        ]
+        total_weight = sum(representative_weights)
+
         tail_groups: List[Tuple[int, int]] = []
-        for bucket, count in zip(HOLDER_TIER_THRESHOLDS, counts):
+        allocated_supply = 0
+        for index, ((bucket, count), weight) in enumerate(zip(tier_allocations, representative_weights)):
             if count <= 0:
                 continue
-            tier_supply = int(remaining_supply * count / remaining_count)
-            tail_groups.extend(
-                self._synthetic_balance_groups_for_tier(
-                    bucket,
-                    count,
-                    tier_supply,
-                    price_usd,
-                    decimals_divisor,
-                )
-            )
+            if total_weight > 0 and index < len(tier_allocations) - 1:
+                tier_supply = int(remaining_supply * weight / total_weight)
+                allocated_supply += tier_supply
+            else:
+                tier_supply = max(remaining_supply - allocated_supply, 0)
+            tail_groups.extend(self._even_balance_groups(tier_supply, count))
 
-        supply_gap = remaining_supply - sum(balance * count for balance, count in tail_groups)
-        if tail_groups and supply_gap:
-            balance, count = tail_groups[0]
-            tail_groups[0] = (max(0, balance + supply_gap), count)
         groups.extend(tail_groups)
+        return groups
+
+    def _tier_representative_balance(
+        self,
+        bucket: Dict,
+        price_usd: float,
+        decimals_divisor: int,
+    ) -> int:
+        """Return a representative raw balance for a USD tier."""
+        min_usd = bucket["min_usd"]
+        if bucket["tier"] == "WHALE":
+            representative_usd = min_usd * 2
+        elif bucket["tier"] == "SHRIMP":
+            representative_usd = 5
+        else:
+            bucket_index = next(
+                (
+                    index
+                    for index, threshold in enumerate(HOLDER_TIER_THRESHOLDS)
+                    if threshold["tier"] == bucket["tier"]
+                ),
+                0,
+            )
+            upper_usd = HOLDER_TIER_THRESHOLDS[bucket_index - 1]["min_usd"]
+            representative_usd = (min_usd + upper_usd) / 2
+
+        return max(1, int((representative_usd / price_usd) * decimals_divisor))
+
+    def _even_balance_groups(self, supply: int, count: int) -> List[Tuple[int, int]]:
+        """Represent a supply split across holders without creating one fake giant holder."""
+        if count <= 0 or supply <= 0:
+            return []
+
+        base = supply // count
+        remainder = supply - (base * count)
+        groups: List[Tuple[int, int]] = []
+        if remainder > 0:
+            groups.append((base + 1, remainder))
+        if count - remainder > 0 and base > 0:
+            groups.append((base, count - remainder))
         return groups
 
     def _synthetic_balance_groups_for_tier(
@@ -1123,10 +1161,14 @@ class HolderAPIManager:
 
         representative_balance = max(1, int((representative_usd / price_usd) * decimals_divisor))
         balance = min(representative_balance, max(1, supply // count))
-        gap = supply - (balance * count)
-        if gap > 0:
-            return [(balance + gap, 1), (balance, count - 1)] if count > 1 else [(balance + gap, 1)]
-        return [(balance, count)]
+        allocated = balance * count
+        if allocated >= supply:
+            return [(balance, count)]
+
+        # Preserve the full supply without assigning the entire residual to a
+        # single synthetic holder.  A one-holder residual was enough to create a
+        # fake whale and corrupt Gini/Nakamoto for large holder populations.
+        return self._even_balance_groups(supply, count)
 
     def _calculate_weighted_gini(self, balance_groups: List[Tuple[int, int]]) -> float:
         """Calculate Gini coefficient from weighted balance groups."""
@@ -1331,12 +1373,14 @@ class HolderAPIManager:
                         count = counts[i]
                         if count > 0:
                             bucket["holders"] += count
-                            # Supply estimate: midpoint USD of tier × price
-                            if i < len(buckets) - 1:
-                                mid_usd = (bucket["min_usd"] + buckets[i + 1]["min_usd"]) / 2
-                            else:
-                                mid_usd = bucket["min_usd"] + 0.5
-                            mid_balance = (mid_usd / price_usd) * decimals_divisor
+                            # Supply estimate: representative tier USD value.
+                            # Buckets are sorted high -> low, so the upper bound
+                            # for a non-whale tier is the previous bucket's min.
+                            mid_balance = self._tier_representative_balance(
+                                bucket,
+                                price_usd,
+                                decimals_divisor,
+                            )
                             bucket["supply"] += int(count * mid_balance)
 
         # ---- 3. Build result with percentages ----
