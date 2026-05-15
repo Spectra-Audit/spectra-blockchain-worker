@@ -20,9 +20,11 @@ Features:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
+import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from scout.cache_manager import HolderDataCache
@@ -121,6 +123,11 @@ class HolderAPIManager:
         self.database = database
         self.enable_cache = enable_cache
         self.enable_rate_limiting = enable_rate_limiting
+        self.metadata_cache_ttl = cache_ttl
+        self._total_supply_cache: dict[tuple[int, str], tuple[float, int | None]] = {}
+        self._decimals_cache: dict[tuple[int, str], tuple[float, int]] = {}
+        self._price_cache: dict[tuple[int, str], tuple[float, float | None]] = {}
+        self._dexscreener_client = None
 
         # Initialize cache
         if enable_cache:
@@ -281,6 +288,12 @@ class HolderAPIManager:
         Returns:
             Total supply as integer, or None if call fails
         """
+        cache_key = (chain_id, token_address.lower())
+        cached = self._total_supply_cache.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < self.metadata_cache_ttl:
+            return cached[1]
+
         if not self.database:
             LOGGER.warning("Cannot get totalSupply: no database manager configured")
             return None
@@ -315,6 +328,7 @@ class HolderAPIManager:
             if result and isinstance(result, str):
                 total_supply = int(result, 16) if result.startswith("0x") else int(result)
                 LOGGER.info(f"Got totalSupply for {token_address[:10]}...: {total_supply}")
+                self._total_supply_cache[cache_key] = (now, total_supply)
                 return total_supply
 
         except Exception as e:
@@ -324,6 +338,7 @@ class HolderAPIManager:
             if rpc_mgr:
                 await rpc_mgr.close()
 
+        self._total_supply_cache[cache_key] = (now, None)
         return None
 
     async def get_token_decimals(
@@ -343,6 +358,12 @@ class HolderAPIManager:
         Returns:
             Token decimals (defaults to 18 if call fails)
         """
+        cache_key = (chain_id, token_address.lower())
+        cached = self._decimals_cache.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < self.metadata_cache_ttl:
+            return cached[1]
+
         if not self.database:
             LOGGER.debug("Cannot get decimals: no database manager configured, defaulting to 18")
             return 18
@@ -375,6 +396,7 @@ class HolderAPIManager:
             if result and isinstance(result, str):
                 decimals = int(result, 16) if result.startswith("0x") else int(result)
                 LOGGER.info(f"Got decimals for {token_address[:10]}...: {decimals}")
+                self._decimals_cache[cache_key] = (now, decimals)
                 return decimals
 
         except Exception as e:
@@ -383,6 +405,7 @@ class HolderAPIManager:
             if rpc_mgr:
                 await rpc_mgr.close()
 
+        self._decimals_cache[cache_key] = (now, 18)
         return 18
 
     async def get_holder_data(
@@ -633,22 +656,42 @@ class HolderAPIManager:
         self, token_address: str, chain_id: int,
     ) -> Optional[float]:
         """Fetch current token price from DexScreener for tier classification."""
+        cache_key = (chain_id, token_address.lower())
+        cached = self._price_cache.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < self.metadata_cache_ttl:
+            return cached[1]
+
         try:
             from scout.dexscreener_client import DexScreenerClient
-            dex_client = DexScreenerClient()
-            chain_str = "ethereum" if chain_id == 1 else str(chain_id)
-            pairs = await dex_client.get_token_pairs(
+
+            if self._dexscreener_client is None:
+                self._dexscreener_client = DexScreenerClient()
+
+            chain_map = {
+                1: "ethereum",
+                10: "optimism",
+                56: "bsc",
+                137: "polygon",
+                8453: "base",
+                42161: "arbitrum",
+                43114: "avalanche",
+                59144: "linea",
+            }
+            chain_str = chain_map.get(chain_id, str(chain_id))
+            pairs = await self._dexscreener_client.get_token_pairs(
                 chain_str, token_address, fetch_detailed=False,
             )
             price = None
             if pairs and pairs[0].price_usd:
                 price = float(pairs[0].price_usd)
-            await dex_client.close()
             if price:
                 LOGGER.info(f"DexScreener price for {token_address[:10]}...: ${price}")
+            self._price_cache[cache_key] = (now, price)
             return price
         except Exception as e:
             LOGGER.warning(f"Failed to fetch price for tier classification: {e}")
+            self._price_cache[cache_key] = (now, None)
             return None
 
     async def _get_holder_tier_sample(
@@ -1434,36 +1477,41 @@ class HolderAPIManager:
         Returns:
             Dictionary mapping (token_address, chain_id) to HolderMetrics or None
         """
-        results = {}
+        results: dict[tuple[str, int], HolderMetrics | None] = {}
+        semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
-        # Split into batches to control concurrency
-        for i in range(0, len(tokens), max_concurrency):
-            batch = tokens[i:i + max_concurrency]
-
-            # Create tasks for this batch
-            tasks = []
-            for token_address, chain_id in batch:
-                task = self.get_holder_data(
-                    token_address=token_address,
-                    chain_id=chain_id,
-                    limit=limit,
-                    bypass_cache=bypass_cache,
-                )
-                tasks.append((token_address, chain_id, task))
-
-            # Execute batch concurrently
-            LOGGER.info(f"Fetching holder data for batch of {len(tasks)} tokens")
-            for token_address, chain_id, task in tasks:
+        async def fetch_one(
+            token_address: str,
+            chain_id: int,
+        ) -> tuple[tuple[str, int], HolderMetrics | None]:
+            async with semaphore:
                 try:
-                    metrics = await task
-                    results[(token_address, chain_id)] = metrics
+                    metrics = await self.get_holder_data(
+                        token_address=token_address,
+                        chain_id=chain_id,
+                        limit=limit,
+                        bypass_cache=bypass_cache,
+                    )
                     status = "SUCCESS" if metrics else "FAILED"
                     LOGGER.info(
                         f"Completed {token_address[:10]}... on chain {chain_id}: {status}"
                     )
+                    return (token_address, chain_id), metrics
                 except Exception as e:
                     LOGGER.error(f"Failed to fetch data for {token_address[:10]}... on chain {chain_id}: {e}")
-                    results[(token_address, chain_id)] = None
+                    return (token_address, chain_id), None
+
+        LOGGER.info(
+            "Fetching holder data for %d tokens with max_concurrency=%d",
+            len(tokens),
+            max_concurrency,
+        )
+        completed = await asyncio.gather(
+            *(fetch_one(token_address, chain_id) for token_address, chain_id in tokens),
+            return_exceptions=False,
+        )
+        for key, metrics in completed:
+            results[key] = metrics
 
         return results
 
@@ -1534,6 +1582,9 @@ class HolderAPIManager:
         """Close all provider HTTP clients and cleanup resources."""
         for provider in self.providers.values():
             await provider.close()
+        if self._dexscreener_client is not None:
+            await self._dexscreener_client.close()
+            self._dexscreener_client = None
 
 
 def create_holder_api_manager(
