@@ -17,6 +17,18 @@ def _make_holder(balance: int, address: str = "0xabc", rank: int = 1) -> HolderD
     return HolderData(address=address, balance=balance, rank=rank)
 
 
+def _make_labeled_holder(
+    balance: int,
+    address: str,
+    label: str,
+    rank: int = 1,
+) -> HolderData:
+    """Create a HolderData instance with provider/backend label metadata."""
+    holder = _make_holder(balance, address, rank)
+    holder.label = label
+    return holder
+
+
 class _PagingHolderProvider(HolderAPIProvider):
     """Mock provider that can return a sorted holder prefix for deep tier scans."""
 
@@ -389,3 +401,50 @@ class TestCalculateHolderTiers:
 
         assert manager._estimate_unconfirmed_holder_count(sample_size=100, requested_limit=100) == 2500
         assert manager._estimate_unconfirmed_holder_count(sample_size=75, requested_limit=100) == 75
+
+    def test_metrics_exclude_burn_and_labeled_operational_wallets(self) -> None:
+        """Burn/dead and labeled exchange/treasury wallets should not skew metrics."""
+        manager = _make_manager()
+        holders = [
+            _make_holder(500, "0x000000000000000000000000000000000000dEaD", 1),
+            _make_labeled_holder(300, "0x1000000000000000000000000000000000000001", "CEX Exchange", 2),
+            _make_holder(100, "0x2000000000000000000000000000000000000002", 3),
+            _make_holder(100, "0x3000000000000000000000000000000000000003", 4),
+        ]
+
+        metrics = manager._calculate_metrics(
+            holders,
+            total_count=4,
+            total_supply=1000,
+            price_usd=1.0,
+            decimals=0,
+            tier_holders=holders,
+        )
+
+        assert metrics["excluded_holder_count"] == 2
+        assert metrics["excluded_supply"] == 800
+        assert metrics["excluded_supply_pct"] == 80.0
+        assert metrics["estimated_total_supply"] == "0xc8"
+
+    def test_gini_uses_estimated_tail_population(self) -> None:
+        """A partial holder sample should not produce single-holder Gini=0."""
+        manager = _make_manager()
+        holders = [_make_holder(900, "0x1000000000000000000000000000000000000001", 1)]
+
+        metrics = manager._calculate_metrics(
+            holders,
+            total_count=10,
+            total_supply=1000,
+            price_usd=1.0,
+            decimals=0,
+            tier_holders=holders,
+        )
+
+        assert metrics["gini_coefficient"] > 0.7
+        assert metrics["holder_tier_total_count"] is None
+
+    def test_nakamoto_defaults_to_51_percent_threshold(self) -> None:
+        """Nakamoto should use a configurable threshold with 51% default."""
+        manager = _make_manager()
+
+        assert manager._calculate_nakamoto([40, 30, 30], 100) == 2

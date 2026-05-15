@@ -163,6 +163,14 @@ class TokenHolderScout:
                 **({"holder_tiers": metrics.holder_tiers} if metrics.holder_tiers else {}),
                 **({"price_usd": metrics.price_usd} if metrics.price_usd is not None else {}),
                 **(
+                    {"nakamoto_threshold_pct": metrics.nakamoto_threshold_pct}
+                    if metrics.nakamoto_threshold_pct is not None
+                    else {}
+                ),
+                "excluded_holder_count": metrics.excluded_holder_count,
+                "excluded_supply": metrics.excluded_supply,
+                "excluded_supply_pct": metrics.excluded_supply_pct,
+                **(
                     {"holder_tier_estimation_method": metrics.holder_tier_estimation_method}
                     if metrics.holder_tier_estimation_method
                     else {}
@@ -305,8 +313,15 @@ class TokenHolderScout:
 
         # Store raw top holders
         # Convert hex supply to int for percentage calculation
-        total_supply_hex = data["metrics"]["estimated_total_supply"]
-        total_supply_int = int(total_supply_hex, 16) if total_supply_hex.startswith("0x") else int(total_supply_hex)
+        total_supply_value = data["metrics"]["estimated_total_supply"]
+        if isinstance(total_supply_value, str):
+            total_supply_int = (
+                int(total_supply_value, 16)
+                if total_supply_value.startswith("0x")
+                else int(total_supply_value)
+            )
+        else:
+            total_supply_int = int(total_supply_value or 0)
 
         for holder in data["top_holders"]:
             self.database.store_top_holder_data(

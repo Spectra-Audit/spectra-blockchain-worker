@@ -56,6 +56,24 @@ HOLDER_TIER_THRESHOLDS = [
 DEFAULT_HOLDER_TIER_SCAN_LIMIT = 5000
 DEFAULT_UNCONFIRMED_HOLDER_COUNT_FLOOR = 5000
 SHRIMP_THRESHOLD_USD = 10
+DEFAULT_NAKAMOTO_THRESHOLD_PCT = 51.0
+EXCLUDED_LABEL_KEYWORDS = (
+    "lp",
+    "liquidity",
+    "pool",
+    "staking",
+    "stake",
+    "vesting",
+    "bridge",
+    "treasury",
+    "exchange",
+    "cex",
+)
+BURN_OR_DEAD_ADDRESSES = {
+    "0x0000000000000000000000000000000000000000",
+    "0x000000000000000000000000000000000000dead",
+    "0x0000000000000000000000000000000000000001",
+}
 
 class HolderAPIManager:
     """Manages multiple holder API providers with automatic failover.
@@ -434,7 +452,7 @@ class HolderAPIManager:
         exclude_failed: List[str] = []
         max_retries = len(self.providers)
 
-        for attempt in range(max_retries):
+        for _attempt in range(max_retries):
             provider = self.get_provider_for_chain(chain_id, exclude_failed)
 
             if not provider:
@@ -769,8 +787,9 @@ class HolderAPIManager:
     ) -> Dict:
         """Calculate distribution metrics from holder data.
 
-        Dead address (0x...dEaD) is excluded from gini/nakamoto calculations
-        and its balance is subtracted from total supply (burned tokens).
+        Burn/dead addresses and labeled operational wallets are excluded from
+        gini/nakamoto calculations and their known balances are subtracted
+        from the effective supply.
 
         Args:
             holders: List of holder data (sorted by balance descending)
@@ -793,37 +812,44 @@ class HolderAPIManager:
                 "price_usd": price_usd,
             }
 
-        # Exclude dead address from concentration metrics
-        DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD".lower()
-        dead_balance = 0
+        # Exclude burn/dead addresses and known operational wallets from
+        # concentration metrics when labels are available on holder objects.
+        excluded_balance = 0
+        excluded_count = 0
         filtered_holders = []
         for h in holders:
-            if h.address.lower() == DEAD_ADDRESS:
-                dead_balance = h.balance
-                LOGGER.info(f"Excluding dead address from metrics: balance={h.balance}")
+            if self._should_exclude_holder_from_concentration(h):
+                excluded_balance += h.balance
+                excluded_count += 1
+                LOGGER.info(
+                    "Excluding holder from concentration metrics: address=%s balance=%s",
+                    h.address,
+                    h.balance,
+                )
             else:
                 filtered_holders.append(h)
 
         tier_filtered_holders = []
         for h in tier_holders or filtered_holders:
-            if h.address.lower() != DEAD_ADDRESS:
+            if not self._should_exclude_holder_from_concentration(h):
                 tier_filtered_holders.append(h)
 
         balances = [h.balance for h in filtered_holders]
         top_100_sum = sum(balances)
 
-        # Subtract burned tokens from total supply
+        # Subtract known excluded supply.
         if total_supply is not None:
-            effective_supply = total_supply - dead_balance
+            effective_supply = total_supply - excluded_balance
             LOGGER.info(
-                f"Adjusted total supply for burned tokens: "
-                f"{total_supply} - {dead_balance} = {effective_supply}"
+                "Adjusted total supply for excluded wallets: %s - %s = %s",
+                total_supply,
+                excluded_balance,
+                effective_supply,
             )
             estimated_total_supply = max(effective_supply, 0)
-        elif dead_balance > 0:
-            # Estimate minus burned
-            estimated_total_supply = max(top_100_sum * 2 - dead_balance, 0)
-            LOGGER.debug("Using estimated supply adjusted for burned tokens")
+        elif excluded_balance > 0:
+            estimated_total_supply = max(top_100_sum * 2 - excluded_balance, 0)
+            LOGGER.debug("Using estimated supply adjusted for excluded wallets")
         else:
             estimated_total_supply = top_100_sum * 2
             LOGGER.debug("Using estimated total supply (top_100_sum * 2)")
@@ -832,22 +858,41 @@ class HolderAPIManager:
         top_100_sum_hex = f"0x{top_100_sum:x}"
         estimated_total_supply_hex = f"0x{estimated_total_supply:x}"
 
-        # Gini coefficient (excludes dead address)
-        gini = self._calculate_gini(balances)
+        effective_count = max(total_count - excluded_count, 1)
+        distribution_groups = self._estimate_full_distribution_groups(
+            known_holders=tier_filtered_holders,
+            total_count=effective_count,
+            total_supply=estimated_total_supply,
+            price_usd=price_usd,
+            decimals=decimals,
+            forced_remaining_tier=forced_remaining_tier,
+        )
+        if not distribution_groups:
+            distribution_groups = [(balance, 1) for balance in balances if balance > 0]
 
-        # Nakamoto coefficient (holders for 51%, excludes dead address)
-        nakamoto = self._calculate_nakamoto(balances, top_100_sum)
+        # Gini coefficient over exact known balances plus estimated full tail.
+        gini = self._calculate_weighted_gini(distribution_groups)
 
-        # Top 10% and 1% of holders (adjust count for dead address removal)
-        effective_count = max(total_count - (1 if dead_balance > 0 else 0), 1)
+        nakamoto_threshold_pct = self._nakamoto_threshold_pct()
+        nakamoto = self._calculate_weighted_nakamoto(
+            distribution_groups,
+            estimated_total_supply,
+            threshold_pct=nakamoto_threshold_pct,
+        )
+
         top_10_n = max(1, effective_count // 10) if effective_count > 0 else 10
         top_1_n = max(1, effective_count // 100) if effective_count > 0 else 1
 
-        top_10_sum = sum(balances[:min(top_10_n, len(balances))])
-        top_1_sum = sum(balances[:min(top_1_n, len(balances))])
+        top_10_sum = self._sum_top_weighted_balances(distribution_groups, top_10_n)
+        top_1_sum = self._sum_top_weighted_balances(distribution_groups, top_1_n)
 
         top_10_pct = (top_10_sum / estimated_total_supply * 100) if estimated_total_supply > 0 else 0
         top_1_pct = (top_1_sum / estimated_total_supply * 100) if estimated_total_supply > 0 else 0
+        excluded_supply_pct = (
+            excluded_balance / total_supply * 100
+            if total_supply and total_supply > 0
+            else 0.0
+        )
 
         tier_metadata = tier_metadata or {}
         return {
@@ -858,14 +903,252 @@ class HolderAPIManager:
             "top_100_balance_sum": top_100_sum_hex,
             "estimated_total_supply": estimated_total_supply_hex,
             "holder_tiers": self._calculate_holder_tiers(
-                tier_filtered_holders, total_count, estimated_total_supply, price_usd,
+                tier_filtered_holders, effective_count, estimated_total_supply, price_usd,
                 decimals=decimals, forced_remaining_tier=forced_remaining_tier,
             ) if price_usd and price_usd > 0 else None,
             "price_usd": price_usd,
             "holder_tier_estimation_method": tier_metadata.get("holder_tier_estimation_method"),
             "holder_tier_sample_size": tier_metadata.get("holder_tier_sample_size"),
             "holder_tier_total_count": tier_metadata.get("holder_tier_total_count"),
+            "nakamoto_threshold_pct": nakamoto_threshold_pct,
+            "excluded_holder_count": excluded_count,
+            "excluded_supply": excluded_balance,
+            "excluded_supply_pct": round(excluded_supply_pct, 3),
         }
+
+    def _nakamoto_threshold_pct(self) -> float:
+        """Return configured Nakamoto supply threshold percentage."""
+        raw_threshold = os.environ.get("NAKAMOTO_SUPPLY_THRESHOLD_PCT")
+        try:
+            threshold = float(raw_threshold) if raw_threshold else DEFAULT_NAKAMOTO_THRESHOLD_PCT
+        except (TypeError, ValueError):
+            threshold = DEFAULT_NAKAMOTO_THRESHOLD_PCT
+        return max(0.01, min(100.0, threshold))
+
+    def _should_exclude_holder_from_concentration(self, holder: HolderData) -> bool:
+        """Exclude burn/dead and known operational wallets from concentration metrics."""
+        address = (holder.address or "").lower()
+        if address in BURN_OR_DEAD_ADDRESSES:
+            return True
+
+        label_parts: List[str] = []
+        for attr in ("label", "category", "holder_type", "name"):
+            value = getattr(holder, attr, None)
+            if isinstance(value, str) and value.strip():
+                label_parts.append(value.strip().lower())
+        tags = getattr(holder, "tags", None)
+        if isinstance(tags, list):
+            for tag in tags:
+                if isinstance(tag, str):
+                    label_parts.append(tag.lower())
+                elif isinstance(tag, dict):
+                    label_parts.extend(
+                        str(value).lower()
+                        for value in tag.values()
+                        if isinstance(value, str)
+                    )
+
+        label = " ".join(label_parts)
+        if not label:
+            return False
+
+        return any(keyword in label for keyword in EXCLUDED_LABEL_KEYWORDS)
+
+    def _estimate_full_distribution_groups(
+        self,
+        known_holders: List[HolderData],
+        total_count: int,
+        total_supply: int,
+        price_usd: Optional[float],
+        decimals: int,
+        forced_remaining_tier: Optional[str] = None,
+    ) -> List[Tuple[int, int]]:
+        """Build exact known balances plus weighted synthetic tail groups."""
+        groups: List[Tuple[int, int]] = [
+            (max(0, h.balance), 1)
+            for h in known_holders
+            if h.balance > 0
+        ]
+        known_supply = sum(balance for balance, _ in groups)
+        known_count = len(groups)
+        if total_count <= known_count:
+            return groups[:total_count]
+        if total_count <= 0 or total_supply <= 0:
+            return groups
+
+        remaining_count = total_count - known_count
+        remaining_supply = max(total_supply - known_supply, 0)
+        if remaining_count <= 0:
+            return groups
+        if remaining_supply <= 0:
+            return groups
+
+        if not price_usd or price_usd <= 0 or not math.isfinite(price_usd):
+            avg_balance = remaining_supply // remaining_count
+            groups.append((avg_balance, remaining_count))
+            return groups
+
+        try:
+            decimals = int(decimals)
+        except (TypeError, ValueError):
+            decimals = 18
+        decimals_divisor = 10 ** max(decimals, 0)
+
+        if forced_remaining_tier:
+            target_bucket = next(
+                (b for b in HOLDER_TIER_THRESHOLDS if b["tier"] == forced_remaining_tier),
+                HOLDER_TIER_THRESHOLDS[-1],
+            )
+            groups.extend(self._synthetic_balance_groups_for_tier(
+                target_bucket,
+                remaining_count,
+                remaining_supply,
+                price_usd,
+                decimals_divisor,
+            ))
+            return groups
+
+        avg_balance = remaining_supply / remaining_count
+        avg_usd = (avg_balance / decimals_divisor) * price_usd
+        if avg_usd <= 0:
+            groups.append((remaining_supply // remaining_count, remaining_count))
+            return groups
+
+        alpha = 1.5
+        xm = avg_usd * (alpha - 1) / alpha
+        per_tier_frac = []
+        for i, bucket in enumerate(HOLDER_TIER_THRESHOLDS):
+            lower = bucket["min_usd"]
+            upper = HOLDER_TIER_THRESHOLDS[i - 1]["min_usd"] if i > 0 else float("inf")
+            sf_lower = (xm / lower) ** alpha if lower and lower >= xm else 1.0
+            sf_upper = (xm / upper) ** alpha if upper >= xm else 1.0
+            per_tier_frac.append(max(sf_lower - sf_upper, 0.0))
+
+        total_frac = sum(per_tier_frac)
+        if total_frac <= 0:
+            avg = remaining_supply // remaining_count
+            groups.append((avg, remaining_count))
+            return groups
+
+        counts = self._allocate_remaining_tier_counts(remaining_count, per_tier_frac, total_frac)
+        tail_groups: List[Tuple[int, int]] = []
+        for bucket, count in zip(HOLDER_TIER_THRESHOLDS, counts):
+            if count <= 0:
+                continue
+            tier_supply = int(remaining_supply * count / remaining_count)
+            tail_groups.extend(
+                self._synthetic_balance_groups_for_tier(
+                    bucket,
+                    count,
+                    tier_supply,
+                    price_usd,
+                    decimals_divisor,
+                )
+            )
+
+        supply_gap = remaining_supply - sum(balance * count for balance, count in tail_groups)
+        if tail_groups and supply_gap:
+            balance, count = tail_groups[0]
+            tail_groups[0] = (max(0, balance + supply_gap), count)
+        groups.extend(tail_groups)
+        return groups
+
+    def _synthetic_balance_groups_for_tier(
+        self,
+        bucket: Dict,
+        count: int,
+        supply: int,
+        price_usd: float,
+        decimals_divisor: int,
+    ) -> List[Tuple[int, int]]:
+        """Create weighted synthetic holder balance groups for a tier."""
+        if count <= 0:
+            return []
+        if supply <= 0:
+            return []
+
+        min_usd = bucket["min_usd"]
+        if bucket["tier"] == "WHALE":
+            representative_usd = max(min_usd, (supply / count / decimals_divisor) * price_usd)
+        elif bucket["tier"] == "SHRIMP":
+            representative_usd = 5
+        else:
+            next_min = HOLDER_TIER_THRESHOLDS[
+                HOLDER_TIER_THRESHOLDS.index(bucket) - 1
+            ]["min_usd"]
+            representative_usd = (min_usd + next_min) / 2
+
+        representative_balance = max(1, int((representative_usd / price_usd) * decimals_divisor))
+        balance = min(representative_balance, max(1, supply // count))
+        gap = supply - (balance * count)
+        if gap > 0:
+            return [(balance + gap, 1), (balance, count - 1)] if count > 1 else [(balance + gap, 1)]
+        return [(balance, count)]
+
+    def _calculate_weighted_gini(self, balance_groups: List[Tuple[int, int]]) -> float:
+        """Calculate Gini coefficient from weighted balance groups."""
+        groups = [(balance, count) for balance, count in balance_groups if count > 0 and balance >= 0]
+        if not groups:
+            return 0.0
+
+        n = sum(count for _, count in groups)
+        total = sum(balance * count for balance, count in groups)
+        if n <= 0 or total <= 0:
+            return 0.0
+
+        weighted_sum = 0.0
+        seen = 0
+        for balance, count in sorted(groups, key=lambda item: item[0]):
+            index_sum = count * (2 * seen + count + 1) / 2
+            weighted_sum += balance * index_sum
+            seen += count
+
+        gini = (2 * weighted_sum) / (n * total) - (n + 1) / n
+        return max(0.0, min(1.0, gini))
+
+    def _calculate_weighted_nakamoto(
+        self,
+        balance_groups: List[Tuple[int, int]],
+        total: int,
+        threshold_pct: float,
+    ) -> int:
+        """Calculate Nakamoto coefficient from weighted balance groups."""
+        if total <= 0:
+            return 0
+
+        target = total * (threshold_pct / 100)
+        cumulative = 0
+        holders = 0
+        for balance, count in sorted(balance_groups, key=lambda item: item[0], reverse=True):
+            if count <= 0 or balance <= 0:
+                continue
+            remaining = target - cumulative
+            needed = min(count, max(1, math.ceil(remaining / balance)))
+            holders += needed
+            cumulative += needed * balance
+            if cumulative >= target:
+                return holders
+
+        return holders
+
+    def _sum_top_weighted_balances(
+        self,
+        balance_groups: List[Tuple[int, int]],
+        limit: int,
+    ) -> int:
+        """Sum the top N balances from weighted groups."""
+        if limit <= 0:
+            return 0
+
+        remaining = limit
+        total = 0
+        for balance, count in sorted(balance_groups, key=lambda item: item[0], reverse=True):
+            if remaining <= 0:
+                break
+            take = min(count, remaining)
+            total += balance * take
+            remaining -= take
+        return total
 
     def _calculate_holder_tiers(
         self,
@@ -1099,26 +1382,33 @@ class HolderAPIManager:
 
         return max(0.0, min(1.0, gini))
 
-    def _calculate_nakamoto(self, balances: List[int], total: int) -> int:
+    def _calculate_nakamoto(
+        self,
+        balances: List[int],
+        total: int,
+        threshold_pct: float = DEFAULT_NAKAMOTO_THRESHOLD_PCT,
+    ) -> int:
         """Calculate Nakamoto coefficient.
 
         The Nakamoto coefficient is the minimum number of holders needed
-        to control 51% of the supply.
+        to control the configured percentage of supply.
 
         Args:
             balances: List of balances sorted by size (descending)
-            total: Total supply (sum of all balances)
+            total: Effective supply after exclusions
+            threshold_pct: Supply threshold percentage
 
         Returns:
-            Number of holders needed for 51% control
+            Number of holders needed for threshold control
         """
         if total == 0:
             return 0
 
+        target = total * (threshold_pct / 100)
         cumulative = 0
-        for i, balance in enumerate(balances):
+        for i, balance in enumerate(sorted(balances, reverse=True)):
             cumulative += balance
-            if cumulative > total / 2:
+            if cumulative >= target:
                 return i + 1
 
         return len(balances)

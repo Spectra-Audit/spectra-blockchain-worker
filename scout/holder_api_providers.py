@@ -43,7 +43,7 @@ class HolderMetrics:
         total_holder_count: Total number of holders
         top_holders: List of top holder data
         gini_coefficient: Gini coefficient (0-1, higher = more unequal)
-        nakamoto_coefficient: Number of holders needed for 51% control
+        nakamoto_coefficient: Number of holders needed for configured supply control threshold
         top_10_pct_supply: Percentage of supply held by top 10%
         top_1_pct_supply: Percentage of supply held by top 1%
         top_100_balance_sum: Sum of top 100 balances (hex string for TEXT storage)
@@ -64,6 +64,10 @@ class HolderMetrics:
     holder_tier_sample_size: Optional[int] = None
     holder_tier_total_count: Optional[int] = None
     holder_count_confirmed: bool = True
+    nakamoto_threshold_pct: Optional[float] = None
+    excluded_holder_count: int = 0
+    excluded_supply: int = 0
+    excluded_supply_pct: float = 0.0
 
 
 class HolderAPIProvider(abc.ABC):
