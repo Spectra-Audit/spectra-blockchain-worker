@@ -1037,12 +1037,29 @@ class HolderAPIManager:
             decimals = 18
         decimals_divisor = 10 ** max(decimals, 0)
 
+        unseen_upper_balance = min(
+            (known_holders[-1].balance if known_holders else remaining_supply),
+            remaining_supply,
+        )
+
         if forced_remaining_tier:
             target_bucket = next(
                 (b for b in HOLDER_TIER_THRESHOLDS if b["tier"] == forced_remaining_tier),
                 HOLDER_TIER_THRESHOLDS[-1],
             )
-            groups.extend(self._even_balance_groups(remaining_supply, remaining_count))
+            max_balance = self._tier_max_balance(
+                target_bucket,
+                price_usd,
+                decimals_divisor,
+                unseen_upper_balance,
+            )
+            groups.extend(
+                self._bounded_even_balance_groups(
+                    remaining_supply,
+                    remaining_count,
+                    max_balance,
+                )
+            )
             return groups
 
         avg_balance = remaining_supply / remaining_count
@@ -1074,7 +1091,7 @@ class HolderAPIManager:
             if count > 0
         ]
         representative_weights = [
-            self._tier_representative_balance(bucket, price_usd, decimals_divisor) * count
+            self._tier_max_balance(bucket, price_usd, decimals_divisor, unseen_upper_balance) * count
             for bucket, count in tier_allocations
         ]
         total_weight = sum(representative_weights)
@@ -1089,10 +1106,61 @@ class HolderAPIManager:
                 allocated_supply += tier_supply
             else:
                 tier_supply = max(remaining_supply - allocated_supply, 0)
-            tail_groups.extend(self._even_balance_groups(tier_supply, count))
+            max_balance = self._tier_max_balance(
+                bucket,
+                price_usd,
+                decimals_divisor,
+                unseen_upper_balance,
+            )
+            tail_groups.extend(
+                self._bounded_even_balance_groups(tier_supply, count, max_balance)
+            )
 
         groups.extend(tail_groups)
         return groups
+
+    def _tier_max_balance(
+        self,
+        bucket: Dict,
+        price_usd: float,
+        decimals_divisor: int,
+        upper_balance_cap: Optional[int] = None,
+    ) -> int:
+        """Return the maximum plausible raw balance for an unseen holder tier.
+
+        Exact fetched holders are kept as-is.  For unseen holders, estimate the
+        tier range using the largest value in that tier:
+        - Shark max: $100K
+        - Dolphin max: $10K
+        - Fish max: $1K
+        - Crab max: $100
+        - Shrimp max: $10
+
+        Whale is unbounded, so unseen whales are capped by the last fetched
+        holder balance.  All unseen tiers are also capped by that last fetched
+        holder balance because holder API pages are sorted descending.
+        """
+        if price_usd <= 0 or decimals_divisor <= 0:
+            return 0
+
+        bucket_index = next(
+            (
+                index
+                for index, threshold in enumerate(HOLDER_TIER_THRESHOLDS)
+                if threshold["tier"] == bucket["tier"]
+            ),
+            0,
+        )
+        if bucket_index == 0:
+            raw_balance = upper_balance_cap or int((bucket["min_usd"] / price_usd) * decimals_divisor)
+        else:
+            upper_usd = HOLDER_TIER_THRESHOLDS[bucket_index - 1]["min_usd"]
+            raw_balance = int((upper_usd / price_usd) * decimals_divisor)
+
+        raw_balance = max(1, raw_balance)
+        if upper_balance_cap and upper_balance_cap > 0:
+            raw_balance = min(raw_balance, upper_balance_cap)
+        return raw_balance
 
     def _tier_representative_balance(
         self,
@@ -1133,6 +1201,26 @@ class HolderAPIManager:
         if count - remainder > 0 and base > 0:
             groups.append((base, count - remainder))
         return groups
+
+    def _bounded_even_balance_groups(
+        self,
+        supply: int,
+        count: int,
+        max_balance: int,
+    ) -> List[Tuple[int, int]]:
+        """Split supply across holders while respecting a per-holder max.
+
+        If the tier-count upper bound cannot absorb the allocated supply, put
+        every holder in that tier at the max.  The remaining supply is handled
+        by later tiers or ignored if no tier can plausibly absorb it, preventing
+        creation of a single fake whale.
+        """
+        if count <= 0 or supply <= 0 or max_balance <= 0:
+            return []
+
+        max_supply = max_balance * count
+        capped_supply = min(supply, max_supply)
+        return self._even_balance_groups(capped_supply, count)
 
     def _synthetic_balance_groups_for_tier(
         self,
@@ -1297,6 +1385,10 @@ class HolderAPIManager:
         # ---- 2. Distribute remaining holders via Pareto model ----
         remaining_count = max(total_count - len(holders), 0)
         remaining_supply = max(total_supply - known_supply, 0)
+        unseen_upper_balance = min(
+            holders[-1].balance if holders else remaining_supply,
+            remaining_supply,
+        )
 
         if remaining_count > 0 and forced_remaining_tier:
             bucket = next(
@@ -1305,7 +1397,13 @@ class HolderAPIManager:
             )
             bucket["holders"] += remaining_count
             if remaining_supply > 0:
-                bucket["supply"] += remaining_supply
+                max_balance = self._tier_max_balance(
+                    bucket,
+                    price_usd,
+                    decimals_divisor,
+                    unseen_upper_balance,
+                )
+                bucket["supply"] += min(remaining_supply, max_balance * remaining_count)
         elif remaining_count > 0:
             # Compute the average USD value for the remaining holders.
             # When known holders collectively hold less than total supply,
@@ -1369,19 +1467,31 @@ class HolderAPIManager:
                     counts = self._allocate_remaining_tier_counts(
                         remaining_count, per_tier_frac, total_frac,
                     )
+                    tier_capacities = [
+                        self._tier_max_balance(
+                            bucket,
+                            price_usd,
+                            decimals_divisor,
+                            unseen_upper_balance,
+                        ) * count
+                        if count > 0
+                        else 0
+                        for bucket, count in zip(buckets, counts)
+                    ]
+                    total_capacity = sum(tier_capacities)
+                    allocated_supply = 0
                     for i, bucket in enumerate(buckets):
                         count = counts[i]
                         if count > 0:
                             bucket["holders"] += count
-                            # Supply estimate: representative tier USD value.
-                            # Buckets are sorted high -> low, so the upper bound
-                            # for a non-whale tier is the previous bucket's min.
-                            mid_balance = self._tier_representative_balance(
-                                bucket,
-                                price_usd,
-                                decimals_divisor,
-                            )
-                            bucket["supply"] += int(count * mid_balance)
+                            if remaining_supply <= 0 or total_capacity <= 0:
+                                continue
+                            if i < len(buckets) - 1:
+                                tier_supply = int(remaining_supply * tier_capacities[i] / total_capacity)
+                                allocated_supply += tier_supply
+                            else:
+                                tier_supply = max(remaining_supply - allocated_supply, 0)
+                            bucket["supply"] += min(tier_supply, tier_capacities[i])
 
         # ---- 3. Build result with percentages ----
         result = []

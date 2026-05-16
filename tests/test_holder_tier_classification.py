@@ -459,6 +459,26 @@ class TestCalculateHolderTiers:
         assert sum(balance * count for balance, count in groups) == 1_000_000
         assert max(balance for balance, _ in groups) == 200_000
 
+    def test_unseen_holders_are_capped_by_bottom_fetched_holder(self) -> None:
+        """Unseen ranges should use tier maxima capped by the checked page bottom."""
+        manager = _make_manager()
+        holders = [
+            _make_holder(200_000, "0x1000000000000000000000000000000000000001", 1),
+            _make_holder(50_000, "0x2000000000000000000000000000000000000002", 2),
+        ]
+
+        groups = manager._estimate_full_distribution_groups(
+            known_holders=holders,
+            total_count=102,
+            total_supply=1_000_000,
+            price_usd=1.0,
+            decimals=0,
+        )
+
+        unseen_groups = groups[len(holders):]
+        assert unseen_groups
+        assert max(balance for balance, _ in unseen_groups) <= holders[-1].balance
+
     def test_nakamoto_uses_estimated_tail_without_fake_residual_holder(self) -> None:
         """A partial sample should not let a synthetic residual dominate Nakamoto."""
         manager = _make_manager()
